@@ -1,16 +1,30 @@
 use crate::tools::hash_fields;
 use std::collections::HashSet;
 
+const MAX_CODEMODE_SAME_ERROR_STREAK: usize = 3;
+
 /// Detects a model repeating a failed call.
 ///
 /// `shell`, `write` and `patch` are serial: only an immediate identical
 /// repetition is blocked (`last_serial`). Any other tool is blocked on a
-/// repeated (arguments, error) pair, remembered as a digest.
+/// repeated (arguments, error) pair, remembered as a digest. Zero-effect
+/// `codemode` failures also stop after repeated identical error lines even
+/// if the program text was slightly rewritten.
 #[derive(Debug, Default)]
 pub struct LoopGuard {
     failed_calls: HashSet<String>,
     /// `tool\narguments` of the previous failed serial call.
     last_serial: Option<String>,
+    /// `(normalized_error, count)` of consecutive zero-effect `codemode` failures.
+    codemode_error_streak: Option<(String, usize)>,
+}
+
+fn codemode_error_signature(error: &str) -> String {
+    let body = error
+        .strip_prefix("codemode failed after ")
+        .and_then(|rest| rest.split_once('\n'))
+        .map_or(error, |(_, rest)| rest);
+    body.lines().next().unwrap_or(body).trim().to_owned()
 }
 
 fn canonical_arguments(tool: &str, arguments: &str) -> String {
@@ -35,6 +49,7 @@ impl LoopGuard {
     /// such as a prepared call fingerprint.
     pub(crate) fn accept_key(&mut self, tool: &str, arguments: &str, error: &str) -> bool {
         if matches!(tool, "shell" | "write" | "patch") {
+            self.codemode_error_streak = None;
             let key = format!("{tool}\n{arguments}");
             if self.last_serial.as_deref() == Some(key.as_str()) {
                 return false;
@@ -43,6 +58,19 @@ impl LoopGuard {
             true
         } else {
             self.last_serial = None;
+            if matches!(tool, "codemode" | "batch_code") {
+                let signature = codemode_error_signature(error);
+                let count = match &self.codemode_error_streak {
+                    Some((prev, count)) if prev == &signature => count + 1,
+                    _ => 1,
+                };
+                self.codemode_error_streak = Some((signature, count));
+                if count >= MAX_CODEMODE_SAME_ERROR_STREAK {
+                    return false;
+                }
+            } else {
+                self.codemode_error_streak = None;
+            }
             self.failed_calls.insert(hash_fields(&[
                 tool.as_bytes(),
                 arguments.as_bytes(),
@@ -52,9 +80,13 @@ impl LoopGuard {
     }
 
     pub fn record_success(&mut self, tool: &str) {
+        if matches!(tool, "codemode" | "batch_code") {
+            self.codemode_error_streak = None;
+        }
         if matches!(tool, "shell" | "write" | "patch" | "ask_question") {
             self.last_serial = None;
             self.failed_calls.clear();
+            self.codemode_error_streak = None;
         }
     }
 }
@@ -100,5 +132,16 @@ mod tests {
         assert!(!guard.accept("read", "{}", &error));
         assert!(guard.accept("read", "{}", "another error"));
         assert!(guard.failed_calls.iter().all(|entry| entry.len() == 64));
+    }
+
+    #[test]
+    fn codemode_same_error_streak_blocks_on_third_consecutive_failure() {
+        let mut guard = LoopGuard::default();
+        let err = "codemode failed after 0 tool call(s); stored values and prior tool effects remain, do not replay the cell automatically.\nSyntaxError: unexpected token";
+        assert!(guard.accept("codemode", r#"{"code":"a"}"#, err));
+        assert!(guard.accept("codemode", r#"{"code":"b"}"#, err));
+        assert!(!guard.accept("codemode", r#"{"code":"c"}"#, err));
+        guard.record_success("codemode");
+        assert!(guard.accept("codemode", r#"{"code":"d"}"#, err));
     }
 }

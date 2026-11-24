@@ -111,6 +111,7 @@ impl XaiAdapter {
         // xAI keeps a prompt cache per server and routes by this key: one
         // conversation's requests share a server.
         wire.set_conversation_key(super::opencode::new_conversation_id());
+        wire.set_store_responses(super::stateful_delta_enabled());
         Ok(Self { model, wire })
     }
 
@@ -156,15 +157,33 @@ impl ProviderAdapter for XaiAdapter {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        self.wire.parser.capabilities()
+        let mut caps = self.wire.parser.capabilities();
+        caps.supports_previous_response_id = super::stateful_delta_enabled();
+        caps
+    }
+
+    fn closing_tool_choice(&self) -> Option<Value> {
+        self.wire.parser.closing_tool_choice()
+    }
+
+    fn compaction_low_effort(&self) -> Option<&'static str> {
+        self.model
+            .reasoning_levels
+            .contains(&"low")
+            .then_some("low")
     }
 
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
         self.wire.parser.materialize_prompt_cache_intent(body);
+        self.wire.scope_prompt_cache_key(body);
     }
 
     fn response_cache_scope_id(&self) -> Option<u64> {
         self.wire.parser.response_cache_scope_id()
+    }
+
+    fn reasoning_scope_fingerprint(&self) -> u64 {
+        self.wire.parser.reasoning_scope_fingerprint()
     }
 
     fn system_prompt_for_budget(&self) -> Option<&str> {

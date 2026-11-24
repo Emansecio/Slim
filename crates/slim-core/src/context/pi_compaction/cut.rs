@@ -81,6 +81,29 @@ pub fn find_turn_start_index(
 /// valid cut point at or after that message (the last one when none follows).
 /// Without reaching the budget the first cut point is used, keeping
 /// everything. `cut_points` must not be empty.
+fn is_clean_user_turn_start(message: &ProviderMessage) -> bool {
+    message.role == "user"
+        && !message.content.starts_with("[Interrupted")
+        && !message.content.starts_with("Budget exhausted")
+        && !message.content.starts_with("Execution stopped")
+        && !message
+            .content
+            .starts_with("The previous response reached its output limit")
+}
+
+fn follows_passing_check(messages: &[ProviderMessage], start: usize, cp: usize) -> bool {
+    cp > start
+        && messages[cp].role == "assistant"
+        && messages[cp - 1].role == "tool"
+        && (messages[cp - 1].content.contains("exit 0")
+            || messages[cp - 1].content.contains("then_run: passed"))
+}
+
+/// Pi's choice of cut index: walk back from the newest message accumulating
+/// estimated tokens; once `keep_recent_tokens` is reached, cut at the first
+/// valid cut point at or after that message (the last one when none follows).
+/// When `keep_recent_tokens >= 4_000`, prefers clean task/turn boundaries
+/// within `[0.75x..1.25x]` of `keep_recent_tokens` before falling back to Pi's rule.
 fn choose_cut_index(
     messages: &[ProviderMessage],
     start: usize,
@@ -88,6 +111,31 @@ fn choose_cut_index(
     keep_recent_tokens: u64,
     cut_points: &[usize],
 ) -> usize {
+    if keep_recent_tokens >= 4_000 {
+        let mut suffix_tokens = vec![0u64; messages.len() + 1];
+        for index in (start..end).rev() {
+            suffix_tokens[index] = suffix_tokens[index + 1].saturating_add(estimate_tokens(&messages[index]));
+        }
+        let min_keep = keep_recent_tokens.saturating_mul(3) / 4;
+        let max_keep = keep_recent_tokens.saturating_mul(5) / 4;
+        let in_window = |&cp: &&usize| {
+            *cp > start && (min_keep..=max_keep).contains(&suffix_tokens[*cp])
+        };
+        if let Some(&best_user) = cut_points
+            .iter()
+            .filter(|cp| in_window(cp) && is_clean_user_turn_start(&messages[**cp]))
+            .min_by_key(|&&cp| suffix_tokens[cp].abs_diff(keep_recent_tokens))
+        {
+            return best_user;
+        }
+        if let Some(&best_check) = cut_points
+            .iter()
+            .filter(|cp| in_window(cp) && follows_passing_check(messages, start, **cp))
+            .min_by_key(|&&cp| suffix_tokens[cp].abs_diff(keep_recent_tokens))
+        {
+            return best_check;
+        }
+    }
     let mut accumulated = 0u64;
     for index in (start..end).rev() {
         let tokens = estimate_tokens(&messages[index]);
@@ -285,9 +333,12 @@ pub fn prepare_compaction(
     if let Some(summary) = &previous_summary {
         file_ops.add_previous(&parse_file_operation_blocks(summary));
     }
-    for message in messages_to_summarize.iter().chain(&turn_prefix_messages) {
-        file_ops.extract_from_message(message);
-    }
+    let mut summarized_span = Vec::with_capacity(
+        messages_to_summarize.len() + turn_prefix_messages.len(),
+    );
+    summarized_span.extend(messages_to_summarize.iter().cloned());
+    summarized_span.extend(turn_prefix_messages.iter().cloned());
+    file_ops.extract_from_history(&summarized_span);
 
     Some(CompactionPreparation {
         first_kept_index: cut.first_kept_index,
@@ -643,6 +694,7 @@ mod tests {
         message.chat_reasoning = Some(crate::provider::ChatReasoning {
             scope_id: 1,
             model: "m".into(),
+            provenance: 0,
             content: "opaque".into(),
             details: Vec::new(),
         });
@@ -841,5 +893,36 @@ mod tests {
                 .count();
             assert_eq!(summarized_calls, summarized_results);
         }
+    }
+
+    #[test]
+    fn choose_cut_index_snaps_to_clean_turn_and_passing_check_within_window() {
+        // Case 1: keep_recent_tokens = 8_000 (window [6_000..=10_000]).
+        // Without snapping, Pi stops inside turn 1's second assistant message (index 2).
+        // With boundary snapping, index 3 (clean user turn with ~7_002 suffix tokens) wins.
+        let clean_turn_history = vec![
+            user(&"o".repeat(16_000)),
+            assistant(&"a".repeat(16_000)),
+            assistant(&"b".repeat(8_000)),
+            user(&format!("next task {}", "u".repeat(4_000))),
+            assistant(&"c".repeat(24_000)),
+        ];
+        let cut_clean = find_cut_point(&clean_turn_history, 0, clean_turn_history.len(), 8_000);
+        assert_eq!(cut_clean.first_kept_index, 3);
+        assert!(!cut_clean.is_split_turn);
+
+        // Case 2: single-turn history with no clean user turn inside [6_000..=10_000].
+        // Pi's raw scan hits 8_000 at index 5, but index 4 follows a passing tool check
+        // ("exit 0") with suffix 9_000 inside [6_000..=10_000], so it snaps to index 4.
+        let check_history = vec![
+            user("single task"),
+            assistant(&"a".repeat(16_000)),
+            ProviderMessage::assistant("", vec![call("c1", "shell", r#"{"command":"cargo check"}"#)]),
+            ProviderMessage::tool("shell", "c1", format!("exit 0\n{}", "o".repeat(16_000))),
+            assistant(&"b".repeat(4_000)),
+            assistant(&"c".repeat(32_000)),
+        ];
+        let cut_check = find_cut_point(&check_history, 0, check_history.len(), 8_000);
+        assert_eq!(cut_check.first_kept_index, 4);
     }
 }

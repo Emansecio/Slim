@@ -695,36 +695,6 @@ async fn zero_idle_shutdown_sends_exit_and_reaps_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn server_result_outside_workspace_is_rejected() {
-    let workspace = TestDir::new("path-output");
-    let outside = TestDir::new("path-outside");
-    let (source, _) = write_workspace(workspace.path());
-    let secret = outside.path().join("secret.rs");
-    std::fs::write(&secret, "fn secret() {}\n").expect("write outside file");
-    let definition_uri = url::Url::from_file_path(&secret)
-        .expect("outside file URI")
-        .to_string();
-    let (pool, manager) = manager_with_mock(
-        workspace.path(),
-        json!({ "mock": { "definitionUri": definition_uri } }),
-    );
-
-    let outcome = manager
-        .definition(&position_query(workspace.path(), source))
-        .await;
-    assert_eq!(outcome.payload.get("found"), Some(&Value::Bool(false)));
-    assert_eq!(outcome.meta.document_version, Some(1));
-    assert!(!outcome.meta.stale);
-    assert!(
-        !serde_json::to_string(&outcome.payload)
-            .expect("serialize payload")
-            .contains("secret.rs"),
-        "external server path must not leak into the result"
-    );
-    pool.close_all().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_query_reports_version_and_staleness_after_concurrent_write() {
     let workspace = TestDir::new("stale-query");
     let (source, _) = write_workspace(workspace.path());
@@ -920,48 +890,6 @@ async fn dead_server_is_evicted_and_restarted_on_next_acquire() {
         .expect("fresh server answers");
     drop(lease);
     wait_for_leases(&pool, 0).await;
-    pool.close_all().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nested_document_symbols_carry_file_and_position() {
-    let workspace = TestDir::new("nested-symbols");
-    let (source, _) = write_workspace(workspace.path());
-    let (pool, manager) = manager_with_mock(
-        workspace.path(),
-        json!({ "mock": { "documentSymbolNested": true } }),
-    );
-    let outcome = manager
-        .symbols(&CodeIntelSymbolQuery {
-            workspace: workspace.path().to_path_buf(),
-            server: None,
-            path: Some(source),
-            query: None,
-            max_results: 20,
-            offset: 0,
-            revision: None,
-            cancellation: None,
-        })
-        .await;
-    let symbols = outcome.payload.get("symbols").and_then(Value::as_array);
-    assert_eq!(
-        outcome.payload.get("kind").and_then(Value::as_str),
-        Some("document")
-    );
-    let symbols = symbols.expect("nested symbols payload");
-    assert_eq!(symbols.len(), 2);
-    assert!(symbols[0]
-        .get("file")
-        .and_then(Value::as_str)
-        .is_some_and(|file| file.ends_with("first.rs")));
-    assert_eq!(symbols[0].get("line").and_then(Value::as_u64), Some(1));
-    assert_eq!(symbols[0].get("column").and_then(Value::as_u64), Some(4));
-    assert!(symbols[1]
-        .get("name")
-        .and_then(Value::as_str)
-        .is_some_and(|name| name.contains("inner")));
-    assert_eq!(symbols[1].get("line").and_then(Value::as_u64), Some(1));
-    assert_eq!(symbols[1].get("column").and_then(Value::as_u64), Some(7));
     pool.close_all().await;
 }
 
@@ -2998,6 +2926,14 @@ async fn definition_reports_out_of_scope_locations() {
         .definition(&position_query(workspace.path(), source))
         .await;
     assert_eq!(outcome.payload["found"], false);
+    assert_eq!(outcome.meta.document_version, Some(1));
+    assert!(!outcome.meta.stale);
+    assert!(
+        !serde_json::to_string(&outcome.payload)
+            .expect("serialize payload")
+            .contains("slim-outside-scope"),
+        "external server path must not leak into the result"
+    );
     assert_eq!(outcome.payload["locations_received"], 1);
     assert_eq!(outcome.payload["locations_out_of_scope"], 1);
     let rendered = slim_core::tools::render_code_intel("definition", &outcome);

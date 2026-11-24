@@ -119,6 +119,10 @@ fn harness(label: &str, slim_toml: &str, visit: Visit) -> Harness {
         endpoint_override: None,
         model_override: None,
         timeout: Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
     Harness {

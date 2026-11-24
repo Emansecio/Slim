@@ -210,7 +210,10 @@ fn ninth_queued_prompt_is_rejected_without_losing_the_draft() {
     // The Enter-while-working path now steers; the queue cap is still
     // enforced on the remaining enqueue path (a skill selection mid-run).
     let mut state = AppState::new();
-    state.set_skill_names_for_test(vec!["review-code".into()]);
+    state.apply_event(UiEvent::WorkspaceChanged {
+        cwd: state.cwd.clone(),
+        skill_names: vec!["review-code".into()],
+    });
     reduce(&mut state, run_started(1));
     for index in 0..8 {
         state.enqueue_queued_prompt(format!("queued-{index}"));
@@ -290,7 +293,10 @@ fn prompt_run_started_drains_the_remaining_queue_into_steers() {
 #[test]
 fn locally_handled_skill_selection_drains_the_next_queued_prompt() {
     let mut state = AppState::new();
-    state.set_skill_names_for_test(vec!["review-code".into()]);
+    state.apply_event(UiEvent::WorkspaceChanged {
+        cwd: state.cwd.clone(),
+        skill_names: vec!["review-code".into()],
+    });
     reduce(&mut state, run_started(1));
     type_text(&mut state, "/review-code");
     reduce(&mut state, Action::Key(enter()));

@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{
     endpoint::protocol_url,
-    opencode_go::{OpenCodeApi, OpenCodeModel},
+    opencode_go::{is_trusted_opencode_base_url, OpenCodeApi, OpenCodeModelSpec},
     wire::{ResponsesWire, WireAdapter},
     AnthropicAdapter, HttpRequest, OpenAiCompatibleAdapter, PreparedProviderRequest,
     ProviderAdapter, ProviderCapabilities, ProviderConfig, ProviderContentBlock, ProviderError,
@@ -21,6 +21,9 @@ pub trait OpenCodeFlavor: 'static {
     const LABEL: &'static str;
     /// Account id sent with the Responses wire, e.g. `opencode-go`.
     const ACCOUNT: &'static str;
+    /// Production gateway base URL; per-model `base_url` overrides apply only
+    /// when the caller uses this default endpoint (never custom/test URLs).
+    const DEFAULT_BASE_URL: &'static str;
     /// Whether models on the Anthropic `messages` API are wired.
     const SUPPORTS_MESSAGES_API: bool;
     /// When true, a reasoning effort on a model without reasoning levels is
@@ -28,11 +31,11 @@ pub trait OpenCodeFlavor: 'static {
     /// when false, it is rejected like any other unsupported effort.
     const DROPS_EFFORT_WITHOUT_LEVELS: bool;
 
-    fn lookup(model_id: &str) -> Option<&'static OpenCodeModel>;
+    fn lookup(model_id: &str) -> Option<OpenCodeModelSpec>;
 }
 
 pub struct OpenCodeAdapter<F: OpenCodeFlavor> {
-    model: &'static OpenCodeModel,
+    model: OpenCodeModelSpec,
     wire: WireAdapter,
     session_id: String,
     flavor: PhantomData<fn() -> F>,
@@ -68,7 +71,9 @@ impl<F: OpenCodeFlavor> OpenCodeAdapter<F> {
             message: format!("unsupported {} model: {model_id}", F::LABEL),
         })?;
         let reasoning_effort = match reasoning_effort {
-            Some(effort) if model.reasoning_levels.contains(&effort) => Some(effort),
+            Some(effort) if model.reasoning_levels.iter().any(|level| level == effort) => {
+                Some(effort)
+            }
             Some(_) if F::DROPS_EFFORT_WITHOUT_LEVELS && model.reasoning_levels.is_empty() => None,
             Some(_) => {
                 return Err(ProviderError::InvalidResponse {
@@ -77,11 +82,22 @@ impl<F: OpenCodeFlavor> OpenCodeAdapter<F> {
             }
             None => None,
         };
+        let effective_endpoint = if endpoint.trim_end_matches('/')
+            == F::DEFAULT_BASE_URL.trim_end_matches('/')
+        {
+            model
+                .base_url
+                .as_deref()
+                .filter(|url| is_trusted_opencode_base_url(url))
+                .unwrap_or(endpoint)
+        } else {
+            endpoint
+        };
         let wire = match model.api {
             OpenCodeApi::ChatCompletions => {
                 let mut config = ProviderConfig::openai(
-                    protocol_url(endpoint, "chat/completions"),
-                    model.id,
+                    protocol_url(effective_endpoint, "chat/completions"),
+                    &model.id,
                     api_key,
                 );
                 if let Some(effort) = reasoning_effort {
@@ -90,11 +106,15 @@ impl<F: OpenCodeFlavor> OpenCodeAdapter<F> {
                 WireAdapter::Chat(OpenAiCompatibleAdapter::new(config)?)
             }
             OpenCodeApi::AnthropicMessages if F::SUPPORTS_MESSAGES_API => {
-                WireAdapter::Messages(AnthropicAdapter::new(ProviderConfig::anthropic_bearer(
-                    protocol_url(endpoint, "messages"),
-                    model.id,
+                let mut config = ProviderConfig::anthropic_bearer(
+                    protocol_url(effective_endpoint, "messages"),
+                    &model.id,
                     api_key,
-                ))?)
+                );
+                if let Some(effort) = reasoning_effort {
+                    config = config.with_reasoning_effort(effort);
+                }
+                WireAdapter::Messages(AnthropicAdapter::new(config)?)
             }
             OpenCodeApi::AnthropicMessages => {
                 return Err(ProviderError::InvalidResponse {
@@ -106,8 +126,8 @@ impl<F: OpenCodeFlavor> OpenCodeAdapter<F> {
                 })
             }
             OpenCodeApi::Responses => WireAdapter::Responses(ResponsesWire::new(
-                protocol_url(endpoint, "responses"),
-                model.id,
+                protocol_url(effective_endpoint, "responses"),
+                &model.id,
                 api_key,
                 F::ACCOUNT,
                 reasoning_effort,
@@ -126,7 +146,11 @@ impl<F: OpenCodeFlavor> OpenCodeAdapter<F> {
     }
 
     pub fn with_session_id(mut self, session_id: &str) -> Self {
-        self.session_id = opaque_session_id(session_id);
+        let opaque = opaque_session_id(session_id);
+        if let WireAdapter::Responses(wire) = &mut self.wire {
+            wire.set_conversation_key(opaque.clone());
+        }
+        self.session_id = opaque;
         self
     }
 
@@ -178,11 +202,23 @@ impl<F: OpenCodeFlavor> ProviderAdapter for OpenCodeAdapter<F> {
     }
 
     fn model(&self) -> &str {
-        self.model.id
+        &self.model.id
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
         self.wire.capabilities()
+    }
+
+    fn closing_tool_choice(&self) -> Option<Value> {
+        self.wire.closing_tool_choice()
+    }
+
+    fn compaction_low_effort(&self) -> Option<&'static str> {
+        self.model
+            .reasoning_levels
+            .iter()
+            .any(|level| level == "low")
+            .then_some("low")
     }
 
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
@@ -191,6 +227,10 @@ impl<F: OpenCodeFlavor> ProviderAdapter for OpenCodeAdapter<F> {
 
     fn response_cache_scope_id(&self) -> Option<u64> {
         self.wire.response_cache_scope_id()
+    }
+
+    fn reasoning_scope_fingerprint(&self) -> u64 {
+        self.wire.reasoning_scope_fingerprint()
     }
 
     fn system_prompt_for_budget(&self) -> Option<&str> {

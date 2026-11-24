@@ -183,6 +183,15 @@ impl Drop for Harness {
 /// A real worker over `ws`, optionally resumed at `resume` and/or pointed at a
 /// mock provider. Sessions persist, so the first prompt creates one.
 fn start(ws: &Workspace, resume: Option<&Path>, endpoint: Option<&str>) -> Harness {
+    start_with_bridge(ws, resume, endpoint, None)
+}
+
+fn start_with_bridge(
+    ws: &Workspace,
+    resume: Option<&Path>,
+    endpoint: Option<&str>,
+    queue_bridge: Option<slim_tui::QueueJournalBridge>,
+) -> Harness {
     let oauth = OAuthService::new(
         OAuthEndpoints::default(),
         Arc::new(NoBrowser),
@@ -229,6 +238,10 @@ fn start(ws: &Workspace, resume: Option<&Path>, endpoint: Option<&str>) -> Harne
         endpoint_override: None,
         model_override: None,
         timeout: Duration::from_secs(20),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
     let mut harness = Harness {
@@ -923,6 +936,7 @@ fn rewind_forks_before_the_chosen_turn_and_hands_back_its_prompt() {
     let mark = harness.seen.len();
     harness.send(UiCommand::RewindSession {
         first_seq: turns[1].first_seq,
+        restore_files: false,
     });
     harness.until("the rewind to finish", |seen| {
         restored_after(seen, mark).is_some()
@@ -997,7 +1011,10 @@ fn rewinding_to_the_first_turn_gives_an_empty_valid_session() {
 
     let mut harness = start(&ws, Some(&current), None);
     let mark = harness.seen.len();
-    harness.send(UiCommand::RewindSession { first_seq });
+    harness.send(UiCommand::RewindSession {
+        first_seq,
+        restore_files: false,
+    });
     harness.until("the rewind to finish", |seen| {
         restored_after(seen, mark).is_some()
             && seen[mark..]
@@ -1053,7 +1070,10 @@ fn rewind_refuses_unknown_and_unfinished_turns_without_creating_files() {
         (turns[1].first_seq, "Este turno ainda não terminou"),
     ] {
         let mark = harness.seen.len();
-        harness.send(UiCommand::RewindSession { first_seq });
+        harness.send(UiCommand::RewindSession {
+        first_seq,
+        restore_files: false,
+    });
         assert_eq!(harness.notice_after(mark), message);
         assert!(restored_after(&harness.seen, mark).is_none());
         assert!(!harness.seen[mark..]
@@ -1075,7 +1095,10 @@ fn turns_and_rewind_without_a_saved_session_are_answered() {
         Some("Nenhuma conversa salva nesta sessão")
     );
     let mark = harness.seen.len();
-    harness.send(UiCommand::RewindSession { first_seq: 0 });
+    harness.send(UiCommand::RewindSession {
+        first_seq: 0,
+        restore_files: false,
+    });
     assert_eq!(
         harness.notice_after(mark),
         "Nenhuma conversa salva nesta sessão"
@@ -1199,6 +1222,7 @@ fn rename_before_the_first_prompt_is_written_at_creation_and_rewind_continues_tr
     let mark = harness.seen.len();
     harness.send(UiCommand::RewindSession {
         first_seq: turns[1].first_seq,
+        restore_files: false,
     });
     harness.until("the rewind", |seen| {
         restored_after(seen, mark).is_some()
@@ -1292,7 +1316,10 @@ fn every_session_command_is_answered_while_a_run_is_active() {
     harness.send(UiCommand::ListTurns { request_id: 22 });
     harness.send(UiCommand::RenameSession { title: "x".into() });
     harness.send(UiCommand::ResumeSession { id: "tui-x".into() });
-    harness.send(UiCommand::RewindSession { first_seq: 0 });
+    harness.send(UiCommand::RewindSession {
+        first_seq: 0,
+        restore_files: false,
+    });
     harness.send(UiCommand::NewSession);
     harness.until("all six answers", |seen| {
         let listed = seen[mark..].iter().any(|event| {
@@ -1520,7 +1547,10 @@ fn refusal_answers_carry_the_request_id_and_never_leave_a_list_hanging() {
         UiCommand::ListTurns { request_id: 4 },
         UiCommand::RenameSession { title: "t".into() },
         UiCommand::ResumeSession { id: "tui-x".into() },
-        UiCommand::RewindSession { first_seq: 1 },
+        UiCommand::RewindSession {
+            first_seq: 1,
+            restore_files: false,
+        },
     ];
     for command in &commands {
         assert!(super::sessions::is_session_command(command));
@@ -1582,6 +1612,7 @@ fn a_run_finishing_delivery_still_answers_session_commands() {
         admission: None,
         result: None,
         projector: None,
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         delivery: Default::default(),
         cancellation: slim_core::runtime::CancellationToken::new(),
         durable: false,
@@ -1591,7 +1622,10 @@ fn a_run_finishing_delivery_still_answers_session_commands() {
     };
     for command in [
         UiCommand::ListSessions { request_id: 8 },
-        UiCommand::RewindSession { first_seq: 1 },
+        UiCommand::RewindSession {
+            first_seq: 1,
+            restore_files: false,
+        },
     ] {
         let shutdown = super::dispatch_pending_command(
             &mut run,
@@ -1623,6 +1657,7 @@ fn a_run_finishing_delivery_refuses_mcp_changes_and_still_serves_a_waiting_sign_
         admission: None,
         result: None,
         projector: None,
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         delivery: Default::default(),
         cancellation: slim_core::runtime::CancellationToken::new(),
         durable: false,
@@ -1850,4 +1885,240 @@ fn job_metadata_refusal_happens_before_prompt_run_started() {
         &harness.seen[mark..]
     );
     assert!(provider.bodies.try_recv().is_err());
+}
+
+#[test]
+fn fresh_session_prepare_prompt_persists_in_flight_before_network_dispatch() {
+    use slim_core::session::{DurableRecord, PromptQueueJournal, PromptQueueSnapshot};
+    use slim_tui::api::{PromptAdmission, PromptGeneration, PromptId, PromptOrigin};
+
+    let ws = Workspace::new("fresh-prepare-in-flight");
+    let provider = provider(1, true);
+    let bridge = slim_tui::QueueJournalBridge::new();
+    let mut harness = start_with_bridge(&ws, None, Some(&provider.endpoint), Some(bridge.clone()));
+    let mark = harness.seen.len();
+    let admission = PromptAdmission {
+        id: PromptId(901),
+        generation: PromptGeneration(901),
+        origin: PromptOrigin::Direct,
+    };
+    harness.send(UiCommand::PreparePrompt {
+        admission,
+        prompt: "crash-safe first prompt".into(),
+    });
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .expect("network dispatch");
+    harness.until("snapshot and prompt run start", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::SessionSnapshot { .. }))
+            && seen[mark..]
+                .iter()
+                .any(|event| matches!(event, UiEvent::PromptRunStarted { admission: a, .. } if *a == admission))
+    });
+    let session_id = harness.seen[mark..]
+        .iter()
+        .find_map(|event| match event {
+            UiEvent::SessionSnapshot { session_id, .. } => Some(session_id.0.to_string()),
+            _ => None,
+        })
+        .expect("session snapshot");
+
+    // While the first provider HTTP request is still in-flight (and before any
+    // PersistentQueue consumes `bridge`), the queue journal on disk must already
+    // hold `in_flight` and `bridge` must hold the preopened locked journal.
+    let queues_dir = ws.0.join(".slim").join("queues");
+    let queue_files: Vec<PathBuf> = std::fs::read_dir(&queues_dir)
+        .expect("queues dir")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(path)
+        })
+        .collect();
+    assert_eq!(queue_files.len(), 1, "one queue journal on disk");
+    let queue_preflight = preflight_session(&queue_files[0]).expect("preflight queue journal");
+    assert_eq!(
+        queue_preflight
+            .header
+            .as_ref()
+            .map(|header| header.id.as_str()),
+        Some(session_id.as_str())
+    );
+    let persisted = queue_preflight
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            DurableRecord::Fact { fact, .. } if fact.namespace == "prompt_queue.v1" => {
+                serde_json::from_value::<PromptQueueSnapshot>(fact.value.clone()).ok()
+            }
+            _ => None,
+        })
+        .expect("persisted prompt_queue.v1 snapshot");
+    assert_eq!(
+        persisted,
+        PromptQueueSnapshot {
+            pending: Vec::new(),
+            in_flight: Some("crash-safe first prompt".into()),
+            recovery_draft: None,
+        }
+    );
+    let busy_err = PromptQueueJournal::open(&ws.0, &session_id)
+        .err()
+        .expect("bridge holds preopened journal lock");
+    assert_eq!(busy_err.kind(), std::io::ErrorKind::ResourceBusy);
+
+    provider.release_first.send(()).unwrap();
+    harness.until("prompt run completed", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::PromptRunCompleted { admission: a, .. } if *a == admission))
+    });
+    harness.wait_idle();
+    drop(harness);
+    drop(bridge);
+
+    let reopened = PromptQueueJournal::open(&ws.0, &session_id).expect("reopen queue journal");
+    assert_eq!(
+        reopened.snapshot(),
+        &PromptQueueSnapshot {
+            pending: Vec::new(),
+            in_flight: Some("crash-safe first prompt".into()),
+            recovery_draft: None,
+        }
+    );
+}
+
+#[test]
+fn new_then_resume_same_session_handles_queue_lock_release_cleanly() {
+    use slim_core::session::PromptQueueJournal;
+
+    let ws = Workspace::new("new-resume-queue-lock");
+    let current = create_session(&ws, "tui-current", &["current turn"]);
+    create_session(&ws, "tui-target", &["target turn"]);
+    let bridge = slim_tui::QueueJournalBridge::new();
+    let mut harness = start_with_bridge(&ws, Some(&current), None, Some(bridge.clone()));
+
+    let mark = harness.seen.len();
+    harness.send(UiCommand::NewSession);
+    harness.until("SessionCleared", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::SessionCleared { .. }))
+    });
+
+    // While another handle still holds the target session's queue journal lock
+    // (analogous to an un-detached JournalWorker), switching must fail closed
+    // instead of emitting SessionRestored that would crash `run_loop`.
+    let held_queue = PromptQueueJournal::open(&ws.0, "tui-target").expect("hold target queue lock");
+    let mark = harness.seen.len();
+    harness.send(UiCommand::ResumeSession {
+        id: "tui-target".into(),
+    });
+    harness.until("queue open failure", |seen| {
+        seen[mark..].iter().any(|event| {
+            matches!(event, UiEvent::RunFailed { message, .. } if message.contains("prompt queue open failed"))
+        })
+    });
+    assert!(
+        restored_after(&harness.seen, mark).is_none(),
+        "SessionRestored must not be emitted when preopen fails with ResourceBusy"
+    );
+
+    // Once the old journal handle drops (releasing `<sha256>.jsonl.lock`),
+    // resuming `tui-target` after `/new` succeeds cleanly.
+    drop(held_queue);
+    let mark = harness.seen.len();
+    harness.send(UiCommand::ResumeSession {
+        id: "tui-target".into(),
+    });
+    harness.until("SessionRestored after lock release", |seen| {
+        restored_after(seen, mark)
+            .is_some_and(|(id, _)| id == "tui-target")
+    });
+}
+
+#[test]
+fn new_then_immediate_resume_previous_with_bridge_does_not_hang_or_fail() {
+    let ws = Workspace::new("new-immediate-resume-prev");
+    let current = create_session(&ws, "tui-current", &["current turn"]);
+    set_modified(&current, SystemTime::now() - Duration::from_secs(60));
+    create_session(&ws, "tui-other", &["other turn"]);
+    let bridge = slim_tui::QueueJournalBridge::new();
+    let mut harness = start_with_bridge(&ws, Some(&current), None, Some(bridge));
+
+    let mark = harness.seen.len();
+    harness.send(UiCommand::NewSession);
+    harness.send(UiCommand::ResumePrevious);
+    harness.until("SessionCleared and immediate SessionRestored", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::SessionCleared { .. }))
+            && restored_after(seen, mark)
+                .is_some_and(|(id, _)| id == "tui-other")
+    });
+    assert!(
+        !harness.seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::RunFailed { .. })),
+        "immediate /resume after /new must not fail or hang: {:?}",
+        &harness.seen[mark..]
+    );
+}
+
+#[test]
+fn rewind_restores_disk_checkpoint_and_undo_reverts_disk_state() {
+    let ws = Workspace::new("worker-rewind-disk");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&ws.0)
+        .status()
+        .unwrap()
+        .success());
+    let target = ws.0.join("notes.txt");
+    std::fs::write(&target, "v1\n").unwrap();
+
+    let provider = provider(2, false);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    harness.run_prompt("turn one");
+    provider.bodies.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    std::fs::write(&target, "v2\n").unwrap();
+    harness.run_prompt("turn two");
+    provider.bodies.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    std::fs::write(&target, "v3-after-turn-two\n").unwrap();
+
+    let (turns, error) = harness.turns_listed(11);
+    assert_eq!(error, None);
+    assert_eq!(turns.len(), 2);
+    assert!(turns[1].has_checkpoint, "turn two should record a checkpoint");
+
+    let mark = harness.seen.len();
+    harness.send(UiCommand::RewindSession {
+        first_seq: turns[1].first_seq,
+        restore_files: true,
+    });
+    harness.until("disk rewind completed", |seen| {
+        restored_after(seen, mark).is_some()
+            && seen[mark..]
+                .iter()
+                .any(|event| matches!(event, UiEvent::RestoreDraft { .. }))
+    });
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
+    assert!(harness.notice_after(mark).contains("/rewind --undo"));
+
+    let undo_mark = harness.seen.len();
+    harness.send(UiCommand::UndoLastRewind);
+    harness.until("undo last rewind completed", |seen| {
+        seen[undo_mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::Notification { .. }))
+    });
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "v3-after-turn-two\n"
+    );
 }

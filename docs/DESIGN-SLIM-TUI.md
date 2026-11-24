@@ -412,11 +412,13 @@ milestone correspondente passou seu gate.
   Plan na TUI executa o loop com read/list/search (sem write/shell/`ask_question`);
   headless `--plan` continua `approval_required` / exit 10;
   em Code, a célula `codemode` aparece como "Executando/Executou programa"
-  (alvo: primeira instrução do código) e cada chamada interna vira uma row do
+  (alvo: primeira instrução do código, pulando comentários `//` e `/* ... */`),
+  `Enter` mostra o código-fonte do programa antes da saída e cada chamada interna vira uma row do
   mesmo batch, com o verbo e o alvo da tool chamada (`slim.read` como
   "Leu …", `mcp.servidor.tool` como `mcp`) e o diff de `write`/`patch`;
   concluído, o lote colapsa em `✓ 1 programa, N leituras, …` (o programa
-  primeiro) e Enter abre as rows;
+  primeiro) e Enter abre as rows; na retomada (`--resume`), as rows dos passos
+  internos são reconstruídas a partir de `codemode.call.v1`;
 - cancelamento encerra request ativo e processo shell iniciado pelo run;
 - shutdown explícito com restore RAII como fallback;
 - transcript navegável: live edge segue o fim, setas/PageUp pinnam, End volta,

@@ -182,3 +182,50 @@ fn process_facts_add_bounded_status_to_timeline_without_output_text() {
     );
     assert!(!timeline.contains("stdout"));
 }
+
+#[test]
+fn codemode_steps_appear_indented_under_the_program_in_timeline() {
+    let events = vec![
+        SessionEvent::new(
+            1,
+            EventKind::ToolStepFinished {
+                batch_id: "b1".into(),
+                call_id: "c1".into(),
+                step_id: "b1:c1:1".into(),
+                name: "slim.read".into(),
+                success: true,
+                duration_ms: 4,
+                output: "ok".into(),
+                diff: None,
+            },
+        ),
+        SessionEvent::new(
+            2,
+            EventKind::ToolStepFinished {
+                batch_id: "b1".into(),
+                call_id: "c1".into(),
+                step_id: "b1:c1:2".into(),
+                name: "mcp.docs.get".into(),
+                success: false,
+                duration_ms: 9,
+                output: "not found".into(),
+                diff: None,
+            },
+        ),
+        SessionEvent::new(
+            3,
+            EventKind::ToolFinished {
+                batch_id: "b1".into(),
+                call_id: "c1".into(),
+                name: "codemode".into(),
+                success: true,
+                duration_ms: 15,
+            },
+        ),
+    ];
+    let timeline = summarize_tool_events(&events).join("\n");
+    assert_eq!(
+        timeline,
+        "✓ codemode · 15ms\n  ✓ read · 4ms\n  ✕ mcp · failed · not found · 9ms"
+    );
+}

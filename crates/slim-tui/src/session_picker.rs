@@ -201,6 +201,7 @@ mod tests {
             index,
             first_seq: index as u64 * 10 + 2,
             prompt: prompt.into(),
+            has_checkpoint: false,
         }
     }
 

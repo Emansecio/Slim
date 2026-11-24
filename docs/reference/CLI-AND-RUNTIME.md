@@ -1179,59 +1179,81 @@ binding `slim`, e `tools.call('slim.…')` falha.
 
 **Code.** A descrição da ferramenta traz um bloco TypeScript gerado das
 definições nativas que Auto anuncia (compactadas, sem campos legados):
-`declare const slim: { read(…): Promise<string>; list; search; write; patch;
+`declare const slim: { read(…): Promise<string>; list; search; glob; write; patch;
 shell; code_intel }` (`code_intel` só com servidor de linguagem para o
-workspace), mais as declarações dos helpers. `slim.<nome>(args = {})` é
-`tools.call('slim.<nome>', args)`: resolve com a saída textual da tool e
-rejeita com `Error` na falha. Cada chamada nativa passa por
-`prepare_invocation` no modo Code e no cwd do turno, pelos mesmos run guards
-de uma chamada do provider (leitura acima de 1.000 linhas, comando que acabou
-de falhar, segunda reescrita completa) e pela mesma checagem de material
-sensível; a saída é redigida e, depois de `write`/`patch`, o servidor de
-linguagem é notificado antes da próxima chamada. A saída não conta como lida
-pelo modelo; uma saída guardada como artefato é registrada na sessão e a
-referência `[artifact id=…]` vem no fim do texto. O `shell` do programa é o do
-registry: roda em primeiro plano com o `timeout_ms` da chamada (padrão 600 s,
-reduzido ao tempo que resta à célula) e os limites de captura de saída da tool;
-`background`, `yield_ms` e `stdin` são recusados. Em `write`/`patch`,
-`then_run.final` é recusado (a resposta sai do `return`), e `then_run` conta
-como duas chamadas no limite; com o ajuste fino encerrado, patch só de ajuste
-falha como no provider. MCP não é anunciado de início: o programa descobre com os helpers e
-chama `tools.call('mcp.…')`. Sem MCP configurado, `slim` funciona normalmente
-e só `tools.call('mcp.…')` e os helpers de descoberta falham.
+workspace), além de `declare function finish(answer: string): void` (também acessível
+como `slim.finish`) e das declarações dos helpers. `slim.<nome>(args = {})` é
+`tools.call('slim.<nome>', args)`: `slim.glob` resolve diretamente com objeto JSON
+(`{ files, truncated, timed_out }`, respeitando `.gitignore` e contenção do
+workspace); `list` e `search` aceitam `structured: true` para resolver direto com
+objeto JS redigido em vez de texto; `shell` aceita `allow_non_zero: true` para
+resolver em saída normal com exit diferente de zero (não expirado nem cancelado).
+Nos demais casos resolve com a saída textual da tool e rejeita com `Error` na
+falha. `finish(answer)` registra a resposta final sem gastar outro turno do
+provider quando a célula termina normalmente sem rejeições não tratadas, sem
+falhas não aguardadas e sem revisão/steer/job pendente (e é descartada se a célula
+falhar ou parar). Cada chamada nativa passa por `prepare_invocation` pré-parseado
+no modo Code e no cwd do turno, pelos mesmos run guards de uma chamada do
+provider (leitura acima de 1.000 linhas, comando que acabou de falhar, segunda
+reescrita completa — avisos dos guards, como primeira reescrita completa,
+aparecem ao fim da saída da célula) e pela mesma checagem de material sensível; a
+saída é redigida e, depois de `write`/`patch`, o servidor de linguagem é
+notificado antes da próxima chamada. Chamadas internas (`slim.*`, `mcp.*` e
+`store`) alimentam o `CausalGovernor` (`NoProgress` e `ValidationGreen` /
+`GoalAssurance`), e células sem efeito mutável ou de `store` não zeram o
+`LoopGuard` (por exemplo, leituras seguidas do mesmo erro JS repetido ainda são
+barradas). A saída não conta como lida pelo modelo; uma saída guardada como
+artefato é registrada na sessão e a referência `[artifact id=…]` vem no fim do
+texto. O `shell` do programa é o do registry: roda em primeiro plano com o
+`timeout_ms` da chamada (padrão 600 s, reduzido ao tempo que resta à célula) e os
+limites de captura de saída da tool; `background`, `yield_ms` e `stdin` são
+recusados. Em `write`/`patch`, `then_run.final` é recusado (a resposta sai do
+`finish`/`return`), e `then_run` conta como duas chamadas no limite; com o
+ajuste fino encerrado, patch só de ajuste falha como no provider. MCP não é
+anunciado de início: o programa descobre com os helpers e chama
+`tools.call('mcp.…')`. Sem MCP configurado, `slim` funciona normalmente e só
+`tools.call('mcp.…')` e os helpers de descoberta falham.
 
 **Paralelismo (Code).** `tools.call` devolve uma promise real. O interpretador
-envia a chamada com um ticket e continua o programa; o host executa cada
-chamada em uma task própria e liquida as promises na ordem em que terminam.
-Leituras (`read`, `list`, `search`, `code_intel`) e chamadas MCP rodam em
-paralelo, até 8 de cada vez; só `write`, `patch` e `shell` são serializadas pelo
-host: começam depois que as chamadas em voo terminam, e nada começa enquanto
-rodam. As chamadas começam na ordem pedida. Pôr chamadas MCP no mesmo
-`Promise.all` declara que são independentes; o host não as ordena entre si. O
-transporte MCP aceita requisições concorrentes (ids multiplexados no stdio e no
-HTTP), então não há serialização por servidor. Depois do `return`, o
-interpretador segue processando as chamadas que o programa não aguardou (por
-exemplo, `forEach(async …)`) até não restar nenhuma em voo, e o host executa a
-fila inteira; falhas e resultados incertos dessas chamadas viram uma nota curta
-(nome e erro) logo após o resultado. Uma promise pendente sem nenhuma chamada
-em voo nunca se resolveria e falha como deadlock.
+envia a chamada com um ticket e continua o programa; o host executa cada chamada
+em uma task própria (acordado por evento, sem polling) e liquida as promises na
+ordem em que terminam. Leituras (`read`, `list`, `search`, `glob`, `code_intel`)
+e chamadas MCP rodam em paralelo, até 8 de cada vez; leituras de snapshot
+idênticas em voo coalescem numa única execução e leituras completas de arquivo
+sem mutação intermediária reaproveitam um cache intra-célula. `write` e `patch`
+(sem `then_run`) aguardam as chamadas anteriores em voo, rodam em paralelo entre
+arquivos **distintos** (mantendo serialização para o **mesmo** arquivo) e agem
+como barreira antes das chamadas seguintes; `shell` e `write`/`patch` com
+`then_run` são sempre exclusivos. As chamadas começam na ordem pedida. Pôr
+chamadas MCP no mesmo `Promise.all` declara que são independentes; o host não
+as ordena entre si. O transporte MCP aceita requisições concorrentes (ids
+multiplexados no stdio e no HTTP), então não há serialização por servidor. Depois
+do `return`, o interpretador segue processando as chamadas que o programa não
+aguardou (por exemplo, `forEach(async …)`) até não restar nenhuma em voo, e o
+host executa a fila inteira; falhas e resultados incertos dessas chamadas viram
+uma nota curta (nome e erro) logo após o resultado. Uma promise pendente sem
+nenhuma chamada em voo nunca se resolveria e falha como deadlock.
 
 **Descoberta** (síncrona, não consome o limite de chamadas, nunca mostra tools
 `hidden`): `searchTools(query, {limit?, server?})` (BM25; padrão 8, máximo 64)
 devolve `[{name, server, tool, description}]` com `name` no formato de
-`tools.call`; `describeTool('mcp.servidor.ferramenta')` devolve
-`{inputSchema, outputSchema?, …}` ou `null`; `listServers()` devolve nome,
-status, descrição e instruções. Em Code, `describeTool` inclui `signature` em
-TypeScript (o retorno vem de `outputSchema`, ou `unknown`) e também descreve
-`slim.<nome>`. Não há helpers de recursos (`resources`/`uri` são só do gateway).
+`tools.call`; sem `server`, busca apenas nos servidores já prontos sem disparar
+conexão em servidores desconectados, enquanto `{ server }` conecta sob demanda;
+`describeTool('mcp.servidor.ferramenta')` devolve `{inputSchema, outputSchema?,
+…}` ou `null`; `listServers()` devolve nome, status, descrição e instruções. Em
+Code, `describeTool` inclui `signature` em TypeScript (o retorno vem de
+`outputSchema` ou `return_type` nativo, ex. `glob`/`search`/`list`, ou
+`unknown`/`string`) e também descreve `slim.<nome>`. Não há helpers de recursos
+(`resources`/`uri` são só do gateway).
 
 **Exibição.** Cada chamada interna emite `ToolStepStarted` (nome e argumentos
 redigidos) e `ToolStepFinished` (sucesso, duração, até 16 KiB da saída ou do
 erro e, em `write`/`patch` bem-sucedidos, o diff) com o `batch_id`/`call_id` da
 célula. São eventos só de exibição: não entram no journal manual, na contagem de
-tools do usage nem na conversa do provider, e uma sessão retomada mostra a
-célula sem as rows de cada chamada (o journal `codemode.call.v1` continua a
-fonte durável).
+tools do usage nem na conversa do provider. Na TUI, `Enter` na row `codemode`
+exibe o código-fonte do programa executado antes da saída, e uma sessão retomada
+reconstrói as rows dos passos internos a partir do journal `codemode.call.v1`; no
+modo `--headless`, a timeline resume os passos filhos sob a chamada `codemode`.
 
 **Console.** `console.log/info/warn/error` são capturados (`warn:`/`error:`
 como prefixo; objetos em JSON) até 1 MiB por célula, o mesmo teto do `return`;
@@ -1246,16 +1268,23 @@ Cada célula tem globais novos. Com sessão durável, os valores são registrado
 no journal e restaurados ao retomar ou ramificar, sem reexecutar código ou MCP.
 Um `store` concluído permanece aplicado mesmo se o restante da célula falhar.
 
-`mcp` e `codemode` são barreiras seriais no bucket mutating. Toda chamada
-interna (nativa ou MCP) consome, ao começar, os limites por turno e por run,
-além do slot da célula; a que não cabe falha sem ser enviada. O journal
-(`codemode.call.v1`) registra cada chamada com identidade ligada à célula:
-`started` com os argumentos, depois `completed`/`failed`/`not_sent`/`uncertain`
-com duração e resultado (para nativas, só `output_bytes` no sucesso, e na falha
-`error_bytes` com no máximo 1 KiB do erro); cada etapa aparece como progresso
-da ferramenta. O `started` só é gravado depois que a chamada foi disparada; se
-o journal falhar, as chamadas já disparadas ainda terminam e são coletadas, e a
-célula devolve o primeiro erro de journal.
+`mcp` e `codemode` são barreiras seriais no bucket mutating. Leituras internas
+(`slim.read`, `slim.list`, `slim.search`, `slim.glob`, `slim.code_intel`)
+consomem o limite total da run, enquanto mutações nativas, `slim.shell` e
+chamadas MCP também consomem o limite mutating por turno; a que não cabe falha
+sem ser enviada. O journal (`codemode.call.v1`) grava sem `fsync` por passo
+(sincronizado na próxima fronteira durável) e registra cada chamada com
+identidade ligada à célula: `started` com os argumentos (compactados acima de
+1 KiB com `elided: true`, preservando identificadores curtos como
+`path`/`command`/`query`/`pattern`, o resumo de tamanho dos campos grandes e, em
+`patch`, `added_lines`/`removed_lines`), depois `completed`/`failed`/`not_sent`/`uncertain` com
+duração e tamanho do resultado (`output_bytes` ou `result_bytes`, e na falha
+`error_bytes` com no máximo 1 KiB do erro); cada etapa aparece como progresso da
+ferramenta. O `started` só é gravado depois que a chamada foi disparada; se o
+journal falhar, as chamadas já disparadas ainda terminam e são coletadas, e a
+célula devolve o primeiro erro de journal. Cada célula também reaproveita um
+runtime QuickJS morno em `thread_local` quando conclui de forma limpa (sem
+erros, interrupção ou jobs pendentes).
 
 Limites da célula: código de 64 KiB, memória de 32 MiB, 120 s de CPU do
 JavaScript (as esperas por chamadas do host não contam), prazo de relógio de
@@ -1357,7 +1386,7 @@ barreiras são estas):
 - **`env_clear`** para stdio: o servidor herda o ambiente do processo.
 - **Áudio** ao modelo (vira `[audio … omitted]`) e imagens em providers cujo wire
   não as aceita em resultados de tool.
-- **Helpers de recursos no codemode** e **chamadas paralelas** de `tools.call`.
+- **Helpers de recursos no codemode** e **chamadas paralelas** de `tools.call` em modo Auto.
 
 ## Command Code — DeepSeek V4.1 Flash
 
@@ -1797,14 +1826,17 @@ não deixa uma sessão filha parcial visível; o pai permanece inalterado.
 O branch compactado também prepara o resumo e checkpoint antes dessa publicação;
 falha do resumidor mantém o ID do filho livre para retry.
 
-Argumentos grandes de `write` (mais de 4096 bytes) recebem uma projeção temporária
-na requisição: `content` vira uma referência com tamanho e SHA-256, somente se
-o recibo nativo posterior confirmar sucesso com tamanho e hash correspondentes.
-Chamadas incompletas, falhas e `patch` conservam os argumentos. A estimativa de
-contexto usa a mesma projeção; histórico canônico, eventos e diário conservam o
-conteúdo original. Essa redução de bytes não equivale a economia de custo medida.
+Argumentos grandes de `write` (mais de 4096 bytes) e chamadas `codemode`
+concluídas (mais de 1024 bytes) recebem uma projeção temporária na requisição:
+em `write`, `content` vira uma referência com tamanho e SHA-256 somente se o
+recibo nativo posterior confirmar sucesso com tamanho e hash correspondentes; em
+`codemode`, `code` vira um resumo compacto (`bytes`, `sha256` e primeira linha),
+enquanto chamadas `codemode` que falharam permanecem literais. Chamadas
+incompletas, falhas e `patch` conservam os argumentos. A estimativa de contexto
+usa a mesma projeção; histórico canônico, eventos e diário conservam o conteúdo
+original. Essa redução de bytes não equivale a economia de custo medida.
 
-A projeção reutiliza um cache por runtime, limitado a 16 entradas e 1 MiB de
+A projeção reutiliza um cache por runtime, limitado a 64 entradas e 1 MiB de
 texto retido, reiniciado a cada execução. O reaproveitamento exige ID e argumentos
 originais idênticos e revalida o recibo no histórico atual. Entradas maiores que
 o teto seguem pelo caminho sem cache; o payload enviado permanece igual.

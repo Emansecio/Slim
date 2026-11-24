@@ -21,6 +21,9 @@ pub(super) struct ResponsesWire {
     /// Narrows the prompt cache key to one conversation, where the provider
     /// routes its cache by conversation.
     conversation_key: Option<String>,
+    /// Opts into server-side response storage for providers that support
+    /// `previous_response_id` delta chains (ChatGPT Codex stays `store: false`).
+    store_responses: bool,
 }
 
 impl ResponsesWire {
@@ -42,19 +45,25 @@ impl ResponsesWire {
             max_output_tokens: super::DEFAULT_MAX_OUTPUT_TOKENS,
             extra_headers: Vec::new(),
             conversation_key: None,
+            store_responses: false,
         })
+    }
+
+    pub(super) fn set_store_responses(&mut self, store: bool) {
+        self.store_responses = store;
     }
 
     pub(super) fn set_conversation_key(&mut self, key: String) {
         self.conversation_key = Some(key);
     }
 
-    fn scope_prompt_cache_key(&self, body: &mut Value) {
+    pub(super) fn scope_prompt_cache_key(&self, body: &mut Value) {
         let Some(conversation) = &self.conversation_key else {
             return;
         };
         if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str) {
-            body["prompt_cache_key"] = Value::String(format!("{key}:{conversation}"));
+            body["prompt_cache_key"] =
+                Value::String(super::scope_prompt_cache_key_bounded(key, conversation));
         }
     }
 
@@ -81,6 +90,9 @@ impl ResponsesWire {
     pub(super) fn request(&self, messages: &[ProviderMessage], tools: &[Value]) -> HttpRequest {
         let mut body = self.parser.request_body(messages, tools);
         body["max_output_tokens"] = Value::from(self.max_output_tokens);
+        if self.store_responses {
+            body["store"] = Value::Bool(true);
+        }
         self.scope_prompt_cache_key(&mut body);
         HttpRequest {
             url: self.endpoint.clone(),
@@ -97,6 +109,9 @@ impl ResponsesWire {
     ) -> Result<PreparedProviderRequest, ProviderError> {
         let (mut body, stable_prefixes) = self.parser.request_body_with_prefixes(messages, tools);
         body["max_output_tokens"] = Value::from(self.max_output_tokens);
+        if self.store_responses {
+            body["store"] = Value::Bool(true);
+        }
         self.scope_prompt_cache_key(&mut body);
         PreparedProviderRequest::from_http_body_with_prefixes(
             self.endpoint.clone(),
@@ -182,11 +197,22 @@ impl WireAdapter {
         }
     }
 
+    pub(super) fn closing_tool_choice(&self) -> Option<Value> {
+        match self {
+            Self::Chat(adapter) => adapter.closing_tool_choice(),
+            Self::Messages(adapter) => adapter.closing_tool_choice(),
+            Self::Responses(wire) => wire.parser.closing_tool_choice(),
+        }
+    }
+
     pub(super) fn materialize_prompt_cache_intent(&self, body: &mut Value) {
         match self {
             Self::Chat(adapter) => adapter.materialize_prompt_cache_intent(body),
             Self::Messages(adapter) => adapter.materialize_prompt_cache_intent(body),
-            Self::Responses(wire) => wire.parser.materialize_prompt_cache_intent(body),
+            Self::Responses(wire) => {
+                wire.parser.materialize_prompt_cache_intent(body);
+                wire.scope_prompt_cache_key(body);
+            }
         }
     }
 
@@ -195,6 +221,14 @@ impl WireAdapter {
             Self::Chat(adapter) => adapter.response_cache_scope_id(),
             Self::Messages(adapter) => adapter.response_cache_scope_id(),
             Self::Responses(wire) => wire.parser.response_cache_scope_id(),
+        }
+    }
+
+    pub(super) fn reasoning_scope_fingerprint(&self) -> u64 {
+        match self {
+            Self::Chat(adapter) => adapter.reasoning_scope_fingerprint(),
+            Self::Messages(adapter) => adapter.reasoning_scope_fingerprint(),
+            Self::Responses(wire) => wire.parser.reasoning_scope_fingerprint(),
         }
     }
 

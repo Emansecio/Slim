@@ -33,6 +33,8 @@ pub struct TurnInfo {
     /// The turn's operation reached `Finished` or `Aborted`. Only terminal
     /// turns are valid rewind targets.
     pub terminal: bool,
+    /// Disk checkpoint captured just before this turn started, if available.
+    pub checkpoint: Option<crate::checkpoint::TurnCheckpoint>,
 }
 
 #[derive(Debug)]
@@ -171,6 +173,55 @@ pub fn fork_session_before_turn(
     Ok(child_path)
 }
 
+/// Forks a healthy settled session after all completed turns into a fresh child
+/// journal so a swarm worker or branched session inherits the exact history
+/// and prompt cache prefix without mutating the source.
+pub fn fork_session_completed(path: &Path, child_id: &str) -> Result<PathBuf, TurnError> {
+    validate_child_id(child_id).map_err(|error| TurnError::InvalidChildId(error.to_string()))?;
+    let report = healthy_v2(path)?;
+    let turns = scan_turns(&report.records);
+    if let Some(last) = turns.last() {
+        if !last.terminal {
+            return Err(TurnError::TurnNotTerminal {
+                index: turns.len() - 1,
+            });
+        }
+    }
+    if has_open_operation(&report.records) {
+        return Err(TurnError::OpenWorkBeforeTurn { index: turns.len() });
+    }
+
+    let header = report
+        .header
+        .as_ref()
+        .ok_or_else(|| TurnError::NotHealthy("durable session header is missing".into()))?;
+    let parent_id = report
+        .session_id
+        .clone()
+        .ok_or_else(|| TurnError::NotHealthy("durable session id is missing".into()))?;
+    let directory = report
+        .path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "session has no directory"))?;
+    let child_path = directory.join(format!("{child_id}.jsonl"));
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let child_header = DurableSessionHeader::new(
+        child_id,
+        created.to_string(),
+        header.cwd.clone(),
+        Some(parent_id),
+        report.records.last().map(DurableRecord::seq),
+    );
+    drop(JsonlRepo::create_with_records(
+        &child_path,
+        child_header,
+        report.records,
+    )?);
+    Ok(child_path)
+}
+
 /// What a session picker needs without opening the whole file.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionPeek {
@@ -235,16 +286,27 @@ fn healthy_v2(path: &Path) -> Result<SessionPreflight, TurnError> {
 fn scan_turns(records: &[DurableRecord]) -> Vec<TurnInfo> {
     let mut input_of = BTreeMap::<&str, &str>::new();
     let mut terminal = BTreeSet::<&str>::new();
+    let mut checkpoints = BTreeMap::<u64, crate::checkpoint::TurnCheckpoint>::new();
     for record in records {
-        let DurableRecord::Operation { operation, .. } = record else {
-            continue;
-        };
-        match &operation.kind {
-            DurableOperationKind::Started { input_entry_id } => {
-                input_of.insert(&operation.operation_id, input_entry_id);
-            }
-            DurableOperationKind::Finished { .. } | DurableOperationKind::Aborted => {
-                terminal.insert(&operation.operation_id);
+        match record {
+            DurableRecord::Operation { operation, .. } => match &operation.kind {
+                DurableOperationKind::Started { input_entry_id } => {
+                    input_of.insert(&operation.operation_id, input_entry_id);
+                }
+                DurableOperationKind::Finished { .. } | DurableOperationKind::Aborted => {
+                    terminal.insert(&operation.operation_id);
+                }
+                _ => {}
+            },
+            DurableRecord::Fact { fact, .. }
+                if fact.namespace == crate::checkpoint::TURN_CHECKPOINT_NAMESPACE =>
+            {
+                if let (Ok(turn_seq), Ok(cp)) = (
+                    fact.key.parse::<u64>(),
+                    serde_json::from_value::<crate::checkpoint::TurnCheckpoint>(fact.value.clone()),
+                ) {
+                    checkpoints.insert(turn_seq, cp);
+                }
             }
             _ => {}
         }
@@ -264,6 +326,7 @@ fn scan_turns(records: &[DurableRecord]) -> Vec<TurnInfo> {
             first_seq: *seq,
             prompt: prompt_preview(&entry.content).unwrap_or_default(),
             terminal: terminal.contains(entry.operation_id.as_str()),
+            checkpoint: checkpoints.get(seq).cloned(),
         });
     }
     turns

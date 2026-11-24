@@ -8,11 +8,11 @@
 //! the `AssignModel` router), same field layout, same auth-in-protobuf-metadata.
 //! Auth never travels in headers: `Metadata.api_key` carries the credential.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,9 +20,9 @@ use sha2::{Digest, Sha256};
 
 use super::catalog_fetch::MAX_CATALOG_BYTES;
 use super::{
-    normalize_messages, redact_values, HttpRequest, PreparedProviderRequest, ProviderAdapter,
-    ProviderCapabilities, ProviderError, ProviderEvent, ProviderKind, ProviderMessage,
-    StreamWire, UsageBreakdown,
+    normalize_messages, redact_values, ConnectFrameParser, HttpRequest, PreparedProviderRequest,
+    ProviderAdapter, ProviderCapabilities, ProviderError, ProviderEvent, ProviderKind,
+    ProviderMessage, StreamWire, UsageBreakdown,
 };
 
 /// Base host for Devin's Cascade API (Connect protocol over HTTP/1.1).
@@ -401,8 +401,12 @@ fn encode_tool_call(id: &str, name: &str, arguments_json: &str) -> Vec<u8> {
 
 /// Replayed ids may come from another provider; Cascade forwards them to the
 /// backend serving the chat model, which rejects them opaquely when invalid.
+/// Short ids with invalid punctuation are sanitized in place; oversized ids
+/// (> 40 chars) keep a deterministic 16-hex SHA-256 suffix within 40 chars so
+/// two foreign ids sharing a 40-char prefix never collide.
 fn wire_tool_call_id(id: &str) -> String {
-    id.chars()
+    let sanitized: String = id
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
                 c
@@ -410,8 +414,19 @@ fn wire_tool_call_id(id: &str) -> String {
                 '_'
             }
         })
-        .take(TOOL_CALL_ID_MAX_LENGTH)
-        .collect()
+        .collect();
+    if sanitized.len() <= TOOL_CALL_ID_MAX_LENGTH {
+        return sanitized;
+    }
+    const HASH_LEN: usize = 16;
+    let head_len = TOOL_CALL_ID_MAX_LENGTH - 1 - HASH_LEN;
+    let digest = Sha256::digest(id.as_bytes());
+    let mut hash = String::with_capacity(HASH_LEN);
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut hash, "{byte:02x}");
+    }
+    format!("{}_{hash}", &sanitized[..head_len])
 }
 
 /// Cascade's Gemini backend rejects JSON Schema type arrays such as
@@ -518,6 +533,89 @@ struct PendingChatBody {
     cascade_id: String,
     /// Encoded once the chat uid is final: Gemini needs scalar schema types.
     tools: Vec<Value>,
+    /// Compactable history byte count captured when this request was prepared.
+    history_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedDevinJwt {
+    user_jwt: String,
+    base_url: String,
+    expires_at: Instant,
+}
+
+static JWT_CACHE: OnceLock<Mutex<HashMap<[u8; 32], CachedDevinJwt>>> = OnceLock::new();
+
+fn jwt_cache_key(endpoint: &str, api_key: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(endpoint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(api_key.as_bytes());
+    hasher.finalize().into()
+}
+
+fn decode_base64url_segment(segment: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'-' | b'+' => Some(62),
+            b'_' | b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = segment
+        .bytes()
+        .filter(|&b| b != b'=')
+        .map(val)
+        .collect::<Option<_>>()?;
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 2 {
+            return None;
+        }
+        out.push((chunk[0] << 2) | (chunk[1] >> 4));
+        if chunk.len() >= 3 {
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        if chunk.len() >= 4 {
+            out.push((chunk[2] << 6) | chunk[3]);
+        }
+    }
+    Some(out)
+}
+
+fn jwt_cache_ttl(jwt: &str) -> Duration {
+    const DEFAULT_TTL: Duration = Duration::from_secs(300);
+    const SAFETY_MARGIN_SECS: u64 = 60;
+    let Some(payload) = jwt.split('.').nth(1).and_then(decode_base64url_segment) else {
+        return DEFAULT_TTL;
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(&payload) else {
+        return DEFAULT_TTL;
+    };
+    let Some(exp) = json.get("exp").and_then(Value::as_u64) else {
+        return DEFAULT_TTL;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let remaining = exp.saturating_sub(now);
+    if remaining <= SAFETY_MARGIN_SECS {
+        return Duration::ZERO;
+    }
+    Duration::from_secs((remaining - SAFETY_MARGIN_SECS).clamp(30, 900))
+}
+
+fn invalidate_cached_jwt(endpoint: &str, api_key: &str) {
+    if let Some(cache) = JWT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&jwt_cache_key(endpoint, api_key));
+    }
 }
 
 /// Text and images of a user/tool turn: blocks replace `content` when present.
@@ -1435,9 +1533,12 @@ pub struct DevinAdapter {
     parallel_tool_calls: bool,
     /// See [`compactable_history_bytes`]; recorded per prepared request.
     history_bytes: AtomicUsize,
-    /// One in-flight request's pending semantic body; consumed by
-    /// `connect_preflight` when auth splicing happens.
-    pending: Mutex<Option<PendingChatBody>>,
+    next_pending_id: AtomicU64,
+    /// In-flight prepared bodies keyed by `connect_request_id` so concurrent
+    /// subagents or speculative compactions sharing an adapter never collide.
+    pending: Mutex<HashMap<u64, PendingChatBody>>,
+    /// Per-stream `history_bytes` captured by `connect_preflight` for `new_connect_parser`.
+    stream_history_bytes: Mutex<HashMap<u64, usize>>,
     stream: Mutex<DevinStreamState>,
 }
 
@@ -1470,7 +1571,9 @@ impl DevinAdapter {
             chat_model_uid: model.to_owned(),
             parallel_tool_calls: false,
             history_bytes: AtomicUsize::new(0),
-            pending: Mutex::new(None),
+            next_pending_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            stream_history_bytes: Mutex::new(HashMap::new()),
             stream: Mutex::new(DevinStreamState::default()),
         })
     }
@@ -1512,14 +1615,20 @@ impl DevinAdapter {
     }
 
     /// Build the pending chat body for `messages` + `tools`.
-    fn build_pending(&self, messages: &[ProviderMessage], tools: &[Value]) -> PendingChatBody {
+    fn build_pending(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+        system_prompt_override: Option<&str>,
+        include_prompt_cache: bool,
+    ) -> PendingChatBody {
         let prompts = build_chat_prompts(self, messages);
-        self.history_bytes.store(
-            compactable_history_bytes(messages, &prompts),
-            Ordering::Relaxed,
-        );
+        let history_bytes = compactable_history_bytes(messages, &prompts);
+        self.history_bytes.store(history_bytes, Ordering::Relaxed);
         let mut body = Vec::with_capacity(4096);
-        let system_prompt = self.system_prompt.as_deref().unwrap_or_default();
+        let system_prompt = system_prompt_override
+            .or(self.system_prompt.as_deref())
+            .unwrap_or_default();
         proto_string_field(&mut body, 2, system_prompt);
         for parts in &prompts {
             proto_message_field(&mut body, 3, encode_chat_message_prompt(parts));
@@ -1528,7 +1637,9 @@ impl DevinAdapter {
         proto_message_field(&mut body, 8, encode_completion_configuration(self.max_output_tokens.into()));
         proto_bool_field(&mut body, 11, !self.parallel_tool_calls);
         proto_message_field(&mut body, 12, encode_tool_choice_auto());
-        proto_message_field(&mut body, 13, encode_prompt_cache_options());
+        if include_prompt_cache {
+            proto_message_field(&mut body, 13, encode_prompt_cache_options());
+        }
         proto_string_field(&mut body, 16, &self.cascade_id);
         proto_varint_field(&mut body, 20, PLANNER_MODE_DEFAULT);
         proto_string_field(&mut body, 22, &random_uuid());
@@ -1565,6 +1676,7 @@ impl DevinAdapter {
             router_prompt,
             cascade_id: self.cascade_id.clone(),
             tools: tools.to_vec(),
+            history_bytes,
         }
     }
 
@@ -1604,13 +1716,26 @@ impl DevinAdapter {
     }
 
     fn prepare(&self, messages: &[ProviderMessage], tools: &[Value]) -> PreparedProviderRequest {
-        let pending = self.build_pending(messages, tools);
+        self.prepare_with_options(messages, tools, None, true)
+    }
+
+    fn prepare_with_options(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+        system_prompt_override: Option<&str>,
+        include_prompt_cache: bool,
+    ) -> PreparedProviderRequest {
+        let pending = self.build_pending(messages, tools, system_prompt_override, include_prompt_cache);
+        let system = system_prompt_override
+            .or(self.system_prompt.as_deref())
+            .unwrap_or_default();
         // The routed identity is opaque JSON: provider, model, endpoint and the
         // per-item digests — the same inputs a JSON request would fingerprint.
         let summary = json!({
             "provider": "devin",
             "model": self.model_id,
-            "system_prompt": self.system_prompt.as_deref().unwrap_or_default(),
+            "system": system,
             "tools": tools.iter().map(|tool| tool.get("name").cloned().unwrap_or_default()).collect::<Vec<_>>(),
             "messages": messages.iter().map(|message| json!({
                 "role": message.role,
@@ -1628,6 +1753,7 @@ impl DevinAdapter {
             ("user-agent".to_owned(), "connect-go/1.18.1 (go1.26.3)".to_owned()),
         ];
         let url = format!("{}{}", self.endpoint, DEVIN_CHAT_MESSAGE_PATH);
+        let req_id = self.next_pending_id.fetch_add(1, Ordering::Relaxed);
         let request = PreparedProviderRequest::from_parts(
             url,
             headers,
@@ -1635,8 +1761,20 @@ impl DevinAdapter {
             serde_json::to_string(&summary).unwrap_or_default(),
             Some(self.api_key.clone()),
             self,
-        );
-        *self.pending.lock().unwrap_or_else(|error| error.into_inner()) = Some(pending);
+        )
+        .with_connect_request_id(req_id);
+        {
+            let mut map = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if map.len() >= 64 {
+                if let Some(&oldest) = map.keys().min() {
+                    map.remove(&oldest);
+                }
+            }
+            map.insert(req_id, pending);
+        }
         request
     }
 
@@ -1758,6 +1896,21 @@ impl ProviderAdapter for DevinAdapter {
         self.response_cache_scope_id
     }
 
+    fn reasoning_scope_fingerprint(&self) -> u64 {
+        // Dynamic routers (`adaptive`) may switch backend models between turns,
+        // so replaying signed thinking from a prior routed turn is unsafe.
+        if self.model_router {
+            return 0;
+        }
+        let auth = super::ProviderAuth::ApiKey(self.api_key.clone());
+        super::provider_reasoning_scope_fingerprint(
+            ProviderKind::Devin,
+            &self.endpoint,
+            &auth,
+            &self.chat_model_uid,
+        )
+    }
+
     fn reasoning_classification(&self) -> Option<super::ReasoningClassification> {
         Some(super::ReasoningClassification::Text)
     }
@@ -1795,7 +1948,12 @@ impl ProviderAdapter for DevinAdapter {
         messages: &[ProviderMessage],
     ) -> Result<PreparedProviderRequest, ProviderError> {
         normalize_messages(messages)?;
-        Ok(self.prepare(messages, &[]))
+        Ok(self.prepare_with_options(
+            messages,
+            &[],
+            Some(crate::context::SUMMARIZATION_SYSTEM_PROMPT),
+            false,
+        ))
     }
 
     fn connect_preflight<'a>(
@@ -1806,64 +1964,51 @@ impl ProviderAdapter for DevinAdapter {
         Box<dyn Future<Output = Result<PreparedProviderRequest, ProviderError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-                .ok_or_else(|| ProviderError::InvalidResponse {
-                    message: "devin: prepared request carried no pending body".into(),
-                })?;
-            // Reset per-request stream state before the first frame can land.
-            *self.lock_stream() = DevinStreamState::default();
-
-            // GetUserJwt: bare/protobuf unary call.
-            let jwt_payload = Self::unary_rpc(
-                client,
-                &self.endpoint,
-                DEVIN_AUTH_PATH,
-                unary_request_body(encode_cli_metadata(&self.api_key, "")),
-                &self.api_key,
-                "auth",
-            )
-            .await?;
-            let jwt = decode_unary(&jwt_payload, decode_get_user_jwt).ok_or_else(|| {
-                ProviderError::InvalidResponse {
-                    message: "Devin auth error: GetUserJwt returned an empty user JWT".into(),
+            let pending = {
+                let mut map = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match request.connect_request_id {
+                    Some(id) => map.remove(&id),
+                    None => map.keys().next().copied().and_then(|id| map.remove(&id)),
                 }
+            }
+            .ok_or_else(|| ProviderError::InvalidResponse {
+                message: "devin: prepared request carried no pending body".into(),
             })?;
-            let base_url = if jwt.custom_api_server_url.trim().is_empty() {
-                self.endpoint.clone()
-            } else {
-                jwt.custom_api_server_url.trim().trim_end_matches('/').to_owned()
-            };
+            if let Some(id) = request.connect_request_id {
+                let mut hist = self
+                    .stream_history_bytes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if hist.len() >= 64 {
+                    if let Some(&oldest) = hist.keys().min() {
+                        hist.remove(&oldest);
+                    }
+                }
+                hist.insert(id, pending.history_bytes);
+            }
+
+            let (mut user_jwt, mut base_url) = self.resolve_user_jwt(client, false).await?;
 
             // Router uids resolve through AssignModel on the same cascade id.
             let (chat_model_uid, assignment_jwt) = if self.model_router {
-                let mut assign_body = Vec::with_capacity(512);
-                proto_len_field(
-                    &mut assign_body,
-                    1,
-                    &encode_cli_metadata(&self.api_key, &jwt.user_jwt),
-                );
-                proto_string_field(&mut assign_body, 2, &pending.chat_model_uid);
-                proto_string_field(&mut assign_body, 3, &pending.cascade_id);
-                proto_message_field(&mut assign_body, 5, pending.router_prompt.clone());
-                let assign_payload = Self::unary_rpc(
-                    client,
-                    &base_url,
-                    DEVIN_ASSIGN_MODEL_PATH,
-                    assign_body,
-                    &self.api_key,
-                    "AssignModel",
-                )
-                .await?;
-                let assignment = decode_unary(&assign_payload, decode_assign_model).ok_or_else(
-                    || ProviderError::InvalidResponse {
-                        message: "Devin AssignModel returned no assignment JWT and model uid".into(),
-                    },
-                )?;
-                (assignment.model_uid, assignment.assignment_jwt)
+                let assign_res = self
+                    .assign_model(client, &base_url, &user_jwt, &pending)
+                    .await;
+                match assign_res {
+                    Ok(assigned) => assigned,
+                    Err(ProviderError::Http {
+                        status: 401 | 403, ..
+                    }) => {
+                        invalidate_cached_jwt(&self.endpoint, &self.api_key);
+                        (user_jwt, base_url) = self.resolve_user_jwt(client, true).await?;
+                        self.assign_model(client, &base_url, &user_jwt, &pending)
+                            .await?
+                    }
+                    Err(err) => return Err(err),
+                }
             } else {
                 (pending.chat_model_uid.clone(), String::new())
             };
@@ -1875,7 +2020,7 @@ impl ProviderAdapter for DevinAdapter {
             proto_len_field(
                 &mut body,
                 1,
-                &encode_cli_metadata(&self.api_key, &jwt.user_jwt),
+                &encode_cli_metadata(&self.api_key, &user_jwt),
             );
             proto_string_field(&mut body, 21, &chat_model_uid);
             if !assignment_jwt.is_empty() {
@@ -1894,7 +2039,7 @@ impl ProviderAdapter for DevinAdapter {
 
             let mut request = request
                 .with_url_and_body(format!("{}{}", base_url, DEVIN_CHAT_MESSAGE_PATH), framed);
-            request.push_sensitive_value(jwt.user_jwt);
+            request.push_sensitive_value(user_jwt);
             if !assignment_jwt.is_empty() {
                 request.push_sensitive_value(assignment_jwt);
             }
@@ -1902,96 +2047,49 @@ impl ProviderAdapter for DevinAdapter {
         })
     }
 
+    fn new_connect_parser(
+        &self,
+        request: &PreparedProviderRequest,
+    ) -> Option<Box<dyn ConnectFrameParser>> {
+        let history_bytes = request
+            .connect_request_id
+            .and_then(|id| {
+                self.stream_history_bytes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&id)
+            })
+            .unwrap_or_else(|| self.history_bytes.load(Ordering::Relaxed));
+        Some(Box::new(DevinConnectParser {
+            model_id: self.model_id.clone(),
+            response_cache_scope_id: self.response_cache_scope_id,
+            reasoning_scope_fingerprint: self.reasoning_scope_fingerprint(),
+            sensitive_values: self.sensitive_values(),
+            history_bytes,
+            state: DevinStreamState::default(),
+        }))
+    }
+
+    fn on_http_error(&self, status: u16) {
+        if matches!(status, 401 | 403) {
+            invalidate_cached_jwt(&self.endpoint, &self.api_key);
+        }
+    }
+
     fn parse_connect_frame(
         &self,
         payload: &[u8],
         trailer: bool,
     ) -> Result<Vec<ProviderEvent>, ProviderError> {
-        if trailer {
-            return self.parse_trailer(payload);
-        }
-        let delta = decode_chat_delta(payload);
-        let mut events = Vec::new();
+        let ctx = FrameParseCtx {
+            model_id: &self.model_id,
+            response_cache_scope_id: self.response_cache_scope_id,
+            reasoning_scope_fingerprint: self.reasoning_scope_fingerprint(),
+            sensitive_values: self.sensitive_values(),
+            history_bytes: self.history_bytes.load(Ordering::Relaxed),
+        };
         let mut state = self.lock_stream();
-        if !delta.delta_signature.is_empty() {
-            state.signature = delta.delta_signature;
-        }
-        if !delta.delta_thinking.is_empty() {
-            state.saw_output = true;
-            if !state.reasoning_open {
-                state.reasoning_open = true;
-                events.push(ProviderEvent::ReasoningStarted);
-            }
-            if let Some(scope_id) = self.response_cache_scope_id {
-                events.push(ProviderEvent::ChatReasoning(super::ChatReasoning {
-                    scope_id,
-                    model: self.model_id.clone(),
-                    content: delta.delta_thinking.clone(),
-                    details: Vec::new(),
-                }));
-            }
-            events.push(ProviderEvent::ReasoningDelta(delta.delta_thinking));
-        }
-        if !delta.delta_text.is_empty() {
-            state.saw_output = true;
-            if state.reasoning_open {
-                state.reasoning_open = false;
-                events.push(ProviderEvent::ReasoningEnded);
-            }
-            events.push(ProviderEvent::TextDelta(delta.delta_text));
-        }
-        for (id, name, args) in delta.tool_calls {
-            let call_id = if !id.is_empty() {
-                state.last_tool_id = Some(id.clone());
-                id
-            } else {
-                match state.last_tool_id.clone() {
-                    Some(id) => id,
-                    None => continue,
-                }
-            };
-            state.saw_output = true;
-            let first_fragment = !state.tool_names.contains_key(&call_id);
-            if !name.is_empty() {
-                state.tool_names.insert(call_id.clone(), name);
-            }
-            // arguments_json may arrive cumulative (replace) or chunked (append).
-            let previous = state.tool_args.get(&call_id).cloned().unwrap_or_default();
-            let accumulated = if args.starts_with(&previous) {
-                args
-            } else {
-                format!("{previous}{args}")
-            };
-            let delta_args = accumulated[previous.len()..].to_owned();
-            state.tool_args.insert(call_id.clone(), accumulated);
-            if first_fragment || !delta_args.is_empty() {
-                events.push(ProviderEvent::ToolCallDelta {
-                    index: None,
-                    id: Some(call_id.clone()),
-                    name: state.tool_names.get(&call_id).cloned(),
-                    arguments: delta_args,
-                });
-            }
-        }
-        if delta.stop_reason != 0 {
-            state.stop_reason = delta.stop_reason;
-        }
-        if delta.has_usage {
-            state.has_usage = true;
-            // `input_tokens` excludes cache reads and writes on this wire.
-            state.usage.uncached_input_tokens = delta.input_tokens;
-            state.usage.cache_write_tokens = delta.cache_write_tokens;
-            state.usage.cache_read_tokens = delta.cache_read_tokens;
-            state.usage.output_tokens = delta.output_tokens;
-            events.push(ProviderEvent::UsagePartial {
-                input_tokens: state.usage.total_input_tokens(),
-                output_tokens: delta.output_tokens,
-                input_complete: !state.usage_reported,
-                output_complete: false,
-            });
-            state.usage_reported = true;
-        }
-        Ok(events)
+        parse_connect_frame_with_state(&ctx, &mut state, payload, trailer)
     }
 
     fn parse_event(&self, _value: &Value) -> Result<Vec<ProviderEvent>, ProviderError> {
@@ -2001,120 +2099,351 @@ impl ProviderAdapter for DevinAdapter {
     }
 }
 
-impl DevinAdapter {
-    /// End-of-stream trailer: `{error:{code,message}}` or empty. On success the
-    /// accumulated tool calls finalize and the terminal usage/stop land.
-    fn parse_trailer(&self, payload: &[u8]) -> Result<Vec<ProviderEvent>, ProviderError> {
-        let text = String::from_utf8_lossy(payload);
-        let text = text.trim();
-        if !text.is_empty() {
-            if let Ok(value) = serde_json::from_str::<Value>(text) {
-                if let Some(error) = value.get("error") {
-                    let code = error
-                        .get("code")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("provider rejected the stream");
-                    let sensitive = self.sensitive_values();
-                    let message = redact_values(message, &sensitive);
-                    if self.is_large_history_rejection(code, &message) {
-                        return Err(ProviderError::Api {
-                            metadata: Box::new(super::ProviderErrorMetadata {
-                                status: None,
-                                code: Some("context_length_exceeded".to_owned()),
-                                error_type: None,
-                                detail_code: None,
-                                retry_after: None,
-                            }),
-                            message: format!("devin stream rejected ({code}): {message}"),
-                        });
-                    }
-                    let transient = matches!(
-                        code,
-                        "internal" | "unavailable" | "resource_exhausted" | "deadline_exceeded"
-                    );
-                    return Err(if transient {
-                        ProviderError::TransientRemote {
-                            message: format!("devin stream rejected ({code}): {message}"),
-                        }
-                    } else {
-                        ProviderError::Api {
-                            metadata: Box::new(super::ProviderErrorMetadata {
-                                status: None,
-                                code: Some(code.to_owned()),
-                                error_type: None,
-                                detail_code: None,
-                                retry_after: None,
-                            }),
-                            message: format!("devin stream rejected ({code}): {message}"),
-                        }
-                    });
-                }
+struct FrameParseCtx<'a> {
+    model_id: &'a str,
+    response_cache_scope_id: Option<u64>,
+    reasoning_scope_fingerprint: u64,
+    sensitive_values: Vec<String>,
+    history_bytes: usize,
+}
+
+struct DevinConnectParser {
+    model_id: String,
+    response_cache_scope_id: Option<u64>,
+    reasoning_scope_fingerprint: u64,
+    sensitive_values: Vec<String>,
+    history_bytes: usize,
+    state: DevinStreamState,
+}
+
+impl ConnectFrameParser for DevinConnectParser {
+    fn parse_frame(
+        &mut self,
+        payload: &[u8],
+        trailer: bool,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let ctx = FrameParseCtx {
+            model_id: &self.model_id,
+            response_cache_scope_id: self.response_cache_scope_id,
+            reasoning_scope_fingerprint: self.reasoning_scope_fingerprint,
+            sensitive_values: self.sensitive_values.clone(),
+            history_bytes: self.history_bytes,
+        };
+        parse_connect_frame_with_state(&ctx, &mut self.state, payload, trailer)
+    }
+}
+
+fn parse_connect_frame_with_state(
+    ctx: &FrameParseCtx<'_>,
+    state: &mut DevinStreamState,
+    payload: &[u8],
+    trailer: bool,
+) -> Result<Vec<ProviderEvent>, ProviderError> {
+    if trailer {
+        return parse_trailer_with_state(ctx, state, payload);
+    }
+    let delta = decode_chat_delta(payload);
+    let mut events = Vec::new();
+    if !delta.delta_signature.is_empty() {
+        if delta.delta_signature.starts_with(&state.signature) {
+            state.signature = delta.delta_signature;
+        } else {
+            state.signature.push_str(&delta.delta_signature);
+        }
+    }
+    if !delta.delta_thinking.is_empty() {
+        state.saw_output = true;
+        if !state.reasoning_open {
+            state.reasoning_open = true;
+            events.push(ProviderEvent::ReasoningStarted);
+        }
+        let provenance = ctx.reasoning_scope_fingerprint;
+        if provenance != 0 {
+            if let Some(scope_id) = ctx.response_cache_scope_id {
+                events.push(ProviderEvent::ChatReasoning(super::ChatReasoning {
+                    scope_id,
+                    model: ctx.model_id.to_owned(),
+                    provenance,
+                    content: delta.delta_thinking.clone(),
+                    details: Vec::new(),
+                }));
             }
         }
-        let mut state = self.lock_stream();
-        state.saw_trailer = true;
-        let mut events = Vec::new();
+        events.push(ProviderEvent::ReasoningDelta(delta.delta_thinking));
+    }
+    if !delta.delta_text.is_empty() {
+        state.saw_output = true;
         if state.reasoning_open {
             state.reasoning_open = false;
             events.push(ProviderEvent::ReasoningEnded);
         }
-        if !state.signature.is_empty() {
-            if let Some(scope_id) = self.response_cache_scope_id {
+        events.push(ProviderEvent::TextDelta(delta.delta_text));
+    }
+    for (id, name, args) in delta.tool_calls {
+        let call_id = if !id.is_empty() {
+            state.last_tool_id = Some(id.clone());
+            id
+        } else {
+            match state.last_tool_id.clone() {
+                Some(id) => id,
+                None => continue,
+            }
+        };
+        state.saw_output = true;
+        let first_fragment = !state.tool_names.contains_key(&call_id);
+        if !name.is_empty() {
+            state.tool_names.insert(call_id.clone(), name);
+        }
+        // arguments_json may arrive cumulative (replace) or chunked (append).
+        let previous = state.tool_args.get(&call_id).cloned().unwrap_or_default();
+        let accumulated = if args.starts_with(&previous) {
+            args
+        } else {
+            format!("{previous}{args}")
+        };
+        let delta_args = accumulated[previous.len()..].to_owned();
+        state.tool_args.insert(call_id.clone(), accumulated);
+        if first_fragment || !delta_args.is_empty() {
+            events.push(ProviderEvent::ToolCallDelta {
+                index: None,
+                id: Some(call_id.clone()),
+                name: state.tool_names.get(&call_id).cloned(),
+                arguments: delta_args,
+            });
+        }
+    }
+    if delta.stop_reason != 0 {
+        state.stop_reason = delta.stop_reason;
+    }
+    if delta.has_usage {
+        state.has_usage = true;
+        // `input_tokens` excludes cache reads and writes on this wire.
+        state.usage.uncached_input_tokens = delta.input_tokens;
+        state.usage.cache_write_tokens = delta.cache_write_tokens;
+        state.usage.cache_read_tokens = delta.cache_read_tokens;
+        state.usage.output_tokens = delta.output_tokens;
+        events.push(ProviderEvent::UsagePartial {
+            input_tokens: state.usage.total_input_tokens(),
+            output_tokens: delta.output_tokens,
+            input_complete: !state.usage_reported,
+            output_complete: false,
+        });
+        state.usage_reported = true;
+    }
+    Ok(events)
+}
+
+fn parse_trailer_with_state(
+    ctx: &FrameParseCtx<'_>,
+    state: &mut DevinStreamState,
+    payload: &[u8],
+) -> Result<Vec<ProviderEvent>, ProviderError> {
+    let text = String::from_utf8_lossy(payload);
+    let text = text.trim();
+    if !text.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            if let Some(error) = value.get("error") {
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider rejected the stream");
+                let message = redact_values(message, &ctx.sensitive_values);
+                let is_large_history = code.eq_ignore_ascii_case("invalid_argument")
+                    && message.to_ascii_lowercase().contains("internal error")
+                    && !state.saw_output
+                    && ctx.history_bytes >= LARGE_HISTORY_RECOVERY_BYTES;
+                if is_large_history {
+                    return Err(ProviderError::Api {
+                        metadata: Box::new(super::ProviderErrorMetadata {
+                            status: None,
+                            code: Some("context_length_exceeded".to_owned()),
+                            error_type: None,
+                            detail_code: None,
+                            retry_after: None,
+                        }),
+                        message: format!("devin stream rejected ({code}): {message}"),
+                    });
+                }
+                let transient = matches!(
+                    code,
+                    "internal" | "unavailable" | "resource_exhausted" | "deadline_exceeded"
+                );
+                return Err(if transient {
+                    ProviderError::TransientRemote {
+                        message: format!("devin stream rejected ({code}): {message}"),
+                    }
+                } else {
+                    ProviderError::Api {
+                        metadata: Box::new(super::ProviderErrorMetadata {
+                            status: None,
+                            code: Some(code.to_owned()),
+                            error_type: None,
+                            detail_code: None,
+                            retry_after: None,
+                        }),
+                        message: format!("devin stream rejected ({code}): {message}"),
+                    }
+                });
+            }
+        }
+    }
+    state.saw_trailer = true;
+    let mut events = Vec::new();
+    if state.reasoning_open {
+        state.reasoning_open = false;
+        events.push(ProviderEvent::ReasoningEnded);
+    }
+    if !state.signature.is_empty() {
+        let provenance = ctx.reasoning_scope_fingerprint;
+        if provenance != 0 {
+            if let Some(scope_id) = ctx.response_cache_scope_id {
                 events.push(ProviderEvent::ChatReasoning(super::ChatReasoning {
                     scope_id,
-                    model: self.model_id.clone(),
+                    model: ctx.model_id.to_owned(),
+                    provenance,
                     content: String::new(),
                     details: vec![json!({ "signature": state.signature })],
                 }));
             }
         }
-        // Arguments already streamed as deltas; a call without any still needs
-        // valid JSON to execute.
-        let empty_calls = state
-            .tool_args
-            .iter()
-            .filter(|(_, arguments)| arguments.is_empty())
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in empty_calls {
-            events.push(ProviderEvent::ToolCallDelta {
-                index: None,
-                id: Some(id),
-                name: None,
-                arguments: "{}".to_owned(),
-            });
-        }
-        if state.has_usage {
-            events.push(ProviderEvent::UsageBreakdown { usage: state.usage });
-            events.push(ProviderEvent::Usage {
-                input_tokens: state.usage.total_input_tokens(),
-                output_tokens: state.usage.output_tokens,
-            });
-        }
-        let reason = if !state.tool_names.is_empty() {
-            "tool_use"
-        } else if state.stop_reason == STOP_REASON_MAX_TOKENS {
-            "max_tokens"
-        } else {
-            "stop"
-        };
-        events.push(ProviderEvent::Stopped {
-            reason: reason.to_owned(),
+    }
+    // Arguments already streamed as deltas; a call without any still needs
+    // valid JSON to execute.
+    let empty_calls = state
+        .tool_args
+        .iter()
+        .filter(|(_, arguments)| arguments.is_empty())
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in empty_calls {
+        events.push(ProviderEvent::ToolCallDelta {
+            index: None,
+            id: Some(id),
+            name: None,
+            arguments: "{}".to_owned(),
         });
-        Ok(events)
+    }
+    if state.has_usage {
+        events.push(ProviderEvent::UsageBreakdown { usage: state.usage });
+        events.push(ProviderEvent::Usage {
+            input_tokens: state.usage.total_input_tokens(),
+            output_tokens: state.usage.output_tokens,
+        });
+    }
+    let reason = if !state.tool_names.is_empty() {
+        "tool_use"
+    } else if state.stop_reason == STOP_REASON_MAX_TOKENS {
+        "max_tokens"
+    } else {
+        "stop"
+    };
+    events.push(ProviderEvent::Stopped {
+        reason: reason.to_owned(),
+    });
+    Ok(events)
+}
+
+impl DevinAdapter {
+    async fn resolve_user_jwt(
+        &self,
+        client: &reqwest::Client,
+        force_refresh: bool,
+    ) -> Result<(String, String), ProviderError> {
+        let key = jwt_cache_key(&self.endpoint, &self.api_key);
+        if !force_refresh {
+            let cache = JWT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(entry) = guard.get(&key) {
+                if Instant::now() < entry.expires_at {
+                    return Ok((entry.user_jwt.clone(), entry.base_url.clone()));
+                }
+            }
+        }
+        let jwt_payload = Self::unary_rpc(
+            client,
+            &self.endpoint,
+            DEVIN_AUTH_PATH,
+            unary_request_body(encode_cli_metadata(&self.api_key, "")),
+            &self.api_key,
+            "auth",
+        )
+        .await?;
+        let jwt = decode_unary(&jwt_payload, decode_get_user_jwt).ok_or_else(|| {
+            ProviderError::InvalidResponse {
+                message: "Devin auth error: GetUserJwt returned an empty user JWT".into(),
+            }
+        })?;
+        let base_url = if jwt.custom_api_server_url.trim().is_empty() {
+            self.endpoint.clone()
+        } else {
+            jwt.custom_api_server_url
+                .trim()
+                .trim_end_matches('/')
+                .to_owned()
+        };
+        if base_url != self.endpoint {
+            super::prewarm_connection(&base_url, super::PRODUCTION_CONNECT_TIMEOUT);
+        }
+        let ttl = jwt_cache_ttl(&jwt.user_jwt);
+        if ttl > Duration::ZERO {
+            let cache = JWT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+            if guard.len() >= 32 {
+                let now = Instant::now();
+                guard.retain(|_, entry| entry.expires_at > now);
+                if guard.len() >= 32 {
+                    if let Some(evict) = guard.keys().next().copied() {
+                        guard.remove(&evict);
+                    }
+                }
+            }
+            guard.insert(
+                key,
+                CachedDevinJwt {
+                    user_jwt: jwt.user_jwt.clone(),
+                    base_url: base_url.clone(),
+                    expires_at: Instant::now() + ttl,
+                },
+            );
+        }
+        Ok((jwt.user_jwt, base_url))
     }
 
-    /// Cascade reports some oversized requests as an opaque internal
-    /// `invalid_argument`; only history compaction can shrink can recover it.
-    fn is_large_history_rejection(&self, code: &str, message: &str) -> bool {
-        code.eq_ignore_ascii_case("invalid_argument")
-            && message.to_ascii_lowercase().contains("internal error")
-            && !self.lock_stream().saw_output
-            && self.history_bytes.load(Ordering::Relaxed) >= LARGE_HISTORY_RECOVERY_BYTES
+    async fn assign_model(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        user_jwt: &str,
+        pending: &PendingChatBody,
+    ) -> Result<(String, String), ProviderError> {
+        let mut assign_body = Vec::with_capacity(512);
+        proto_len_field(
+            &mut assign_body,
+            1,
+            &encode_cli_metadata(&self.api_key, user_jwt),
+        );
+        proto_string_field(&mut assign_body, 2, &pending.chat_model_uid);
+        proto_string_field(&mut assign_body, 3, &pending.cascade_id);
+        proto_message_field(&mut assign_body, 5, pending.router_prompt.clone());
+        let assign_payload = Self::unary_rpc(
+            client,
+            base_url,
+            DEVIN_ASSIGN_MODEL_PATH,
+            assign_body,
+            &self.api_key,
+            "AssignModel",
+        )
+        .await?;
+        let assignment = decode_unary(&assign_payload, decode_assign_model).ok_or_else(|| {
+            ProviderError::InvalidResponse {
+                message: "Devin AssignModel returned no assignment JWT and model uid".into(),
+            }
+        })?;
+        Ok((assignment.model_uid, assignment.assignment_jwt))
     }
 }
 
@@ -2393,7 +2722,7 @@ mod tests {
     fn parallel_tools_are_disabled_unless_the_catalog_allows_them() {
         let adapter = adapter();
         let disabled = |adapter: &DevinAdapter| {
-            ProtoCursor::new(&adapter.build_pending(&[], &[]).body)
+            ProtoCursor::new(&adapter.build_pending(&[], &[], None, true).body)
                 .fields()
                 .iter()
                 .any(|field| field.number == 11 && field.varint == 1)
@@ -2422,5 +2751,131 @@ mod tests {
         assert!(delta.has_usage);
         assert_eq!(delta.input_tokens, 10);
         assert_eq!(delta.output_tokens, 4);
+    }
+
+    #[test]
+    fn connect_proto_adapter_survives_compaction_limit_rewrites_and_finalization() {
+        let adapter = DevinAdapter::new(DEVIN_DEFAULT_BASE_URL, "swe-2", "key", None).unwrap();
+        let client =
+            super::super::HttpProviderClient::new(adapter, std::time::Duration::from_secs(5))
+                .unwrap();
+        let messages = [
+            ProviderMessage {
+                role: "system".into(),
+                ..ProviderMessage::user("Summarize the conversation.")
+            },
+            ProviderMessage::user("hello"),
+        ];
+
+        let compacted = client
+            .prepare_compaction_messages(&messages, 4_096)
+            .expect("compaction must not parse protobuf as JSON");
+        assert!(!compacted.body().is_empty());
+        assert!(!client.adapter().pending.lock().unwrap().is_empty());
+
+        let raised = client
+            .prepare_compaction_messages_raised(&messages, 16_384)
+            .expect("raised compaction must not parse protobuf as JSON");
+        assert!(!raised.body().is_empty());
+
+        let recovered = client
+            .with_recovery_output_limit(raised, 32_768)
+            .expect("recovery output limit must pass protobuf through");
+        let capped = client
+            .with_output_limit_ceiling(recovered, 2_048)
+            .expect("output ceiling must pass protobuf through");
+        assert!(!capped.body().is_empty());
+
+        client.adapter().pending.lock().unwrap().clear();
+        let finalized = client
+            .prepare_finalization_messages(&messages, &[], true)
+            .expect("finalization must prepare protobuf request directly");
+        assert!(!finalized.body().is_empty());
+        assert!(!client.adapter().pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_connect_prepares_and_parsers_are_isolated_per_request() {
+        let adapter = std::sync::Arc::new(adapter());
+        let req_a = adapter.prepare(&[ProviderMessage::user("first")], &[]);
+        let req_b = adapter.prepare(&[ProviderMessage::user("second")], &[]);
+        assert_ne!(req_a.connect_request_id, req_b.connect_request_id);
+        assert_eq!(adapter.pending.lock().unwrap().len(), 2);
+
+        let mut parser_a = adapter.new_connect_parser(&req_a).unwrap();
+        let mut parser_b = adapter.new_connect_parser(&req_b).unwrap();
+
+        let mut frame_a = Vec::new();
+        proto_string_field(&mut frame_a, 3, "alpha");
+        let mut frame_b = Vec::new();
+        proto_string_field(&mut frame_b, 3, "beta");
+        proto_message_field(&mut frame_b, 6, encode_tool_call("c2", "read", "{}"));
+
+        let ev_a = parser_a.parse_frame(&frame_a, false).unwrap();
+        let ev_b = parser_b.parse_frame(&frame_b, false).unwrap();
+        assert!(ev_a.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "alpha")));
+        assert!(!ev_a.iter().any(|e| matches!(e, ProviderEvent::ToolCallDelta { .. })));
+        assert!(ev_b.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "beta")));
+        let end_a = parser_a.parse_frame(b"", true).unwrap();
+        let end_b = parser_b.parse_frame(b"", true).unwrap();
+        assert!(matches!(end_a.last(), Some(ProviderEvent::Stopped { reason }) if reason == "stop"));
+        assert!(matches!(end_b.last(), Some(ProviderEvent::Stopped { reason }) if reason == "tool_use"));
+    }
+
+    #[test]
+    fn jwt_exp_parser_computes_bounded_ttl() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // base64url({"exp": now + 600})
+        let header = "eyJhbGciOiJub25lIn0";
+        let payload_json = serde_json::json!({ "exp": now + 600 }).to_string();
+        let encoded_payload = {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let bytes = payload_json.as_bytes();
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0] as usize;
+                let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+                let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+                out.push(TABLE[(b0 >> 2) & 0x3f] as char);
+                out.push(TABLE[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+                if chunk.len() > 1 {
+                    out.push(TABLE[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(TABLE[b2 & 0x3f] as char);
+                }
+            }
+            out
+        };
+        let jwt = format!("{header}.{encoded_payload}.sig");
+        let ttl = jwt_cache_ttl(&jwt);
+        assert!(ttl >= Duration::from_secs(500) && ttl <= Duration::from_secs(545));
+
+        // Near-expiry token (<= 60s) must not be cached.
+        let near = {
+            let s = serde_json::json!({ "exp": now + 30 }).to_string();
+            let mut out = String::new();
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            for chunk in s.as_bytes().chunks(3) {
+                let b0 = chunk[0] as usize;
+                let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+                let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+                out.push(TABLE[(b0 >> 2) & 0x3f] as char);
+                out.push(TABLE[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+                if chunk.len() > 1 {
+                    out.push(TABLE[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(TABLE[b2 & 0x3f] as char);
+                }
+            }
+            format!("{header}.{out}.sig")
+        };
+        assert_eq!(jwt_cache_ttl(&near), Duration::ZERO);
     }
 }

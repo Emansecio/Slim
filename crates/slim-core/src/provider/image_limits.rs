@@ -35,6 +35,85 @@ pub(super) fn validate_anthropic_images(messages: &[ProviderMessage]) -> Result<
     Ok(())
 }
 
+/// Wire-only graceful degradation for cross-provider switches TO Anthropic:
+/// when a multi-turn history inherited from OpenAI/Devin contains older images
+/// that violate Anthropic's strict dimension/size/count limits (>20 images over
+/// 2000px, >8000px, or >10 MiB), replaces only the offending images in earlier
+/// messages with a text placeholder while keeping the latest user turn strictly
+/// validated. Returns `None` when the history already passes unchanged or when
+/// the latest user turn itself carries an invalid image.
+pub(crate) fn degrade_history_images_for_anthropic(
+    messages: &[ProviderMessage],
+) -> Option<Vec<ProviderMessage>> {
+    if validate_anthropic_images(messages).is_ok() || messages.len() <= 1 {
+        return None;
+    }
+    let last_user_idx = messages.iter().rposition(|message| message.role == "user");
+    // Never mask an invalid image the user just attached on the active turn.
+    if let Some(idx) = last_user_idx {
+        if validate_anthropic_images(&messages[idx..=idx]).is_err() {
+            return None;
+        }
+    }
+    let mut degraded = messages.to_vec();
+    let placeholder = || {
+        ProviderContentBlock::Text(
+            "[earlier image omitted: exceeds target model image limits]".into(),
+        )
+    };
+    let image_valid_for_limit = |media_type: &str, data: &str, max_dim: u32| -> bool {
+        if data.len() > 10 * 1024 * 1024 {
+            return false;
+        }
+        let Ok(mt) = normalize_media_type(media_type) else {
+            return false;
+        };
+        let Ok(enc) = normalize_base64(data) else {
+            return false;
+        };
+        let Some(bytes) = decode_base64(&enc) else {
+            return false;
+        };
+        dimensions(&mt, &bytes)
+            .is_some_and(|(w, h)| w > 0 && h > 0 && w <= max_dim && h <= max_dim)
+    };
+    // Pass 1: drop images in earlier messages that exceed Anthropic's 8000px / 10 MiB hard cap.
+    for (idx, message) in degraded.iter_mut().enumerate() {
+        if Some(idx) == last_user_idx {
+            continue;
+        }
+        for block in &mut message.content_blocks {
+            if let ProviderContentBlock::Image { media_type, data } = block {
+                if !image_valid_for_limit(media_type, data, 8000) {
+                    *block = placeholder();
+                }
+            }
+        }
+    }
+    if validate_anthropic_images(&degraded).is_ok() {
+        return Some(degraded);
+    }
+    // Pass 2: if total image count > 20 pushes the dimension cap down to 2000px,
+    // prune oldest images in earlier messages until the request fits.
+    'outer: for idx in 0..degraded.len() {
+        if Some(idx) == last_user_idx {
+            continue;
+        }
+        for block_idx in 0..degraded[idx].content_blocks.len() {
+            if matches!(
+                degraded[idx].content_blocks[block_idx],
+                ProviderContentBlock::Image { .. }
+            ) {
+                degraded[idx].content_blocks[block_idx] = placeholder();
+                if validate_anthropic_images(&degraded).is_ok() {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    validate_anthropic_images(&degraded).is_ok().then_some(degraded)
+}
+
 fn invalid(message: &str) -> ProviderError {
     ProviderError::InvalidResponse {
         message: message.into(),

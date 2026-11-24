@@ -233,6 +233,33 @@ impl Composer {
             .collect()
     }
 
+    /// Compares the draft payload against `expected` without allocating.
+    pub fn payload_equals(&self, expected: &str) -> bool {
+        let total_bytes: usize = self
+            .elements
+            .iter()
+            .map(|element| match element {
+                TextElement::Text(text) | TextElement::Paste { payload: text, .. } => text.len(),
+            })
+            .sum();
+        if total_bytes != expected.len() {
+            return false;
+        }
+        let mut rest = expected;
+        for element in &self.elements {
+            let part = match element {
+                TextElement::Text(text) | TextElement::Paste { payload: text, .. } => {
+                    text.as_str()
+                }
+            };
+            let Some(next) = rest.strip_prefix(part) else {
+                return false;
+            };
+            rest = next;
+        }
+        rest.is_empty()
+    }
+
     /// The draft's chars — same sequence as `payload().chars()` — without
     /// materializing the String. Keystroke-driven scans (`move_home`,
     /// `move_end`, slash completion) stay O(1) in allocation.
@@ -616,25 +643,35 @@ impl Composer {
                 let TextElement::Text(text) = element else {
                     return None;
                 };
-                let chars: Vec<char> = text.chars().collect();
-                let local = (self.cursor - offset).min(chars.len());
-                let mut start = local;
-                while start > 0 && !chars[start - 1].is_whitespace() {
-                    start -= 1;
+                let local = (self.cursor - offset).min(len);
+                let cursor_byte = char_byte_index(text, local);
+                let mut start_byte = cursor_byte;
+                let mut start_back_chars = 0usize;
+                for (byte, ch) in text[..cursor_byte].char_indices().rev() {
+                    if ch.is_whitespace() {
+                        break;
+                    }
+                    start_byte = byte;
+                    start_back_chars += 1;
                 }
-                let mut stop = local;
-                while stop < chars.len() && !chars[stop].is_whitespace() {
-                    stop += 1;
+                let start = local - start_back_chars;
+                let mut stop_byte = text.len();
+                let mut stop_fwd_chars = 0usize;
+                for (byte, ch) in text[cursor_byte..].char_indices() {
+                    if ch.is_whitespace() {
+                        stop_byte = cursor_byte + byte;
+                        break;
+                    }
+                    stop_fwd_chars += 1;
                 }
+                let stop = local + stop_fwd_chars;
                 // A token that touches a neighbouring chip is not a token.
-                if (start == 0 && offset > 0) || (stop == chars.len() && end < self.char_count) {
+                if (start_byte == 0 && offset > 0) || (stop_byte == text.len() && end < self.char_count)
+                {
                     return None;
                 }
-                if chars.get(start) != Some(&prefix) {
-                    return None;
-                }
-                let query: String = chars[start + 1..stop].iter().collect();
-                return Some((offset + start, offset + stop, query));
+                let query = text[start_byte..stop_byte].strip_prefix(prefix)?;
+                return Some((offset + start, offset + stop, query.to_owned()));
             }
             offset = end;
         }
@@ -1259,5 +1296,50 @@ mod tests {
         big.insert_text("@a");
         assert!(!big.replace_range(0, 2, &"x".repeat(MAX_DRAFT_CHARS + 1)));
         assert_eq!(big.payload(), "@a");
+    }
+
+    #[test]
+    fn payload_equals_matches_mixed_text_and_paste_without_allocating() {
+        let mut draft = Composer::default();
+        assert!(draft.payload_equals(""));
+        assert!(!draft.payload_equals("x"));
+
+        draft.insert_text("olá ");
+        draft.paste("ação\n日本語");
+        draft.insert_text(" fim");
+        let full = draft.payload();
+        assert!(draft.payload_equals(&full));
+        assert!(!draft.payload_equals(&format!("{full}!")));
+        assert!(!draft.payload_equals(&full[..full.len() - 1]));
+        assert!(!draft.payload_equals("olá ação\n日本語 fmi"));
+    }
+
+    #[test]
+    fn token_at_cursor_handles_multibyte_utf8_indices() {
+        let mut draft = Composer::default();
+        draft.insert_text("olá @ação/árvore.rs fim");
+        for _ in 0..(" fim".chars().count()) {
+            draft.move_left();
+        }
+        assert_eq!(
+            draft.token_at_cursor('@'),
+            Some((4, 19, "ação/árvore.rs".to_owned()))
+        );
+        // Cursor right after '@' still resolves the full token.
+        for _ in 0..("ação/árvore.rs".chars().count()) {
+            draft.move_left();
+        }
+        assert_eq!(
+            draft.token_at_cursor('@'),
+            Some((4, 19, "ação/árvore.rs".to_owned()))
+        );
+        // Cursor right before '@' (after the space) also resolves the token.
+        draft.move_left();
+        assert_eq!(
+            draft.token_at_cursor('@'),
+            Some((4, 19, "ação/árvore.rs".to_owned()))
+        );
+        draft.move_left();
+        assert_eq!(draft.token_at_cursor('@'), None);
     }
 }

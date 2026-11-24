@@ -1,8 +1,9 @@
 use slim_core::session::{
-    drive_manual, fork_session_before_turn, list_turns, peek_session, preflight_session,
-    provider_messages_from_records, CompactionCheckpoint, CompactionReason, DurableEntry,
-    DurableEntryRole, DurableRecord, DurableRepo, DurableSessionHeader, Effect, JsonlRepo,
-    ManualExecutor, ManualRunSpec, PreflightStatus, ProviderResponse, SessionFormat, TurnError,
+    drive_manual, fork_session_before_turn, fork_session_completed, list_turns, peek_session,
+    preflight_session, provider_messages_from_records, CompactionCheckpoint, CompactionReason,
+    DurableEntry, DurableEntryRole, DurableRecord, DurableRepo, DurableSessionHeader, Effect,
+    JsonlRepo, ManualExecutor, ManualRunSpec, PreflightStatus, ProviderResponse, SessionFormat,
+    TurnError,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -476,4 +477,28 @@ fn peek_handles_small_unterminated_and_empty_files() {
             .kind(),
         std::io::ErrorKind::NotFound
     );
+}
+
+#[test]
+fn fork_session_completed_clones_settled_session_and_rejects_missing_or_open() {
+    let sessions = Sessions::new();
+    let parent = session_with_turns(&sessions, "tui-settled", &["one", "two"]);
+    let child = fork_session_completed(&parent, "tui-settled-child").expect("fork settled");
+    let turns = list_turns(&child).expect("child turns");
+    assert_eq!(turns.len(), 2);
+    assert!(turns.iter().all(|turn| turn.terminal));
+
+    assert!(matches!(
+        fork_session_completed(&parent, "tui-settled-child"),
+        Err(TurnError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+
+    let open = sessions.path("tui-open");
+    let mut repo = JsonlRepo::create(&open, header("tui-open")).expect("create open");
+    run_turn(&mut repo, "in flight", &mut Fail);
+    drop(repo);
+    assert!(matches!(
+        fork_session_completed(&open, "tui-open-child"),
+        Err(TurnError::TurnNotTerminal { index: 0 })
+    ));
 }

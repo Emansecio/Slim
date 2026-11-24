@@ -5,7 +5,14 @@ use std::collections::VecDeque;
 /// a run that ends without delivering them hands the leftovers back to the
 /// host, which re-queues them as ordinary prompts.
 #[derive(Clone, Debug, Default)]
-pub struct SteerInbox(Arc<Mutex<VecDeque<String>>>);
+pub struct SteerInbox(Arc<SteerShared>);
+
+#[derive(Debug, Default)]
+struct SteerShared {
+    queue: Mutex<VecDeque<String>>,
+    /// Wakes a run that is blocked waiting on something else (see `arrived`).
+    arrived: tokio::sync::Notify,
+}
 
 /// Same bound philosophy as the TUI's prompt queue: a runaway submit loop
 /// cannot balloon the live conversation.
@@ -27,21 +34,35 @@ impl Runtime {
 impl SteerInbox {
     /// Appends FIFO; `false` when the inbox is already at its cap.
     pub fn push(&self, text: String) -> bool {
-        let mut inbox = lock_mutex(&self.0);
+        let mut inbox = lock_mutex(&self.0.queue);
         if inbox.len() >= STEER_INBOX_CAP {
             return false;
         }
         inbox.push_back(text);
+        drop(inbox);
+        self.0.arrived.notify_one();
         true
     }
 
     /// Takes every pending message in FIFO order.
     pub fn drain(&self) -> Vec<String> {
-        lock_mutex(&self.0).drain(..).collect()
+        lock_mutex(&self.0.queue).drain(..).collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        lock_mutex(&self.0).is_empty()
+        lock_mutex(&self.0.queue).is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        lock_mutex(&self.0.queue).len()
+    }
+
+    /// Resolves once a message is waiting (right away when one already is). The message stays
+    /// in the inbox: the loop still delivers it at the next turn boundary.
+    pub async fn arrived(&self) {
+        while self.is_empty() {
+            self.0.arrived.notified().await;
+        }
     }
 }
 
@@ -70,6 +91,26 @@ mod tests {
         assert!(!inbox.push("ninth".into()));
         assert_eq!(inbox.drain().len(), 8);
         assert!(inbox.push("after drain".into()));
+    }
+
+    #[tokio::test]
+    async fn arrived_resolves_only_while_a_message_waits() {
+        let inbox = SteerInbox::default();
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(20), inbox.arrived());
+        assert!(quiet.await.is_err(), "empty inbox keeps waiting");
+        let waiter = tokio::spawn({
+            let inbox = inbox.clone();
+            async move { inbox.arrived().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(inbox.push("go on".into()));
+        waiter.await.unwrap();
+        // Still there for the loop to deliver, and a second wait sees it at once.
+        inbox.arrived().await;
+        assert_eq!(inbox.drain(), vec!["go on".to_owned()]);
+        // A drained inbox waits again, even with the stale wake-up from the push above.
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(20), inbox.arrived());
+        assert!(quiet.await.is_err());
     }
 
     #[test]

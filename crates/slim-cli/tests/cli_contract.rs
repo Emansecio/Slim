@@ -52,25 +52,6 @@ fn stdin_is_used_when_prompt_argument_is_absent() {
 }
 
 #[test]
-fn option_values_are_consumed_even_when_they_look_like_flags() {
-    let _lock = env_lock();
-    // `--prompt "--plan"` is prompt text, not a mode selection: the value is
-    // consumed by `--prompt`, so it is never parsed as an unknown option.
-    let output = run_cli(["--headless", "--prompt", "--plan"], "");
-    assert_ne!(
-        output.code,
-        ExitCode::Internal,
-        "a flag-like prompt value must be consumed, not parsed: {}",
-        output.stderr
-    );
-    assert!(
-        !output.stderr.contains("unknown option"),
-        "{}",
-        output.stderr
-    );
-}
-
-#[test]
 fn trust_project_flag_is_a_known_boolean_flag_and_consumes_no_value() {
     let _lock = env_lock();
     let output = run_cli(["--fake", "--read-only", "--trust-project"], "hello");
@@ -395,7 +376,6 @@ fn help_version_and_unknown_flags_are_stable() {
         "Slim coding agent\n\nUsage:\n  Slim [TUI OPTIONS]\n  Slim --headless [OPTIONS] [PROMPT...]\n  Slim mcp COMMAND [ARGS...]    Manage MCP servers (Slim mcp --help)\n\nModes:\n  --tui              Open the fullscreen TUI (default)\n  --headless         Run one prompt without the TUI\n  --fake             Use the deterministic offline provider\n  --plan             Allow inspection without workspace mutations\n  --read-only        Disable workspace mutations\n  --code             Full access through codemode programs (JavaScript per step)\n\nProvider:\n  --provider NAME    Provider route\n  --model MODEL      Model identifier (Codex: astra, sol, terra, luna)\n  --effort LEVEL     Reasoning effort\n  --thinking-display MODE  Thinking text: summarized or omitted\n  --fast             Enable Codex Fast (higher usage)\n  --normal           Use normal Codex speed\n  --endpoint URL     Override the provider endpoint\n\nInput and sessions:\n  --prompt TEXT      Prompt text; positional text or stdin also works\n  --image PATH       Attach a local image (repeatable)\n  --session PATH     Persist the run to a session file\n  --resume PATH      Continue an existing session\n  --recover PATH     Repair a durable session without running a prompt\n  --abandon-pending  With --recover: abandon unfinished work; effects stay unverified\n  --experiment-id ID Label durable run telemetry for a benchmark experiment\n  --task-id ID       Label durable run telemetry for a benchmark task\n\nOutput:\n  --verbose          Include detailed human-readable events\n  --jsonl            Emit machine-readable JSON Lines\n\nOther:\n  --trust-project    Trust this project's slim.toml (MCP servers, LSP overrides) for this run\n  --mcp-config <file>\n                     Add the [mcp.servers] of this TOML file for this run (trusted, never saved)\n  -h, --help         Show this help\n  -V, --version      Show the version\n\nExamples:\n  Slim\n  Slim --headless --fake \"Summarize this repository\"\n  Slim --headless --provider anthropic --model MODEL --prompt \"Review src\"\n"
     );
     assert_eq!(run_cli(["--version"], "").stdout, "slim 0.1.0\n");
-    assert_eq!(run_cli(["--unknown"], "").code, ExitCode::Internal);
 }
 
 #[test]

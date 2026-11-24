@@ -10,6 +10,9 @@ pub(super) struct BatchRecord<'a> {
     pub(super) reacquisitions: &'a mut std::collections::HashSet<String>,
     /// Journal position where the batch's events begin.
     pub(super) event_start: usize,
+    /// Mid-run elision is skipped when an active stateful `previous_response_id`
+    /// delta chain is preserving the remote prefix.
+    pub(super) allow_elision: bool,
 }
 
 /// What recording a batch concluded.
@@ -87,6 +90,7 @@ struct PoolJob {
     /// Redacted, as announced by `ToolStarted`.
     arguments: String,
     prepared: Arc<PreparedToolInvocation>,
+    speculative: Option<SpeculativeReadEntry>,
 }
 
 struct PoolRun {
@@ -110,14 +114,92 @@ async fn run_pool_job(
         name,
         arguments,
         prepared,
+        speculative,
     } = job;
     let _ = started_tx
         .send(ToolStartedNotice { index, arguments })
         .await;
     let started_at = Instant::now();
     let revision_before = env.tools.workspace_revision();
+    let current_fs_epoch = prepared
+        .target_paths
+        .first()
+        .and_then(|p| crate::project_index::existing_for_path(p))
+        .map_or(0, |d| d.fs_epoch());
     let mut outcome = if name == "code_intel" {
-        code_intel_outcome(env, &prepared, started_at, revision_before).await
+        if let Some(entry) = speculative {
+            let valid_pre = prepared.error.is_none()
+                && entry.revision_before == revision_before
+                && (entry.fs_epoch_before == 0 || current_fs_epoch == 0 || entry.fs_epoch_before == current_fs_epoch)
+                && (entry.fingerprint.is_empty() || entry.fingerprint == prepared.canonical_fingerprint);
+            if valid_pre {
+                if let Ok(Some(SpeculativeOutcome::CodeIntel {
+                    fingerprint,
+                    mut result,
+                    presentation,
+                })) = entry.handle.await
+                {
+                    if fingerprint == prepared.canonical_fingerprint
+                        && env.tools.workspace_revision() == revision_before
+                        && result.success
+                    {
+                        let admitted = super::native_code_intel::admit_code_intel_output(
+                            &mut result,
+                            &prepared,
+                            presentation,
+                        );
+                        ToolExecutionOutcome {
+                            result,
+                            receipt: ToolExecutionReceipt {
+                                presentation: admitted,
+                                ..ToolExecutionReceipt::unobserved(
+                                    revision_before,
+                                    env.tools.workspace_revision(),
+                                    elapsed_micros(started_at),
+                                )
+                            },
+                        }
+                    } else {
+                        code_intel_outcome(env, &prepared, started_at, revision_before).await
+                    }
+                } else {
+                    code_intel_outcome(env, &prepared, started_at, revision_before).await
+                }
+            } else {
+                entry.handle.abort();
+                code_intel_outcome(env, &prepared, started_at, revision_before).await
+            }
+        } else {
+            code_intel_outcome(env, &prepared, started_at, revision_before).await
+        }
+    } else if let Some(entry) = speculative {
+        if prepared.error.is_none()
+            && (entry.fingerprint.is_empty() || entry.fingerprint == prepared.canonical_fingerprint)
+            && entry.revision_before == revision_before
+            && env.tools.workspace_revision() == entry.revision_before
+            && (entry.fs_epoch_before == 0 || current_fs_epoch == 0 || entry.fs_epoch_before == current_fs_epoch)
+        {
+            if let Ok(Some(SpeculativeOutcome::Native {
+                fingerprint: fp,
+                outcome: spec_outcome,
+            })) = entry.handle.await
+            {
+                if fp == prepared.canonical_fingerprint
+                    && env.tools.workspace_revision() == revision_before
+                    && spec_outcome.receipt.revision_before == revision_before
+                    && spec_outcome.result.success
+                {
+                    spec_outcome
+                } else {
+                    native_outcome(env, kind, &name, &prepared, started_at, revision_before).await
+                }
+            } else {
+                native_outcome(env, kind, &name, &prepared, started_at, revision_before).await
+            }
+        } else {
+            entry.handle.abort();
+            native_outcome(env, kind, &name, &prepared, started_at, revision_before).await
+        }
     } else {
         native_outcome(env, kind, &name, &prepared, started_at, revision_before).await
     };
@@ -248,13 +330,20 @@ impl Runtime {
             presentations,
             reacquisitions,
             event_start,
+            allow_elision,
         } = batch;
         let mut repeated_failure_in_batch = false;
         let mut mutation_succeeded = false;
-        for ((call, result), presentation) in
-            calls.iter().zip(results.iter()).zip(presentations.iter())
+        let batch_advisory = self.run_guards.observe_batch_health(calls, results);
+        let call_count = calls.len();
+        for (call_index, ((call, result), presentation)) in
+            calls.iter().zip(results.iter()).zip(presentations.iter()).enumerate()
         {
             let is_mutation = matches!(call.name.as_str(), "write" | "patch");
+            let codemode_effects = matches!(call.name.as_str(), "codemode" | "batch_code")
+                .then(|| self.codemode.effects_for(&call.id))
+                .unwrap_or_default();
+            let codemode_mutated = codemode_effects.mutated_workspace;
             let mutation_changed = is_mutation
                 && self.app.events()[event_start..].iter().any(|event| {
                     matches!(&event.kind, crate::EventKind::CausalProgressObserved {
@@ -262,6 +351,8 @@ impl Runtime {
                     } if call_id.as_ref() == call.id)
                 });
             let ok = result.success || mutation_changed;
+            self.scratchpad
+                .record_tool_outcome(&call.name, &call.arguments, ok, &result.output);
             let full_output = presentation.text.clone();
             // Cut to fit the request, the model did not receive all of it.
             let shown = full_output == result.output;
@@ -283,7 +374,10 @@ impl Runtime {
             };
             if ok {
                 guard.record_success(&call.name);
-                mutation_succeeded |= is_mutation;
+                mutation_succeeded |= is_mutation || codemode_mutated;
+                if codemode_effects.had_non_readonly_effect {
+                    guard.record_success("write");
+                }
                 if matches!(
                     call.name.as_str(),
                     "shell" | "write" | "patch" | "ask_question"
@@ -322,6 +416,14 @@ impl Runtime {
                     },
                 )?;
             }
+            if call_index + 1 == call_count {
+                if let Some(advisory) = &batch_advisory {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(advisory);
+                }
+            }
             self.append_conversation_message(
                 messages,
                 ProviderMessage::tool(tool_name, self.redact_sensitive(&call.id), output)
@@ -331,11 +433,15 @@ impl Runtime {
             // Use the existing causal boundary instead of treating its exit
             // status as proof that the workspace stayed unchanged.
             let then_run_id = format!("{}:then_run", call.id);
-            let volatile_boundary = self.app.events()[event_start..].iter().any(|event| {
-                matches!(&event.kind, crate::EventKind::CausalBoundaryObserved {
-                    call_id, kind: crate::CausalBoundaryKind::PotentiallyVolatile, ..
-                } if call_id.as_ref() == call.id || call_id.as_ref() == then_run_id)
-            });
+            let volatile_boundary = if matches!(call.name.as_str(), "codemode" | "batch_code") {
+                codemode_effects.had_effect
+            } else {
+                self.app.events()[event_start..].iter().any(|event| {
+                    matches!(&event.kind, crate::EventKind::CausalBoundaryObserved {
+                        call_id, kind: crate::CausalBoundaryKind::PotentiallyVolatile, ..
+                    } if call_id.as_ref() == call.id || call_id.as_ref() == then_run_id)
+                })
+            };
             let repeated_failure = if volatile_boundary {
                 *guard = LoopGuard::default();
                 repeated_failure_in_batch = false;
@@ -377,8 +483,10 @@ impl Runtime {
             repeated_failure_in_batch |= repeated_failure;
         }
         let mut elided = false;
-        if mutation_succeeded {
-            let elision = elide_superseded_tool_outputs_if_it_pays(messages);
+        if mutation_succeeded && allow_elision {
+            let write_penalty = self.cache_write_penalty.max(1);
+            let elision =
+                elide_superseded_tool_outputs_with_penalty(messages, write_penalty);
             if elision.elided > 0 {
                 elided = true;
                 push_runtime_event(
@@ -483,8 +591,10 @@ impl Runtime {
         }
         if result.is_err() || cancellation.is_cancelled() {
             cancellation.cancel();
+            self.clear_speculative_reads();
             cancellation.wait_for_native_work().await;
         } else {
+            self.clear_speculative_reads();
             // Managed jobs outlive a batch, but remain owned by the run.
             cancellation.wait_for_foreground_work().await;
         }
@@ -533,13 +643,131 @@ impl Runtime {
                 index += 1;
                 continue;
             }
+            // Multiple `subagent` calls emitted together in one turn run concurrently (up to 6),
+            // even when phase-1 snapshot reads or a `todo` update sit between them in the batch.
+            if ctx.calls[index].name == "subagent" {
+                let mut cluster = vec![index];
+                let mut probe = index + 1;
+                while probe < ctx.calls.len() {
+                    if st.results[probe].is_some() {
+                        probe += 1;
+                        continue;
+                    }
+                    if ctx.calls[probe].name == "subagent" {
+                        cluster.push(probe);
+                    } else if ctx.calls[probe].name != "todo" {
+                        break;
+                    }
+                    probe += 1;
+                }
+                if cluster.len() >= 2 {
+                    for &ci in &cluster {
+                        push_runtime_event(
+                            &mut self.app,
+                            &mut st.next_seq,
+                            crate::EventKind::ToolAdmitted {
+                                batch_id: ctx.batch_id.into(),
+                                call_id: ctx.calls[ci].id.clone(),
+                                name: ctx.calls[ci].name.clone(),
+                            },
+                        )?;
+                    }
+                    let outcomes = self
+                        .execute_subagent_cluster(ctx.batch_id, ctx.calls, &cluster, &mut st.next_seq)
+                        .await?;
+                    for (ci, res) in outcomes {
+                        st.results[ci] = Some(res);
+                    }
+                    index += 1;
+                    continue;
+                }
+            }
+            if ctx.prepared[index].error.is_none()
+                && super::native_mcp_direct::is_direct_mcp_call(&ctx.calls[index].name)
+                && self
+                    .mcp
+                    .as_ref()
+                    .is_some_and(|manager| manager.is_direct_tool_read_only(&ctx.calls[index].name))
+            {
+                let mut cluster = vec![index];
+                let mut probe = index + 1;
+                while probe < ctx.calls.len() {
+                    if st.results[probe].is_some() {
+                        probe += 1;
+                        continue;
+                    }
+                    let probe_name = &ctx.calls[probe].name;
+                    if ctx.prepared[probe].error.is_none()
+                        && super::native_mcp_direct::is_direct_mcp_call(probe_name)
+                        && self
+                            .mcp
+                            .as_ref()
+                            .is_some_and(|manager| manager.is_direct_tool_read_only(probe_name))
+                    {
+                        cluster.push(probe);
+                        probe += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if cluster.len() >= 2 {
+                    for &ci in &cluster {
+                        push_runtime_event(
+                            &mut self.app,
+                            &mut st.next_seq,
+                            crate::EventKind::ToolAdmitted {
+                                batch_id: ctx.batch_id.into(),
+                                call_id: ctx.calls[ci].id.clone(),
+                                name: ctx.calls[ci].name.clone(),
+                            },
+                        )?;
+                    }
+                    let outcomes = self
+                        .execute_direct_mcp_cluster(
+                            ctx.mode,
+                            ctx.batch_id,
+                            ctx.calls,
+                            &cluster,
+                            &mut st.next_seq,
+                        )
+                        .await?;
+                    for (ci, res) in outcomes {
+                        st.results[ci] = Some(res);
+                    }
+                    index += 1;
+                    continue;
+                }
+            }
             let cluster = independent_mutation_cluster(ctx.prepared, &st.results, index);
-            if cluster.len() >= 2 {
-                self.execute_independent_mutation_segment(&ctx, &mut st, governor, &cluster)
+            let mutation_wave = if !cluster.is_empty() {
+                cluster
+            } else if is_file_mutation(&ctx.prepared[index])
+                && !is_serial_barrier(&ctx.prepared[index])
+            {
+                vec![index]
+            } else {
+                Vec::new()
+            };
+            if !mutation_wave.is_empty() {
+                let disjoint_reads = disjoint_ready_reads_for_mutations(
+                    &self.tools,
+                    ctx.prepared,
+                    &st.results,
+                    &mutation_wave,
+                );
+                if mutation_wave.len() >= 2 || !disjoint_reads.is_empty() {
+                    self.execute_combined_mutation_and_read_segment(
+                        &ctx,
+                        &mut st,
+                        governor,
+                        &mutation_wave,
+                        &disjoint_reads,
+                    )
                     .await?;
-                self.anticipate_ready_snapshots(&ctx, &mut st, governor)
-                    .await?;
-                continue;
+                    self.anticipate_ready_snapshots(&ctx, &mut st, governor)
+                        .await?;
+                    continue;
+                }
             }
             if !self.run_single_call(&ctx, &mut st, governor, index).await? {
                 break;
@@ -620,9 +848,13 @@ impl Runtime {
     ) -> Result<bool, ProviderError> {
         let call = &ctx.calls[index];
         let prepared = &*ctx.prepared[index];
-        let (pending, observations) =
-            governor.observe_before_identified(prepared, ctx.batch_id, &call.id);
-        self.emit_governor_observations(observations, &mut st.next_seq)?;
+        let mut pending = None;
+        if !(matches!(call.name.as_str(), "codemode" | "batch_code") && prepared.error.is_none()) {
+            let (call_pending, observations) =
+                governor.observe_before_identified(prepared, ctx.batch_id, &call.id);
+            self.emit_governor_observations(observations, &mut st.next_seq)?;
+            pending = Some(call_pending);
+        }
         push_runtime_event(
             &mut self.app,
             &mut st.next_seq,
@@ -632,12 +864,14 @@ impl Runtime {
                 name: call.name.clone(),
             },
         )?;
+        self.shell_ends_batch = st.results[index + 1..].iter().all(Option::is_some);
         let execution = self
             .execute_provider_tool_call(
                 ctx.mode,
                 ctx.cwd,
                 ToolInvocation::provider(ctx.batch_id, call),
                 prepared,
+                governor,
                 st.next_seq,
             )
             .await;
@@ -647,8 +881,10 @@ impl Runtime {
             Err(error) => return Err(error),
         };
         st.next_seq = following_seq;
-        let observations = governor.observe_after(pending, &outcome.result, &outcome.receipt);
-        self.emit_governor_observations(observations, &mut st.next_seq)?;
+        if let Some(pending) = pending {
+            let observations = governor.observe_after(pending, &outcome.result, &outcome.receipt);
+            self.emit_governor_observations(observations, &mut st.next_seq)?;
+        }
         if let Some(presentation) = outcome.receipt.presentation.clone() {
             self.presentation_sources
                 .insert((ctx.batch_id.to_owned(), call.id.clone()), presentation);
@@ -713,46 +949,69 @@ impl Runtime {
         Ok(())
     }
 
-    /// Runs file mutations on distinct files in parallel. A journal failure
-    /// cancels the run, but the side effects are already underway: every
-    /// outcome is still recorded and the first failure is returned last.
-    async fn execute_independent_mutation_segment(
+    /// Runs file mutations on distinct files (plus any disjoint ready snapshot
+    /// reads that touch no mutated path) in parallel. A journal failure cancels
+    /// the run, but side effects are already underway: every outcome is still
+    /// recorded and the first failure is returned last.
+    async fn execute_combined_mutation_and_read_segment(
         &mut self,
         ctx: &BatchCtx<'_>,
         st: &mut BatchState,
         governor: &mut CausalGovernor,
-        indices: &[usize],
+        mutation_indices: &[usize],
+        disjoint_read_indices: &[usize],
     ) -> Result<(), ProviderError> {
-        let no_aliases = (0..indices.len()).collect::<Vec<_>>();
+        let mut indices = Vec::with_capacity(mutation_indices.len() + disjoint_read_indices.len());
+        indices.extend_from_slice(mutation_indices);
+        indices.extend_from_slice(disjoint_read_indices);
+        let alias_of = evidence_reuse_aliases(indices.iter().map(|&index| &*ctx.prepared[index]));
         let Some(pending_calls) =
-            self.admit_segment(ctx, governor, indices, &no_aliases, &mut st.next_seq)?
+            self.admit_segment(ctx, governor, &indices, &alias_of, &mut st.next_seq)?
         else {
             return Ok(());
         };
         let PoolRun {
-            completed,
+            mut completed,
             first_error,
         } = self
             .drive_pool(
                 ctx,
-                indices,
-                &no_aliases,
+                &indices,
+                &alias_of,
                 SegmentKind::Mutation,
                 &mut st.next_seq,
             )
             .await?;
+        if first_error.is_none() {
+            self.emit_evidence_aliases(ctx, &indices, &alias_of, &mut completed, &mut st.next_seq)?;
+        }
         let completed = completed
             .into_iter()
-            .map(|outcome| outcome.expect("every independent mutation yields one result"))
+            .enumerate()
+            .filter_map(|(slot, outcome)| {
+                if outcome.is_none() && first_error.is_some() && alias_of[slot] != slot {
+                    None
+                } else {
+                    Some(outcome.expect("every wave call yields one result"))
+                }
+            })
             .collect::<Vec<_>>();
         for (&index, outcome) in indices.iter().zip(&completed) {
-            self.notify_code_intel_after_mutation(
-                ctx.cwd,
-                ToolInvocation::provider(ctx.batch_id, &ctx.calls[index]),
-                &ctx.prepared[index],
-                outcome,
-            )
-            .await;
+            if let Some(presentation) = outcome.receipt.presentation.clone() {
+                self.presentation_sources.insert(
+                    (ctx.batch_id.to_owned(), ctx.calls[index].id.clone()),
+                    presentation,
+                );
+            }
+            if mutation_indices.contains(&index) {
+                self.notify_code_intel_after_mutation(
+                    ctx.cwd,
+                    ToolInvocation::provider(ctx.batch_id, &ctx.calls[index]),
+                    &ctx.prepared[index],
+                    outcome,
+                )
+                .await;
+            }
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -761,7 +1020,7 @@ impl Runtime {
             let observations = governor.observe_after(pending, &outcome.result, &outcome.receipt);
             self.emit_governor_observations(observations, &mut st.next_seq)?;
         }
-        st.store(indices, completed.into_iter().map(|outcome| outcome.result));
+        st.store(&indices, completed.into_iter().map(|outcome| outcome.result));
         Ok(())
     }
 
@@ -839,6 +1098,13 @@ impl Runtime {
             code_intel: self.code_intel.clone(),
             cancellation: self.cancellation.clone(),
         };
+        for (slot, &index) in indices.iter().enumerate() {
+            if alias_of[slot] != slot {
+                if let Some(dup) = self.speculative_reads.remove(&ctx.calls[index].id) {
+                    dup.handle.abort();
+                }
+            }
+        }
         let jobs = indices
             .iter()
             .enumerate()
@@ -849,6 +1115,7 @@ impl Runtime {
                 name: ctx.calls[index].name.clone(),
                 arguments: self.redact_sensitive(&ctx.calls[index].arguments),
                 prepared: Arc::clone(&ctx.prepared[index]),
+                speculative: self.speculative_reads.remove(&ctx.calls[index].id),
             })
             .collect::<Vec<_>>();
         let (started_tx, mut started_rx) =
@@ -1036,11 +1303,30 @@ impl Runtime {
         cwd: &Path,
         invocation: ToolInvocation<'_>,
         prepared: &PreparedToolInvocation,
+        governor: &mut CausalGovernor,
         next_seq: u64,
     ) -> Result<(ToolExecutionOutcome, u64), ProviderError> {
         let started_at = Instant::now();
         let revision_before = self.tools.workspace_revision();
-        if let Some(refusal) = super::mode::code_mode_direct_refusal(mode, invocation.name) {
+        let mcp_enabled = self
+            .mcp
+            .as_ref()
+            .is_some_and(|manager| manager.has_enabled_servers());
+        let envelope_refusal = if invocation.name == "ask_question" && !self.can_ask(mode) {
+            Some("ask_question is not available in this mode".to_owned())
+        } else if invocation.name == "shell_job" && !mode.allows_mutation() {
+            Some("shell_job is only available in Auto or Code mode".to_owned())
+        } else if invocation.name == "batch_code" && !super::codemode::batch_code_enabled() {
+            Some("batch_code is disabled in this session".to_owned())
+        } else if invocation.name == "codemode" && !mode.allows_mutation() {
+            Some("codemode is not available in Read-only or Plan mode".to_owned())
+        } else {
+            None
+        };
+        if let Some(refusal) = envelope_refusal
+            .or_else(|| super::mode::code_mode_direct_refusal(mode, invocation.name))
+            .or_else(|| super::mode::auto_mode_codemode_refusal(mode, invocation.name, mcp_enabled))
+        {
             self.ensure_not_cancelled()?;
             let mut following = next_seq;
             let begun = self.begin_tool(invocation, &mut following)?;
@@ -1068,6 +1354,8 @@ impl Runtime {
             self.execute_ask_question(invocation, next_seq).await?
         } else if invocation.name == "artifact_read" {
             self.execute_artifact_read(invocation, next_seq)?
+        } else if invocation.name == "history_recall" {
+            self.execute_history_recall(invocation, next_seq)?
         } else if invocation.name == "todo" {
             self.execute_todo(mode, invocation, next_seq)?
         } else if invocation.name == "skill" {
@@ -1079,9 +1367,13 @@ impl Runtime {
             || super::native_mcp_direct::is_direct_mcp_call(invocation.name)
         {
             self.execute_mcp(mode, invocation, next_seq).await?
-        } else if invocation.name == "codemode" {
-            self.execute_codemode(mode, cwd, invocation, next_seq)
+        } else if matches!(invocation.name, "codemode" | "batch_code") {
+            self.execute_codemode_with_governor(mode, cwd, invocation, next_seq, Some(governor))
                 .await?
+        } else if invocation.name == "subagent" {
+            self.execute_subagent(invocation, next_seq).await?
+        } else if invocation.name == "subagent_control" {
+            self.execute_subagent_control(invocation, next_seq).await?
         } else {
             let (outcome, following) = self
                 .execute_tool_call_async(invocation, prepared, next_seq)
@@ -1128,6 +1420,17 @@ impl Runtime {
                 next_seq,
             );
         }
+        if name == "history_recall" {
+            return self.execute_history_recall(
+                ToolInvocation {
+                    batch_id: &batch_id,
+                    call_id: &call_id,
+                    name,
+                    arguments,
+                },
+                next_seq,
+            );
+        }
         let cwd = cwd.as_ref();
         let prepared = self.tools.prepare_invocation(mode, cwd, name, arguments);
         self.execute_tool_call(
@@ -1151,6 +1454,42 @@ impl Runtime {
         self.ensure_not_cancelled()?;
         let mut following_seq = next_seq;
         let started_at = self.begin_tool(invocation, &mut following_seq)?;
+        if let Some(spec) = self.speculative_reads.remove(invocation.call_id) {
+            let revision_now = self.tools.workspace_revision();
+            let current_fs_epoch = prepared
+                .target_paths
+                .first()
+                .and_then(|p| crate::project_index::existing_for_path(p))
+                .map_or(0, |d| d.fs_epoch());
+            if prepared.error.is_none()
+                && spec.revision_before == revision_now
+                && (spec.fs_epoch_before == 0 || current_fs_epoch == 0 || spec.fs_epoch_before == current_fs_epoch)
+                && (spec.fingerprint.is_empty() || spec.fingerprint == prepared.canonical_fingerprint)
+            {
+                if let Ok(Some(SpeculativeOutcome::Native {
+                    fingerprint: fp,
+                    mut outcome,
+                })) = spec.handle.await
+                {
+                    if fp == prepared.canonical_fingerprint
+                        && self.tools.workspace_revision() == revision_now
+                        && outcome.receipt.revision_before == revision_now
+                        && outcome.result.success
+                    {
+                        self.finish_tool(
+                            invocation,
+                            &mut outcome.result,
+                            started_at,
+                            &mut following_seq,
+                            Some(&outcome.receipt),
+                        )?;
+                        return Ok((outcome, following_seq));
+                    }
+                }
+            } else {
+                spec.handle.abort();
+            }
+        }
         let tools = self.tools.clone();
         let fallback_tools = tools.clone();
         let revision_before = tools.workspace_revision();
@@ -1361,5 +1700,211 @@ impl Runtime {
                 duration_ms,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::native_subagent::{SubagentRegistry, SubagentRunArgs, SubagentSpawner};
+    use super::super::temp_root::TempRoot;
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct ParallelProbeSpawner {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl SubagentSpawner for ParallelProbeSpawner {
+        fn run(
+            &self,
+            args: SubagentRunArgs,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'static>> {
+            let active = Arc::clone(&self.active);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async move {
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(format!("done:{}", args.prompt))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_calls_separated_by_snapshot_read_still_run_in_parallel() {
+        let root = TempRoot::new("subagent-interleaved-read");
+        std::fs::write(root.join("note.txt"), "hello\n").unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let reg = SubagentRegistry::new();
+        reg.set_spawner(
+            Arc::new(ParallelProbeSpawner {
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak),
+            }),
+            crate::OperatingMode::Auto,
+        );
+        let mut rt = Runtime::new();
+        rt.set_subagents(reg);
+
+        let calls = vec![
+            ProviderToolCall {
+                id: "s1".into(),
+                name: "subagent".into(),
+                arguments: r#"{"role":"A","prompt":"task-a"}"#.into(),
+            },
+            ProviderToolCall {
+                id: "r1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"note.txt"}"#.into(),
+            },
+            ProviderToolCall {
+                id: "s2".into(),
+                name: "subagent".into(),
+                arguments: r#"{"role":"B","prompt":"task-b"}"#.into(),
+            },
+            ProviderToolCall {
+                id: "t1".into(),
+                name: "todo".into(),
+                arguments: r#"{"todos":[{"title":"split the work","status":"in_progress"}]}"#.into(),
+            },
+            ProviderToolCall {
+                id: "s3".into(),
+                name: "subagent".into(),
+                arguments: r#"{"role":"C","prompt":"task-c"}"#.into(),
+            },
+        ];
+        let mut governor = CausalGovernor::default();
+        let (results, _) = rt
+            .execute_provider_tool_batch(
+                crate::OperatingMode::Auto,
+                &root,
+                "batch-1",
+                &calls,
+                1,
+                &mut governor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 5);
+        // The todo has no capability bridge in this runtime; only its place in the batch matters.
+        assert!(
+            results.iter().all(|r| r.success || r.name == "todo"),
+            "{results:?}"
+        );
+        assert!(results[0].output.contains("task-a"));
+        assert!(results[1].output.contains("hello"));
+        assert!(results[2].output.contains("task-b"));
+        assert!(results[4].output.contains("task-c"));
+        assert!(
+            peak.load(Ordering::SeqCst) >= 3,
+            "subagents across a phase-1 read and a todo update must overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_read_is_reused_when_valid_and_discarded_on_revision_change() {
+        let root = TempRoot::new("speculative-read-reuse");
+        std::fs::write(root.join("fast.txt"), "from-disk\n").unwrap();
+
+        let mut rt = Runtime::new();
+        let prep = rt.tools.prepare_invocation(
+            crate::OperatingMode::ReadOnly,
+            &root,
+            "read",
+            r#"{"path":"fast.txt"}"#,
+        );
+        let fp = prep.canonical_fingerprint.clone();
+        let rev = rt.tools.workspace_revision();
+
+        // Inject a pre-resolved speculative outcome with a distinctive marker so we can
+        // prove the pool consumed the speculative handle instead of hitting disk again.
+        let mut fake_outcome =
+            rt.tools
+                .execute_prepared_with_cancellation_and_progress(&prep, None, |_| {});
+        fake_outcome.result.output = "speculative-hit\n".into();
+        let handle = tokio::spawn(async move {
+            Some(SpeculativeOutcome::Native {
+                fingerprint: fp.clone(),
+                outcome: fake_outcome,
+            })
+        });
+        rt.speculative_reads.insert(
+            "call-hit".into(),
+            SpeculativeReadEntry {
+                fingerprint: prep.canonical_fingerprint.clone(),
+                revision_before: rev,
+                fs_epoch_before: 0,
+                git_dirty_epoch_before: 0,
+                handle,
+            },
+        );
+
+        let calls = vec![ProviderToolCall {
+            id: "call-hit".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"fast.txt"}"#.into(),
+        }];
+        let mut governor = CausalGovernor::default();
+        let (results, _) = rt
+            .execute_provider_tool_batch(
+                crate::OperatingMode::ReadOnly,
+                &root,
+                "b1",
+                &calls,
+                1,
+                &mut governor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output, "speculative-hit\n");
+        assert!(rt.speculative_reads.is_empty());
+
+        // Stale revision must ignore speculative outcome and execute fresh read.
+        let fp2 = prep.canonical_fingerprint.clone();
+        let mut stale_outcome =
+            rt.tools
+                .execute_prepared_with_cancellation_and_progress(&prep, None, |_| {});
+        stale_outcome.result.output = "stale-hit\n".into();
+        stale_outcome.receipt.revision_before = rev.saturating_add(99);
+        let stale_handle = tokio::spawn(async move {
+            Some(SpeculativeOutcome::Native {
+                fingerprint: fp2,
+                outcome: stale_outcome,
+            })
+        });
+        rt.speculative_reads.insert(
+            "call-miss".into(),
+            SpeculativeReadEntry {
+                fingerprint: prep.canonical_fingerprint,
+                revision_before: rev.saturating_add(99),
+                fs_epoch_before: 0,
+                git_dirty_epoch_before: 0,
+                handle: stale_handle,
+            },
+        );
+        let calls2 = vec![ProviderToolCall {
+            id: "call-miss".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"fast.txt"}"#.into(),
+        }];
+        let (results2, _) = rt
+            .execute_provider_tool_batch(
+                crate::OperatingMode::ReadOnly,
+                &root,
+                "b2",
+                &calls2,
+                10,
+                &mut governor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results2[0].output, "from-disk\n");
     }
 }

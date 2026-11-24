@@ -28,6 +28,13 @@ const TOOL_ARGUMENT_MAX_CHARS: usize = 2000;
 /// request.
 const THINKING_MAX_CHARS: usize = 2000;
 
+/// Condensed thinking budget used inside compaction summary requests: older
+/// thinking traces are already reflected in assistant text and tool results,
+/// so keeping only the last few turns prevents tens of thousands of dead
+/// prefill tokens during long-session fallback compaction.
+const COMPACT_RECENT_THINKING_TURNS: usize = 3;
+const COMPACT_THINKING_MAX_CHARS: usize = 400;
+
 /// Text of a message: its `content` followed by its text blocks, joined with
 /// `separator` (Pi's `contentText`: `""` for user and tool results, `"\n"` for
 /// assistant text). Images, audio, files and opaque reasoning carry no
@@ -284,8 +291,38 @@ fn render_tool_call(call: &ProviderToolCall) -> String {
 pub fn serialize_conversation<'a>(
     messages: impl IntoIterator<Item = &'a ProviderMessage>,
 ) -> String {
+    serialize_conversation_inner(messages, None, THINKING_MAX_CHARS)
+}
+
+/// Condensed transcript variant used when building LLM summarization prompts:
+/// preserves full user/assistant/tool text and arguments while keeping only the
+/// last 3 assistant thinking traces (capped at 400 chars each).
+pub(super) fn serialize_conversation_for_summary<'a>(
+    messages: impl IntoIterator<Item = &'a ProviderMessage>,
+) -> String {
+    serialize_conversation_inner(
+        messages,
+        Some(COMPACT_RECENT_THINKING_TURNS),
+        COMPACT_THINKING_MAX_CHARS,
+    )
+}
+
+fn serialize_conversation_inner<'a>(
+    messages: impl IntoIterator<Item = &'a ProviderMessage>,
+    recent_thinking_turns: Option<usize>,
+    thinking_max_chars: usize,
+) -> String {
+    let collected: Vec<&'a ProviderMessage> = messages.into_iter().collect();
+    let total_assistants = collected
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .count();
+    let keep_thinking_from = recent_thinking_turns
+        .map(|limit| total_assistants.saturating_sub(limit))
+        .unwrap_or(0);
+    let mut assistant_seen = 0usize;
     let mut parts: Vec<String> = Vec::new();
-    for message in messages {
+    for message in collected {
         match message.role.as_str() {
             "user" => {
                 let text = message_text(message, "");
@@ -294,11 +331,49 @@ pub fn serialize_conversation<'a>(
                 }
             }
             "assistant" => {
-                if let Some(reasoning) = &message.chat_reasoning {
-                    if !reasoning.content.is_empty() {
+                let include_thinking = assistant_seen >= keep_thinking_from;
+                assistant_seen += 1;
+                if include_thinking {
+                    let mut thinking_text = String::new();
+                    if let Some(reasoning) = &message.chat_reasoning {
+                        if !reasoning.content.is_empty() {
+                            thinking_text.push_str(&reasoning.content);
+                        }
+                    }
+                    for reasoning in &message.responses_reasoning {
+                        if let Some(text) = reasoning
+                            .item
+                            .get("thinking")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            if !thinking_text.is_empty() {
+                                thinking_text.push('\n');
+                            }
+                            thinking_text.push_str(text);
+                        } else if let Some(summary) = reasoning
+                            .item
+                            .get("summary")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            for part in summary {
+                                if let Some(text) = part
+                                    .get("text")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|text| !text.is_empty())
+                                {
+                                    if !thinking_text.is_empty() {
+                                        thinking_text.push('\n');
+                                    }
+                                    thinking_text.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                    if !thinking_text.is_empty() {
                         parts.push(format!(
                             "[Assistant thinking]: {}",
-                            truncate_for_summary(&reasoning.content, THINKING_MAX_CHARS)
+                            truncate_for_summary(&thinking_text, thinking_max_chars)
                         ));
                     }
                 }
@@ -383,6 +458,7 @@ mod tests {
         assistant.chat_reasoning = Some(crate::provider::ChatReasoning {
             scope_id: 1,
             model: "m".into(),
+            provenance: 0,
             content: "t".repeat(2600),
             details: Vec::new(),
         });
@@ -499,6 +575,7 @@ mod tests {
         assistant.chat_reasoning = Some(crate::provider::ChatReasoning {
             scope_id: 1,
             model: "m".into(),
+            provenance: 0,
             content: "thinking hard".into(),
             details: Vec::new(),
         });
@@ -561,5 +638,53 @@ mod tests {
             serialize_conversation([&tool, &assistant]),
             "[Tool result]: onetwo\n\n[Assistant]: a\nb"
         );
+    }
+
+    #[test]
+    fn summary_serializer_keeps_only_recent_truncated_thinking_traces() {
+        let markers = ['a', 'b', 'c', 'd', 'e'];
+        let mut messages = Vec::new();
+        for (idx, marker) in markers.iter().enumerate() {
+            messages.push(ProviderMessage::user(format!("user turn {idx}")));
+            let mut assistant = ProviderMessage::assistant(format!("reply {idx}"), Vec::new());
+            assistant.chat_reasoning = Some(crate::provider::ChatReasoning {
+                scope_id: 1,
+                model: "m".into(),
+                provenance: 0,
+                content: marker.to_string().repeat(600),
+                details: Vec::new(),
+            });
+            messages.push(assistant);
+        }
+
+        let summary_view = serialize_conversation_for_summary(&messages);
+        for (idx, marker) in markers.iter().enumerate() {
+            let full_trace = marker.to_string().repeat(600);
+            let truncated_prefix = marker.to_string().repeat(400);
+            if idx < 2 {
+                assert!(
+                    !summary_view.contains(&marker.to_string().repeat(20)),
+                    "older turn {idx} thinking must be omitted from summary transcript"
+                );
+            } else {
+                assert!(
+                    summary_view.contains(&truncated_prefix),
+                    "recent turn {idx} must keep 400 chars of thinking"
+                );
+                assert!(
+                    !summary_view.contains(&full_trace),
+                    "recent turn {idx} must truncate thinking past 400 chars"
+                );
+            }
+            assert!(summary_view.contains(&format!("[User]: user turn {idx}")));
+            assert!(summary_view.contains(&format!("[Assistant]: reply {idx}")));
+        }
+        assert!(summary_view.contains("[... 200 more characters truncated]"));
+
+        // Standard serialize_conversation preserves all 5 full thinking traces (<2000 chars each).
+        let full_view = serialize_conversation(&messages);
+        for marker in markers {
+            assert!(full_view.contains(&marker.to_string().repeat(600)));
+        }
     }
 }

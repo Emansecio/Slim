@@ -29,7 +29,11 @@ pub(super) fn declarations(namespace: &str, definitions: &[Value]) -> String {
         };
         let description = definition.get("description").and_then(Value::as_str);
         let schema = definition.get("input_schema").unwrap_or(&Value::Null);
-        for line in signature(name, description, schema, "string").lines() {
+        let returns = definition
+            .get("return_type")
+            .and_then(Value::as_str)
+            .unwrap_or("string");
+        for line in signature(name, description, schema, returns).lines() {
             out.push_str("  ");
             out.push_str(line);
             out.push('\n');
@@ -54,13 +58,35 @@ pub(super) fn signature(
         prefix.push_str(" */\n");
     }
     prefix.push_str(&property_key(name));
-    let build = |args: &str| format!("{prefix}(args: {args}): Promise<{returns}>;");
+    let param = if allows_omitted_argument(input_schema) {
+        "args?"
+    } else {
+        "args"
+    };
+    let build = |args: &str| format!("{prefix}({param}: {args}): Promise<{returns}>;");
     let full = build(&ts_type(input_schema));
     if full.len() <= MAX_SIGNATURE_BYTES {
         full
     } else {
         build(UNKNOWN)
     }
+}
+
+fn allows_omitted_argument(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    let no_required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    let no_top_level_combinator = !object.contains_key("oneOf")
+        && !object.contains_key("anyOf")
+        && !object.contains_key("allOf");
+    let is_object = object.get("type").and_then(Value::as_str) == Some("object")
+        || object.contains_key("properties")
+        || object.contains_key("additionalProperties");
+    is_object && no_required && no_top_level_combinator
 }
 
 /// TypeScript type of a JSON Schema; depth and size limits degrade to `unknown`.

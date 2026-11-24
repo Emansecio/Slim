@@ -82,6 +82,10 @@ fn harness(label: &str, slim_toml: &str, trust_project: bool) -> Harness {
         endpoint_override: None,
         model_override: None,
         timeout: Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
     Harness {
@@ -686,19 +690,69 @@ fn reconnecting_a_server_also_fills_its_resource_counts() {
 /// slim.toml and trust decision of the workspace.
 #[test]
 fn lsp_trust_notice_follows_the_workspace_not_the_process_directory() {
+    let _guard = super::tests::env_lock();
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+    let vars = [
+        "SLIM_AUTH_FILE",
+        "SLIM_CONFIG_FILE",
+        "SLIM_MCP_TRUST_FILE",
+        "SLIM_PROVIDER",
+        "SLIM_API_KEY",
+        "OPENAI_API_KEY",
+    ];
+    let _restore = EnvRestore(
+        vars.iter()
+            .map(|&name| (name, std::env::var_os(name)))
+            .collect(),
+    );
+    for name in vars {
+        std::env::remove_var(name);
+    }
+
     let root = std::env::temp_dir().join(format!(
         "slim-lsp-trust-notice-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        super::system_time_nanos(std::time::SystemTime::now())
     ));
     std::fs::create_dir_all(&root).expect("workspace");
+    let auth_path = root.join("auth.json");
+    let config_path = root.join("config.toml");
+    let trust_path = root.join("mcp-trust.json");
+    std::fs::write(&config_path, "").expect("isolated global config");
+    std::env::set_var("SLIM_AUTH_FILE", &auth_path);
+    std::env::set_var("SLIM_CONFIG_FILE", &config_path);
+    std::env::set_var("SLIM_MCP_TRUST_FILE", &trust_path);
     std::fs::write(
         root.join(crate::config::PROJECT_CONFIG_FILE),
         "[lsp.servers.typescript-language-server]\npath = 'repo.mjs'\n",
     )
     .expect("project config");
-    let untrusted = super::project_lsp_trust_notice(Some(&root), false);
-    let trusted_session = super::project_lsp_trust_notice(Some(&root), true);
+    let oauth = OAuthService::new(
+        OAuthEndpoints::default(),
+        Arc::new(NoBrowser),
+        OAuthStore::at(&auth_path),
+    )
+    .expect("oauth");
+    let untrusted = super::prepare_tui_in(vec!["--tui".into()], &oauth, Some(&root))
+        .expect("untrusted startup")
+        .lsp_trust_notice;
+    let trusted_session = super::prepare_tui_in(
+        vec!["--tui".into(), "--trust-project".into()],
+        &oauth,
+        Some(&root),
+    )
+    .expect("trusted startup")
+    .lsp_trust_notice;
     let _ = std::fs::remove_dir_all(&root);
     assert!(
         untrusted

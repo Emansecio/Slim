@@ -252,6 +252,9 @@ mod tests {
             description: Some(description.into()),
             schema,
             output_schema: None,
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
         }
     }
 

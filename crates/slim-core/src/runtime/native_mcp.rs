@@ -1,4 +1,4 @@
-use super::native_mcp_direct::{mcp_outcome_result, run_mcp_route};
+use super::native_mcp_direct::{is_direct_mcp_call, mcp_outcome_result, run_mcp_route};
 use super::*;
 use crate::context::ArtifactHandle;
 use crate::mcp::{McpProgress, McpProgressSink};
@@ -175,10 +175,11 @@ pub(super) async fn run_mcp_dispatch_with(
                 .map(Rendered::plain),
             (false, Some(server), Some(tool), false) => {
                 let arguments = Value::Object(args.arguments.unwrap_or_default());
-                manager
-                    .call_with_progress(server, tool, arguments, cancellation, progress)
+                let outcome = manager
+                    .call_with_progress(server, tool, arguments, cancellation.clone(), progress)
                     .await
-                    .map(|value| render_call_tool_result(&value, server, tool, env))
+                    .map(|value| render_call_tool_result(&value, server, tool, env));
+                with_usage_hint(&manager, server, tool, outcome, cancellation).await
             }
             _ => McpRequestOutcome::Completed(Err(usage())),
         }
@@ -186,25 +187,67 @@ pub(super) async fn run_mcp_dispatch_with(
     mcp_outcome_result("mcp", outcome)
 }
 
-/// [`run_mcp_dispatch_with`] without an artifact store, bounded like a
-/// result the runtime presents.
-#[cfg(test)]
-pub(super) async fn run_mcp_dispatch(
-    manager: Option<Arc<McpManager>>,
-    arguments: &str,
+/// A call the server rejected for its shape (unknown tool, invalid arguments)
+/// carries what fixes it in the same result: the tool's schema, or the
+/// server's tools when the name does not exist. A model that guessed wrong
+/// then needs one retry, not a describe or another guess.
+async fn with_usage_hint(
+    manager: &McpManager,
+    server: &str,
+    tool: &str,
+    outcome: McpRequestOutcome<Rendered>,
     cancellation: McpCancellation,
-    progress: Option<McpProgressSink>,
-) -> ToolResult {
-    let (mut result, _) = run_mcp_dispatch_with(
-        manager,
-        arguments,
-        cancellation,
-        progress,
-        &RenderEnv::default(),
-    )
-    .await;
-    result.output = limit_text(result.output, None).inline;
-    result
+) -> McpRequestOutcome<Rendered> {
+    use crate::mcp::McpError;
+    const INVALID_PARAMS: i64 = -32602;
+    let rejected = match &outcome {
+        McpRequestOutcome::Completed(Ok(rendered)) => {
+            !rendered.success && names_invalid_arguments(&rendered.text)
+        }
+        McpRequestOutcome::Completed(Err(McpError::Server { code, .. })) => *code == INVALID_PARAMS,
+        _ => false,
+    };
+    if !rejected {
+        return outcome;
+    }
+    let hint = match manager
+        .describe_cancellable(server, tool, cancellation.clone())
+        .await
+        .into_result()
+    {
+        Ok(schema) => format!("Schema of {tool}:\n{schema}"),
+        Err(_) => match manager
+            .list_tools_text_cancellable(server, 0, cancellation)
+            .await
+            .into_result()
+        {
+            Ok(tools) => tools,
+            Err(_) => return outcome,
+        },
+    };
+    match outcome {
+        McpRequestOutcome::Completed(Ok(mut rendered)) => {
+            rendered.text.push_str("\n\n");
+            rendered.text.push_str(&hint);
+            McpRequestOutcome::Completed(Ok(rendered))
+        }
+        McpRequestOutcome::Completed(Err(McpError::Server { code, message })) => {
+            McpRequestOutcome::Completed(Err(McpError::Server {
+                code,
+                message: format!("{message}\n\n{hint}"),
+            }))
+        }
+        other => other,
+    }
+}
+
+/// Whether a failed tool result opens by blaming the arguments (the MCP SDKs'
+/// input validation), as opposed to failing at its work.
+fn names_invalid_arguments(text: &str) -> bool {
+    let head = text[..text.floor_char_boundary(160)].to_ascii_lowercase();
+    ["validation error", "invalid arguments", "invalid params"]
+        .iter()
+        .any(|marker| head.contains(marker))
 }
 
 impl Runtime {
@@ -212,6 +255,29 @@ impl Runtime {
     /// connects lazily on first use; list/describe keep schemas out of the
     /// prompt until the model asks for them. Events use `invocation.name`
     /// (the `mcp` meta-tool), not a per-server tool name.
+    fn mcp_call_allowed(&self, mode: crate::OperatingMode, name: &str, arguments: &str) -> bool {
+        if mode.allows_mutation() {
+            return true;
+        }
+        if self.mcp_readonly_allowlist.is_empty() {
+            return false;
+        }
+        if is_direct_mcp_call(name) {
+            return self
+                .mcp
+                .as_ref()
+                .and_then(|manager| manager.resolve_direct_tool(name))
+                .is_some_and(|(server, _)| self.mcp_readonly_allowlist.contains(&server));
+        }
+        if name == "mcp" {
+            return serde_json::from_str::<Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("server").and_then(Value::as_str).map(str::to_owned))
+                .is_some_and(|server| self.mcp_readonly_allowlist.contains(&server));
+        }
+        false
+    }
+
     pub(super) async fn execute_mcp(
         &mut self,
         mode: crate::OperatingMode,
@@ -230,7 +296,7 @@ impl Runtime {
         let store = self.artifact_store.clone();
         self.refresh_mcp_secrets();
         let secrets = self.sensitive_values.0.clone();
-        let mut result = if mode.allows_mutation() {
+        let mut result = if self.mcp_call_allowed(mode, invocation.name, invocation.arguments) {
             let (sink, mut updates) = progress_channel();
             let env = RenderEnv {
                 store: store.as_ref(),
@@ -272,6 +338,26 @@ impl Runtime {
             self.refresh_mcp_secrets();
             let (result, created) = result;
             blobs = created;
+            if is_direct_mcp_call(invocation.name) {
+                self.promoted_direct_mcp_tools
+                    .insert(invocation.name.to_owned());
+            } else if invocation.name == "mcp" {
+                if let (Ok(parsed), Some(manager)) = (
+                    serde_json::from_str::<Value>(invocation.arguments),
+                    self.mcp.as_ref(),
+                ) {
+                    if let (Some(srv), Some(tl)) = (
+                        parsed.get("server").and_then(Value::as_str),
+                        parsed.get("tool").and_then(Value::as_str),
+                    ) {
+                        for direct in manager.direct_tools().iter() {
+                            if direct.server == srv && direct.tool == tl {
+                                self.promoted_direct_mcp_tools.insert(direct.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
             result
         } else {
             ToolResult::fail(
@@ -279,7 +365,14 @@ impl Runtime {
                 format!("{} is only available in Auto mode", invocation.name),
             )
         };
-        blobs.extend(self.bound_mcp_output(&mut result));
+        let is_resource_listing = invocation.name == "mcp"
+            && serde_json::from_str::<Value>(invocation.arguments)
+                .ok()
+                .is_some_and(|v| {
+                    v.get("resources").and_then(Value::as_bool) == Some(true)
+                        || v.get("resource_templates").and_then(Value::as_bool) == Some(true)
+                });
+        blobs.extend(self.bound_mcp_output(&mut result, !is_resource_listing));
         for handle in blobs {
             let carrier = ToolResult {
                 artifact: Some(handle),
@@ -291,12 +384,145 @@ impl Runtime {
         Ok((result, seq))
     }
 
+    /// Runs a cluster of 2+ read-only direct MCP calls concurrently via `buffer_unordered(6)`.
+    pub(super) async fn execute_direct_mcp_cluster(
+        &mut self,
+        mode: crate::OperatingMode,
+        batch_id: &str,
+        calls: &[ProviderToolCall],
+        indices: &[usize],
+        next_seq: &mut u64,
+    ) -> Result<Vec<(usize, ToolResult)>, ProviderError> {
+        self.ensure_not_cancelled()?;
+        self.refresh_mcp_secrets();
+        let manager = self.mcp.clone();
+        let store = self.artifact_store.clone();
+        let secrets = self.sensitive_values.0.clone();
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationToken::mcp_cancellation)
+            .unwrap_or_default();
+
+        let mut begun_list = Vec::with_capacity(indices.len());
+        let mut runnable = Vec::new();
+        let mut outcomes: Vec<Option<(ToolResult, Vec<ArtifactHandle>)>> =
+            vec![None; indices.len()];
+
+        for (pos, &idx) in indices.iter().enumerate() {
+            let call = &calls[idx];
+            let inv = ToolInvocation::provider(batch_id, call);
+            let started_at = self.begin_tool(inv, next_seq)?;
+            begun_list.push((pos, idx, started_at));
+            if !self.mcp_call_allowed(mode, &call.name, &call.arguments) {
+                outcomes[pos] = Some((
+                    ToolResult::fail(&call.name, format!("{} is only available in Auto mode", call.name)),
+                    Vec::new(),
+                ));
+            } else {
+                self.promoted_direct_mcp_tools.insert(call.name.clone());
+                runnable.push((pos, call.name.clone(), call.arguments.clone()));
+            }
+        }
+
+        if !runnable.is_empty() {
+            let env = RenderEnv {
+                store: store.as_ref(),
+                secrets: &secrets,
+            };
+            let mut completed = futures_util::stream::iter(runnable.into_iter().map(
+                |(pos, name, arguments)| {
+                    let manager = manager.clone();
+                    let cancel = cancellation.clone();
+                    let env_ref = &env;
+                    async move {
+                        let res = run_mcp_route(
+                            manager,
+                            &name,
+                            &arguments,
+                            cancel,
+                            None,
+                            env_ref,
+                        )
+                        .await;
+                        (pos, res)
+                    }
+                },
+            ))
+            .buffer_unordered(6);
+            while let Some((pos, outcome)) = completed.next().await {
+                outcomes[pos] = Some(outcome);
+            }
+            self.refresh_mcp_secrets();
+        }
+
+        let mut results = Vec::with_capacity(indices.len());
+        for (pos, idx, started_at) in begun_list {
+            let (mut result, mut blobs) = outcomes[pos]
+                .take()
+                .unwrap_or_else(|| (ToolResult::fail(&calls[idx].name, "mcp call did not complete"), Vec::new()));
+            blobs.extend(self.bound_mcp_output(&mut result, true));
+            for handle in blobs {
+                let carrier = ToolResult {
+                    artifact: Some(handle),
+                    ..ToolResult::ok("mcp", "")
+                };
+                self.record_existing_artifact(&carrier, next_seq)?;
+            }
+            let inv = ToolInvocation::provider(batch_id, &calls[idx]);
+            self.finish_tool(inv, &mut result, started_at, next_seq, None)?;
+            results.push((idx, result));
+        }
+        Ok(results)
+    }
+
     /// Applies the inline budget to a result's text: the redacted text is
     /// stored whole and the model sees its head and tail with the artifact's
     /// pointer. Redaction comes first so the stored copy holds no secrets.
     /// Returns the artifact, which the caller announces.
-    fn bound_mcp_output(&self, result: &mut ToolResult) -> Option<ArtifactHandle> {
+    fn bound_mcp_output(
+        &self,
+        result: &mut ToolResult,
+        allow_json_distill: bool,
+    ) -> Option<ArtifactHandle> {
         let redacted = self.redact_sensitive(&result.output);
+        if allow_json_distill {
+            if let Some(distilled) = super::distill::distill_json_for_model(&redacted) {
+                let raw_artifact = self
+                    .artifact_store
+                    .as_ref()
+                    .and_then(|store| store.put("mcp-output", redacted.as_bytes()).ok());
+                let saved_pct = 100usize.saturating_sub(
+                    distilled
+                        .distilled_bytes
+                        .saturating_mul(100)
+                        .checked_div(distilled.original_bytes.max(1))
+                        .unwrap_or(100),
+                );
+                let mut annotated = if let Some(handle) = &raw_artifact {
+                    format!(
+                        "[distilled {}: {} -> {} bytes (-{saved_pct}%); full JSON in artifact id={}]\n{}",
+                        distilled.kind,
+                        distilled.original_bytes,
+                        distilled.distilled_bytes,
+                        handle.id,
+                        distilled.text
+                    )
+                } else {
+                    format!(
+                        "[distilled {}: {} -> {} bytes (-{saved_pct}%)]\n{}",
+                        distilled.kind,
+                        distilled.original_bytes,
+                        distilled.distilled_bytes,
+                        distilled.text
+                    )
+                };
+                let limited = limit_text(annotated, None);
+                annotated = limited.inline;
+                result.output = annotated;
+                return raw_artifact;
+            }
+        }
         let limited = limit_text(redacted, self.artifact_store.as_ref());
         result.output = limited.inline;
         limited.artifact
@@ -330,6 +556,24 @@ impl Runtime {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    async fn run_mcp_dispatch(
+        manager: Option<Arc<McpManager>>,
+        arguments: &str,
+        cancellation: McpCancellation,
+        progress: Option<McpProgressSink>,
+    ) -> ToolResult {
+        let (mut result, _) = run_mcp_dispatch_with(
+            manager,
+            arguments,
+            cancellation,
+            progress,
+            &RenderEnv::default(),
+        )
+        .await;
+        result.output = limit_text(result.output, None).inline;
+        result
+    }
 
     #[tokio::test]
     async fn malformed_dispatch_arguments_are_rejected_before_discovery_or_sending() {
@@ -980,6 +1224,54 @@ mod tests {
         );
         assert_eq!(lines[3], "[audio audio/mpeg omitted]");
         assert!(!result.output.contains("ignored"));
+    }
+
+    #[tokio::test]
+    async fn a_call_rejected_for_its_shape_returns_the_schema_or_the_tool_list() {
+        let server = ScriptedConnection::new(|method, params| match (method, params["name"].as_str()) {
+            ("tools/call", Some("navigate_page")) => Ok(json!({"isError": true, "content": [{
+                "type": "text",
+                "text": "Input validation error: Invalid arguments for tool navigate_page: pageId: expected number"
+            }]})),
+            ("tools/call", Some("click")) => Ok(json!({"isError": true, "content": [{
+                "type": "text", "text": "Error: Element with uid 1_2 no longer exists on the page."
+            }]})),
+            _ => Err(crate::mcp::McpError::Server {
+                code: -32602,
+                message: "Tool navigate not found".into(),
+            }),
+        });
+        let manager = manager_with(Vec::new());
+        let catalog = vec![crate::mcp::McpToolSummary {
+            name: "navigate_page".into(),
+            description: Some("Go to a URL".into()),
+            schema: json!({"type": "object", "required": ["pageId", "url"],
+                "properties": {"pageId": {"type": "number"}, "url": {"type": "string"}}}),
+            output_schema: None,
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
+        }];
+        manager.insert_connection(spec("cdp"), server.clone(), catalog);
+        let call = |tool: &str| json!({"server": "cdp", "tool": tool, "arguments": {"url": "x"}});
+
+        let invalid = gateway(&manager, call("navigate_page")).await;
+        assert!(!invalid.success);
+        assert!(invalid.output.starts_with("Input validation error"), "{}", invalid.output);
+        assert!(
+            invalid.output.contains("Schema of navigate_page") && invalid.output.contains("\"pageId\""),
+            "{}",
+            invalid.output
+        );
+
+        let unknown = gateway(&manager, call("navigate")).await;
+        assert!(!unknown.success);
+        assert!(unknown.output.contains("Tool navigate not found") && unknown.output.contains("navigate_page"));
+
+        // A tool that failed at its work says only that.
+        let stale = gateway(&manager, call("click")).await;
+        assert_eq!(stale.output, "Error: Element with uid 1_2 no longer exists on the page.");
+        assert_eq!(server.count("tools/list"), 0, "the hint reads the loaded catalog");
     }
 
     #[test]

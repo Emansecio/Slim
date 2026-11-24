@@ -29,6 +29,8 @@ pub struct ToolState {
     pub pending_page: Option<PendingContentPage>,
     /// Changed lines of a successful patch, rendered before the output.
     pub edit_diff: Option<slim_core::ToolEditDiff>,
+    /// Redacted program source of a `codemode` call, shown when expanded.
+    pub program_source: Option<String>,
 }
 
 impl ToolState {
@@ -66,7 +68,9 @@ impl ToolState {
     }
 
     pub fn has_expanded_body(&self) -> bool {
-        self.edit_diff.is_some() || !self.materialized_output.is_empty()
+        self.program_source.is_some()
+            || self.edit_diff.is_some()
+            || !self.materialized_output.is_empty()
     }
 
     /// The row an open call keeps under its details while its output is not
@@ -99,17 +103,21 @@ impl ToolState {
         }
     }
 
-    /// Everything the expanded body shows: the diff, then the materialized
-    /// output. Layout and rendering measure this same text.
+    /// Everything the expanded body shows: program source (for `codemode`),
+    /// diff, then materialized output. Layout and rendering measure this same text.
     pub fn expanded_body(&self) -> String {
-        let mut body = self.diff_lines().join("\n");
-        if !self.materialized_output.is_empty() {
-            if !body.is_empty() {
-                body.push('\n');
-            }
-            body.push_str(&self.materialized_output);
+        let mut sections = Vec::new();
+        if let Some(source) = &self.program_source {
+            sections.push(format!("Program:\n{source}"));
         }
-        body
+        let diff = self.diff_lines().join("\n");
+        if !diff.is_empty() {
+            sections.push(diff);
+        }
+        if !self.materialized_output.is_empty() {
+            sections.push(self.materialized_output.clone());
+        }
+        sections.join("\n")
     }
 }
 
@@ -1139,6 +1147,15 @@ impl Block {
         true
     }
 
+    pub fn set_tool_source(&mut self, source: String) -> bool {
+        let BlockKind::Tool(state) = &mut self.kind else {
+            return false;
+        };
+        state.program_source = Some(source);
+        self.touch_content();
+        true
+    }
+
     pub fn append_tool_page(&mut self, text: &str, next_cursor: Option<PageCursor>) -> bool {
         const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
         let BlockKind::Tool(state) = &mut self.kind else {
@@ -1438,5 +1455,20 @@ mod tests {
             lines[core]
         );
         assert!(lines[core + 1].contains("Runtime and protocol"), "{joined}");
+    }
+
+    #[test]
+    fn codemode_expanded_body_shows_program_source_before_output() {
+        let state = super::ToolState {
+            name: "codemode".into(),
+            program_source: Some("const x = await slim.list();\nreturn x;".into()),
+            materialized_output: "\"ok\"".into(),
+            ..super::ToolState::default()
+        };
+        assert!(state.has_expanded_body());
+        assert_eq!(
+            state.expanded_body(),
+            "Program:\nconst x = await slim.list();\nreturn x;\n\"ok\""
+        );
     }
 }

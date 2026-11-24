@@ -440,6 +440,17 @@ pub trait CodeIntelligence: Send + Sync {
         true
     }
 
+    /// Best-effort background warm-up before a tool call completes.
+    /// Never mutates files or surfaces errors.
+    async fn prewarm_file(
+        &self,
+        _workspace: &Path,
+        _path: &Path,
+        _allow_spawn: bool,
+        _cancellation: Option<CancellationToken>,
+    ) {
+    }
+
     /// Server availability and health for a workspace.
     async fn status(&self, workspace: &Path) -> CodeIntelOutcome;
 

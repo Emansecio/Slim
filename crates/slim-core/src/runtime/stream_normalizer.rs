@@ -52,6 +52,7 @@ impl Wire {
 struct ThinkingAssembly {
     scope_id: u64,
     model: String,
+    provenance: u64,
     binding: u64,
     blocks: Vec<(u32, PendingThinking)>,
     broken: bool,
@@ -117,12 +118,15 @@ impl ThinkingAssembly {
                 }),
                 None => return Vec::new(),
             };
-            items.push(crate::provider::ResponsesReasoning::anthropic_thinking(
-                self.scope_id,
-                self.model.clone(),
-                item,
-                self.binding,
-            ));
+            items.push(
+                crate::provider::ResponsesReasoning::anthropic_thinking(
+                    self.scope_id,
+                    self.model.clone(),
+                    item,
+                    self.binding,
+                )
+                .with_provenance(self.provenance),
+            );
         }
         items
     }
@@ -141,6 +145,7 @@ pub(crate) struct ProviderStreamNormalizer {
     reasoning_pending: String,
     reasoning_open: bool,
     reasoning_classification: Option<crate::ReasoningClassification>,
+    reasoning_provenance: u64,
     responses_reasoning: Vec<crate::provider::ResponsesReasoning>,
     chat_reasoning: Option<crate::provider::ChatReasoning>,
     thinking: Option<ThinkingAssembly>,
@@ -166,6 +171,7 @@ impl ProviderStreamNormalizer {
             reasoning_pending: String::new(),
             reasoning_open: false,
             reasoning_classification: None,
+            reasoning_provenance: 0,
             responses_reasoning: Vec::new(),
             chat_reasoning: None,
             thinking: None,
@@ -195,15 +201,28 @@ impl ProviderStreamNormalizer {
         model: &str,
         binding: Option<u64>,
     ) -> Self {
+        let provenance = self.reasoning_provenance;
         self.thinking = scope_id
             .zip(binding)
             .map(|(scope_id, binding)| ThinkingAssembly {
                 scope_id,
                 model: model.to_owned(),
+                provenance,
                 binding,
                 blocks: Vec::new(),
                 broken: false,
             });
+        self
+    }
+
+    /// Stamps the issuing adapter's provenance fingerprint onto opaque
+    /// reasoning items produced by this response so cross-provider switches
+    /// sharing a model ID never leak encrypted state or signatures.
+    pub(crate) fn with_reasoning_provenance(mut self, provenance: u64) -> Self {
+        self.reasoning_provenance = provenance;
+        if let Some(thinking) = self.thinking.as_mut() {
+            thinking.provenance = provenance;
+        }
         self
     }
 
@@ -438,11 +457,19 @@ impl ProviderStreamNormalizer {
             ProviderEvent::ToolCallProgress { name, bytes } => {
                 self.on_tool_progress(app, name.as_deref(), bytes)
             }
-            ProviderEvent::ResponsesReasoning(state) => {
+            ProviderEvent::ResponsesReasoning(mut state) => {
+                if state.provenance == 0 {
+                    state.provenance = self.reasoning_provenance;
+                }
                 self.responses_reasoning.push(state);
                 Ok(())
             }
-            ProviderEvent::ChatReasoning(state) => self.on_chat_reasoning(state),
+            ProviderEvent::ChatReasoning(mut state) => {
+                if state.provenance == 0 {
+                    state.provenance = self.reasoning_provenance;
+                }
+                self.on_chat_reasoning(state)
+            }
             ProviderEvent::ThinkingBlock { index, fragment } => {
                 if let Some(thinking) = self.thinking.as_mut() {
                     thinking.push(index, fragment);
@@ -464,6 +491,7 @@ impl ProviderStreamNormalizer {
             ProviderEvent::ResponseCacheHit => {
                 push_runtime_event(app, &mut self.next_seq, crate::EventKind::ResponseCacheHit)
             }
+            ProviderEvent::ResponseId(_) => Ok(()),
             ProviderEvent::Usage {
                 input_tokens,
                 output_tokens,

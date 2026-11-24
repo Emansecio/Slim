@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const MAX_SHELL_YIELD_MS: u64 = 10_000;
+pub(crate) const DEFAULT_SHELL_YIELD_MS: u64 = 1000;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ToolPresentationSource {
@@ -461,7 +462,7 @@ pub(crate) fn present_unstructured(
             "[tool result omitted by aggregate presentation budget; raw result retained separately]",
         );
     }
-    if name == "shell" {
+    if matches!(name, "shell" | "codemode" | "batch_code") {
         let head_target = budget.max_bytes / 2 + budget.max_bytes % 2;
         let tail_target = budget.max_bytes.saturating_sub(head_target);
         let mut head_end = head_target.min(output.len());
@@ -527,6 +528,25 @@ impl FastStamp {
             file_id: file_identity(file, metadata),
             operation_digest,
         }
+    }
+
+    pub(crate) fn from_metadata(
+        kind: DependencyKind,
+        metadata: &Metadata,
+        operation_digest: Option<String>,
+    ) -> Option<Self> {
+        let file_id = metadata_file_identity(metadata)?;
+        Some(Self {
+            kind,
+            len: metadata.len(),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+            file_id: Some(file_id),
+            operation_digest,
+        })
     }
 
     pub(crate) fn observed_directory(entry_count: usize, digest: String) -> Self {
@@ -642,6 +662,10 @@ pub(crate) enum PreparedToolArguments {
         /// `None` when the model omitted the limit: the default first page may
         /// widen to a full-file read. `Some` is always honored literally.
         max_lines: Option<usize>,
+        outline: bool,
+        raw: bool,
+        ranges: Vec<(usize, usize)>,
+        symbols: Vec<String>,
     },
     List {
         offset: usize,
@@ -654,6 +678,7 @@ pub(crate) enum PreparedToolArguments {
         offset: usize,
         max_hits: usize,
         cursor: Option<String>,
+        glob: Option<String>,
     },
     Write {
         content: String,
@@ -661,7 +686,9 @@ pub(crate) enum PreparedToolArguments {
         then_run: Option<Box<PreparedToolInvocation>>,
     },
     Patch {
-        edits: Vec<(String, String)>,
+        edits: Vec<super::patch::Edit>,
+        extra_files: Vec<(PathBuf, Vec<super::patch::Edit>)>,
+        rollback_on_check_fail: bool,
         then_run: Option<Box<PreparedToolInvocation>>,
     },
     Shell {
@@ -670,6 +697,7 @@ pub(crate) enum PreparedToolArguments {
         timeout_ms: u64,
         yield_ms: u64,
         stdin: bool,
+        no_cache: bool,
     },
     CodeIntel(CodeIntelRequest),
     External,
@@ -712,14 +740,24 @@ impl PreparedToolInvocation {
 
     /// A patch whose every edit only retunes numeric literals or hex colours.
     pub(crate) fn is_tuning_patch(&self) -> bool {
-        matches!(
-            &self.arguments,
-            PreparedToolArguments::Patch { edits, .. }
-                if !edits.is_empty()
-                    && edits
-                        .iter()
-                        .all(|(expected, replacement)| super::patch::tuning_only_edit(expected, replacement))
-        )
+        match &self.arguments {
+            PreparedToolArguments::Patch {
+                edits,
+                extra_files,
+                ..
+            } => {
+                let mut has_any = false;
+                let all_tuning = edits
+                    .iter()
+                    .chain(extra_files.iter().flat_map(|(_, file_edits)| file_edits.iter()))
+                    .all(|(expected, replacement, _)| {
+                        has_any = true;
+                        super::patch::tuning_only_edit(expected, replacement)
+                    });
+                has_any && all_tuning
+            }
+            _ => false,
+        }
     }
 
     /// Refuses the call before any executor runs, as argument admission does.
@@ -747,16 +785,26 @@ impl PreparedToolInvocation {
         raw_arguments: &str,
         native_spec: Option<ToolOperationalSpec>,
     ) -> Self {
+        let parsed_arguments = serde_json::from_str::<Value>(raw_arguments)
+            .map_err(|error| format!("invalid tool arguments: {error}"));
+        Self::from_workspace_value(mode, cwd, workspace, name, parsed_arguments, native_spec)
+    }
+
+    pub(crate) fn from_workspace_value(
+        mode: OperatingMode,
+        cwd: &Path,
+        workspace: &Result<PathBuf, String>,
+        name: &str,
+        parsed_arguments: Result<Value, String>,
+        native_spec: Option<ToolOperationalSpec>,
+    ) -> Self {
         let (canonical_workspace, workspace_error) = match workspace {
             Ok(workspace) => (workspace.clone(), None),
             Err(message) => (absolute_fallback(cwd), Some(message.clone())),
         };
-        let (mut arguments, mut error) = match serde_json::from_str::<Value>(raw_arguments) {
+        let (mut arguments, mut error) = match parsed_arguments {
             Ok(arguments) => (arguments, None),
-            Err(error) => (
-                Value::Null,
-                Some(format!("invalid tool arguments: {error}")),
-            ),
+            Err(message) => (Value::Null, Some(message)),
         };
         let mut structural_rejection = error.is_some();
         if error.is_none() {
@@ -994,6 +1042,18 @@ fn materialize_defaults_and_paths(
             *edits = Value::Array(vec![edit]);
             admission_notes.push("patch single edit normalized to edits array".into());
         }
+        if let Some(files) = object.get_mut("files").and_then(Value::as_array_mut) {
+            for entry in files {
+                if let Some(edits) = entry
+                    .as_object_mut()
+                    .and_then(|map| map.get_mut("edits"))
+                    .filter(|edits| edits.is_object())
+                {
+                    let edit = edits.take();
+                    *edits = Value::Array(vec![edit]);
+                }
+            }
+        }
     }
     reject_unknown_native_fields(tool_name, object)?;
     match tool_name {
@@ -1087,7 +1147,7 @@ fn materialize_defaults_and_paths(
                 "timeout_ms",
                 Value::from(super::DEFAULT_SHELL_TIMEOUT_MS),
             );
-            insert_default(object, "yield_ms", Value::from(1000));
+            insert_default(object, "yield_ms", Value::from(DEFAULT_SHELL_YIELD_MS));
             insert_default(object, "background", Value::from(false));
             insert_default(object, "stdin", Value::from(false));
             if object.get("args").is_some_and(Value::is_null) {
@@ -1098,6 +1158,39 @@ fn materialize_defaults_and_paths(
             // `null` is the documented create/observed-precondition spelling;
             // it has the same effective meaning as an omitted expected value.
             object.remove("expected");
+        }
+        "patch"
+            if object.get("path").is_none()
+                && object.get("edits").is_none()
+                && object.get("expected").is_none()
+                && object.get("replacement").is_none() =>
+        {
+            if let Some(files) = object.get_mut("files") {
+                let array = files
+                    .as_array_mut()
+                    .ok_or("patch files must be an array of {path, edits} objects")?;
+                if array.is_empty() || array.len() > 16 {
+                    return Err("patch files must contain 1..=16 entries".into());
+                }
+                let first = array.remove(0);
+                let mut first_obj = first
+                    .as_object()
+                    .cloned()
+                    .ok_or("each patch files entry must be an object with path and edits")?;
+                let first_path = first_obj
+                    .remove("path")
+                    .ok_or("each patch files entry needs string field `path`")?;
+                let first_edits = first_obj
+                    .remove("edits")
+                    .ok_or("each patch files entry needs `edits`")?;
+                if array.is_empty() {
+                    object.remove("files");
+                }
+                object.insert("path".into(), first_path);
+                object.insert("edits".into(), first_edits);
+                admission_notes
+                    .push("patch standalone files promoted first entry to path/edits".into());
+            }
         }
         _ => {}
     }
@@ -1125,17 +1218,67 @@ fn materialize_defaults_and_paths(
         target_paths.push(normalized.clone());
         object.insert("path".into(), Value::String(path_identity(&normalized)));
     }
+    if tool_name == "patch" {
+        if let Some(files) = object.get_mut("files") {
+            let entries = files
+                .as_array_mut()
+                .ok_or("patch files must be an array of {path, edits} objects")?;
+            if entries.is_empty() || entries.len() > 16 {
+                return Err("patch files must contain 1..=16 entries".into());
+            }
+            let mut seen_identities: std::collections::HashSet<String> = target_paths
+                .iter()
+                .map(|path| path_identity(path))
+                .collect();
+            for entry in entries.iter_mut() {
+                let entry_obj = entry
+                    .as_object_mut()
+                    .ok_or("each patch files entry must be an object with path and edits")?;
+                let file_path = entry_obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("each patch files entry needs non-empty string field `path`")?
+                    .to_owned();
+                let spelled = workspace_relative_spelling(cwd, &file_path);
+                if spelled.is_some() {
+                    admission_notes.push(
+                        "absolute path inside the workspace; used as a workspace-relative path"
+                            .into(),
+                    );
+                }
+                let normalized =
+                    resolve_workspace_path_from_root(cwd, spelled.as_deref().unwrap_or(&file_path))?;
+                let id = path_identity(&normalized);
+                if !seen_identities.insert(id.clone()) {
+                    return Err(format!("duplicate target path in patch files: {file_path}"));
+                }
+                entry_obj.insert("path".into(), Value::String(id));
+                target_paths.push(normalized);
+            }
+        }
+    }
     Ok(())
 }
 
 fn native_argument_keys(tool_name: &str) -> Option<&'static [&'static str]> {
     match tool_name {
-        "read" => Some(&["path", "offset", "max_lines", "lines"]),
+        "read" => Some(&[
+            "path",
+            "offset",
+            "max_lines",
+            "lines",
+            "outline",
+            "ranges",
+            "symbols",
+            "raw",
+        ]),
         "list" => Some(&["path", "offset", "max_entries", "cursor"]),
         "search" => Some(&[
             "path",
             "query",
             "patterns",
+            "glob",
             "context_lines",
             "max_hits",
             "max_entries",
@@ -1143,7 +1286,15 @@ fn native_argument_keys(tool_name: &str) -> Option<&'static [&'static str]> {
             "cursor",
         ]),
         "write" => Some(&["path", "content", "expected", "then_run"]),
-        "patch" => Some(&["path", "edits", "expected", "replacement", "then_run"]),
+        "patch" => Some(&[
+            "path",
+            "edits",
+            "expected",
+            "replacement",
+            "files",
+            "rollback_on_check_fail",
+            "then_run",
+        ]),
         "shell" => Some(&[
             "command",
             "args",
@@ -1151,6 +1302,7 @@ fn native_argument_keys(tool_name: &str) -> Option<&'static [&'static str]> {
             "yield_ms",
             "background",
             "stdin",
+            "no_cache",
         ]),
         "code_intel" => Some(&[
             "action",
@@ -1199,11 +1351,41 @@ fn reject_unknown_native_fields(
                 };
                 if let Some(key) = edit
                     .keys()
-                    .find(|key| !matches!(key.as_str(), "expected" | "replacement"))
+                    .find(|key| !matches!(key.as_str(), "expected" | "replacement" | "replace_all"))
                 {
                     return Err(format!(
-                        "patch edit {index} has unknown argument `{key}`; valid fields: expected, replacement"
+                        "patch edit {index} has unknown argument `{key}`; valid fields: expected, replacement, replace_all"
                     ));
+                }
+            }
+        }
+        if let Some(files) = object.get("files").and_then(Value::as_array) {
+            for (f_idx, entry) in files.iter().enumerate() {
+                let Some(entry_obj) = entry.as_object() else {
+                    continue;
+                };
+                if let Some(key) = entry_obj
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "path" | "edits"))
+                {
+                    return Err(format!(
+                        "patch files[{f_idx}] has unknown argument `{key}`; valid fields: path, edits"
+                    ));
+                }
+                if let Some(edits) = entry_obj.get("edits").and_then(Value::as_array) {
+                    for (e_idx, edit) in edits.iter().enumerate() {
+                        let Some(edit) = edit.as_object() else {
+                            continue;
+                        };
+                        if let Some(key) = edit
+                            .keys()
+                            .find(|key| !matches!(key.as_str(), "expected" | "replacement" | "replace_all"))
+                        {
+                            return Err(format!(
+                                "patch files[{f_idx}] edit {e_idx} has unknown argument `{key}`; valid fields: expected, replacement, replace_all"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1617,7 +1799,21 @@ fn typed_arguments(
                     admission_notes,
                 )
             });
-            Ok(PreparedToolArguments::Read { offset, max_lines })
+            let outline = optional_bool_argument(arguments, "outline")?.unwrap_or(false);
+            let raw = optional_bool_argument(arguments, "raw")?.unwrap_or(false);
+            let ranges = parse_read_ranges(arguments)?;
+            let symbols = parse_read_symbols(arguments)?;
+            if outline && (!ranges.is_empty() || !symbols.is_empty()) {
+                return Err("read `outline: true` cannot be combined with `ranges` or `symbols`".into());
+            }
+            Ok(PreparedToolArguments::Read {
+                offset,
+                max_lines,
+                outline,
+                raw,
+                ranges,
+                symbols,
+            })
         }
         "list" => {
             let offset = integer_argument(arguments, "offset")?;
@@ -1679,7 +1875,13 @@ fn typed_arguments(
                 ));
                 arguments["context_lines"] = Value::from(context_lines);
             }
+            let glob = optional_nonempty_string_argument(arguments, "glob")?;
+            if let Some(glob) = &glob {
+                super::search::compile_glob(Path::new("."), glob)
+                    .map_err(super::tool_error_message)?;
+            }
             Ok(PreparedToolArguments::Search {
+                glob,
                 context_lines,
                 patterns,
                 offset,
@@ -1709,11 +1911,8 @@ fn typed_arguments(
             })
         }
         "patch" => {
-            let edits = if let Some(edits) = arguments.get("edits") {
-                if arguments.get("expected").is_some() || arguments.get("replacement").is_some() {
-                    return Err("patch accepts edits or expected/replacement, not both".into());
-                }
-                let edits = edits
+            let parse_edits_list = |raw_edits: &Value| -> Result<Vec<super::patch::Edit>, String> {
+                let edits = raw_edits
                     .as_array()
                     .ok_or("patch edits must be an array or a single edit object")?;
                 if edits.is_empty() || edits.len() > super::patch::MAX_PATCH_EDITS {
@@ -1734,24 +1933,65 @@ fn typed_arguments(
                             .get("replacement")
                             .and_then(Value::as_str)
                             .ok_or("each edit needs a replacement string")?;
-                        Ok((expected.to_owned(), replacement.to_owned()))
+                        let replace_all = edit.get("replace_all").map_or(Ok(false), |value| {
+                            value.as_bool().ok_or("each edit's replace_all must be boolean")
+                        })?;
+                        Ok((expected.to_owned(), replacement.to_owned(), replace_all))
                     })
-                    .collect::<Result<Vec<_>, String>>()?
+                    .collect()
+            };
+            let edits = if let Some(edits) = arguments.get("edits") {
+                if arguments.get("expected").is_some() || arguments.get("replacement").is_some() {
+                    return Err("patch accepts edits or expected/replacement, not both".into());
+                }
+                parse_edits_list(edits)?
             } else {
                 vec![(
                     nonempty_string_argument("expected")?,
                     string_argument("replacement")?,
+                    false,
                 )]
+            };
+            let mut extra_files = Vec::new();
+            let mut total_edits = edits.len();
+            if let Some(files) = arguments.get("files").and_then(Value::as_array) {
+                for (index, entry) in files.iter().enumerate() {
+                    let target_path = target_paths
+                        .get(1 + index)
+                        .cloned()
+                        .ok_or("patch files path resolution mismatch")?;
+                    let raw_edits = entry
+                        .get("edits")
+                        .ok_or("each patch files entry needs `edits`")?;
+                    let file_edits = parse_edits_list(raw_edits)?;
+                    total_edits = total_edits.saturating_add(file_edits.len());
+                    if total_edits > super::patch::MAX_PATCH_EDITS {
+                        return Err(format!(
+                            "patch total edits across all files must not exceed {}",
+                            super::patch::MAX_PATCH_EDITS
+                        ));
+                    }
+                    extra_files.push((target_path, file_edits));
+                }
+            }
+            let rollback_on_check_fail = match arguments.get("rollback_on_check_fail") {
+                None => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err("patch rollback_on_check_fail must be boolean".into()),
             };
             // Legacy `expected`/`replacement` and the batch form have the same
             // effective operation.  Store one canonical shape for identity,
             // while continuing to accept the legacy spelling at the boundary.
             let canonical_edits = edits
                 .iter()
-                .map(|(expected, replacement)| {
+                .map(|(expected, replacement, replace_all)| {
                     let mut edit = serde_json::Map::new();
                     edit.insert("expected".into(), Value::String(expected.clone()));
                     edit.insert("replacement".into(), Value::String(replacement.clone()));
+                    // Only when set, so the identity of plain edits is unchanged.
+                    if *replace_all {
+                        edit.insert("replace_all".into(), Value::Bool(true));
+                    }
                     Value::Object(edit)
                 })
                 .collect();
@@ -1766,6 +2006,8 @@ fn typed_arguments(
             }
             Ok(PreparedToolArguments::Patch {
                 edits,
+                extra_files,
+                rollback_on_check_fail,
                 then_run: prepare_then_run(mode, arguments, canonical_workspace, admission_notes)?,
             })
         }
@@ -1844,12 +2086,17 @@ fn typed_arguments(
                 .get("stdin")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let no_cache = arguments
+                .get("no_cache")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             Ok(PreparedToolArguments::Shell {
                 command,
                 args,
                 timeout_ms,
                 yield_ms,
                 stdin,
+                no_cache,
             })
         }
         "code_intel" => {
@@ -2129,6 +2376,70 @@ fn optional_string_argument(arguments: &Value, name: &str) -> Result<Option<Stri
         .transpose()
 }
 
+fn optional_bool_argument(arguments: &Value, name: &str) -> Result<Option<bool>, String> {
+    arguments
+        .get(name)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("argument `{name}` must be a boolean"))
+        })
+        .transpose()
+}
+
+fn parse_read_ranges(arguments: &Value) -> Result<Vec<(usize, usize)>, String> {
+    let Some(value) = arguments.get("ranges") else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| "argument `ranges` must be an array of [start, end] pairs".to_owned())?;
+    if array.len() > 8 {
+        return Err("read `ranges` accepts at most 8 ranges per call".into());
+    }
+    let mut parsed = Vec::with_capacity(array.len());
+    for (idx, item) in array.iter().enumerate() {
+        let pair = item
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| format!("read ranges[{idx}] must be a [start, end] pair"))?;
+        let start = pair[0]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|&v| v >= 1)
+            .ok_or_else(|| format!("read ranges[{idx}][0] must be an integer >= 1"))?;
+        let end = pair[1]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|&v| v >= start)
+            .ok_or_else(|| format!("read ranges[{idx}][1] must be an integer >= start"))?;
+        parsed.push((start, end));
+    }
+    Ok(super::outline::merge_line_ranges(parsed))
+}
+
+fn parse_read_symbols(arguments: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = arguments.get("symbols") else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| "argument `symbols` must be an array of strings".to_owned())?;
+    if array.len() > 8 {
+        return Err("read `symbols` accepts at most 8 symbol names per call".into());
+    }
+    let mut out = Vec::with_capacity(array.len());
+    for (idx, item) in array.iter().enumerate() {
+        let s = item
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("read symbols[{idx}] must be a non-empty string"))?;
+        out.push(s.to_owned());
+    }
+    Ok(out)
+}
+
 fn optional_nonempty_string_argument(
     arguments: &Value,
     name: &str,
@@ -2212,7 +2523,7 @@ fn effective_spec(
             dependency_scope: ToolDependencyScope::Internal,
             replay_policy: ToolReplayPolicy::Never,
         }),
-        "skill" | "shell_job" | "codemode" => Some(ToolOperationalSpec {
+        "skill" | "shell_job" | "codemode" | "batch_code" => Some(ToolOperationalSpec {
             effect_class: ToolEffectClass::PotentiallyVolatile,
             cacheability: ToolCacheability::None,
             volatility: ToolVolatility::Volatile,
@@ -2227,67 +2538,23 @@ fn allowlisted_validation(arguments: &Value) -> bool {
     let Some(command) = arguments.get("command").and_then(Value::as_str) else {
         return false;
     };
-    let tokens = if let Some(args) = arguments.get("args").filter(|value| !value.is_null()) {
-        let Some(args) = args.as_array() else {
-            return false;
-        };
-        let mut tokens = vec![command];
-        for argument in args {
-            let Some(argument) = argument.as_str() else {
+    let args: Option<Vec<String>> = match arguments.get("args").filter(|value| !value.is_null()) {
+        Some(value) => {
+            let Some(arr) = value.as_array() else {
                 return false;
             };
-            tokens.push(argument);
-        }
-        tokens
-    } else {
-        if command.chars().any(|character| {
-            matches!(
-                character,
-                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r'
-            )
-        }) {
-            return false;
-        }
-        command.split_whitespace().collect::<Vec<_>>()
-    };
-    if tokens.iter().any(|token| {
-        let token = token
-            .strip_prefix("'")
-            .and_then(|token| token.strip_suffix("'"))
-            .or_else(|| {
-                token
-                    .strip_prefix("\"")
-                    .and_then(|token| token.strip_suffix("\""))
-            })
-            .unwrap_or(token);
-        matches!(token, "--fix" | "--help" | "-h" | "--version" | "-V")
-    }) {
-        return false;
-    }
-    let mut index = 0;
-    if tokens.first().is_some_and(|token| *token == "env") {
-        index = 1;
-        while index < tokens.len() {
-            if tokens[index] == "-u" {
-                index = index.saturating_add(2);
-            } else if tokens[index].starts_with("--unset=") {
-                index = index.saturating_add(1);
-            } else {
-                break;
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    return false;
+                };
+                out.push(s.to_owned());
             }
+            Some(out)
         }
-    }
-    if !tokens
-        .get(index)
-        .is_some_and(|token| matches!(*token, "cargo" | "cargo.exe"))
-    {
-        return false;
-    }
-    match tokens.get(index + 1).copied() {
-        Some("test" | "check" | "clippy") => true,
-        Some("fmt") => tokens[index + 2..].contains(&"--check"),
-        _ => false,
-    }
+        None => None,
+    };
+    super::validation_cache::normalized_cacheable_validation(command, args.as_deref()).is_some()
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -2477,9 +2744,24 @@ fn file_identity(file: &File, _metadata: &Metadata) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn file_identity(_file: &File, metadata: &Metadata) -> Option<String> {
+fn metadata_file_identity(metadata: &Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn file_identity(_file: &File, metadata: &Metadata) -> Option<String> {
+    metadata_file_identity(metadata)
+}
+
+#[cfg(windows)]
+fn metadata_file_identity(_metadata: &Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(windows, unix)))]
+fn metadata_file_identity(_metadata: &Metadata) -> Option<String> {
+    None
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -2499,27 +2781,30 @@ mod tests {
     /// (SHA-256 over big-endian u64 length prefix + bytes, per field).
     #[test]
     fn hash_fields_keeps_its_length_prefixed_sha256_encoding() {
-        fn reference(fields: &[&[u8]]) -> String {
-            let mut hasher = Sha256::new();
-            for field in fields {
-                hasher.update((field.len() as u64).to_be_bytes());
-                hasher.update(field);
-            }
-            hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect()
-        }
-        let inputs: [&[&[u8]]; 5] = [
-            &[],
-            &[b""],
-            &[b"slim-causal-call-v2", b"abc", b"", b"7"],
-            &[b"ab", b"c"],
-            &["olá\0\n".as_bytes(), &[0xff, 0x00, 0x7f]],
+        let cases: [(&[&[u8]], &str); 5] = [
+            (
+                &[],
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                &[b""],
+                "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+            ),
+            (
+                &[b"slim-causal-call-v2", b"abc", b"", b"7"],
+                "2324521127883dac5dd8adc5646d4add686bd2c133f44773cbfce5c4124d55fc",
+            ),
+            (
+                &[b"ab", b"c"],
+                "601d5476e2ccfe2c87a2bba7a322659734a05749d5b5aa781f513e4912db0d5f",
+            ),
+            (
+                &["olá\0\n".as_bytes(), &[0xff, 0x00, 0x7f]],
+                "71c8c02ff5d9b0c701d74a5236c5834d03089a6b4749e9805402fc8ab746830f",
+            ),
         ];
-        for fields in inputs {
-            assert_eq!(hash_fields(fields), reference(fields));
+        for (fields, expected) in cases {
+            assert_eq!(hash_fields(fields), expected);
         }
         assert_ne!(hash_fields(&[b"ab", b"c"]), hash_fields(&[b"a", b"bc"]));
     }
@@ -3489,7 +3774,7 @@ mod tests {
         .error
         .expect("rejected");
         assert!(
-            error.ends_with("valid fields: expected, replacement"),
+            error.ends_with("valid fields: expected, replacement, replace_all"),
             "{error}"
         );
         let _ = fs::remove_dir_all(root);

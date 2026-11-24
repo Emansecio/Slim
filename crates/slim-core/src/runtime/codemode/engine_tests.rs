@@ -56,9 +56,10 @@ async fn serve_with(
                 ticket,
                 name,
                 arguments,
+                ..
             })) => on_call(&cell, ticket, name, arguments),
-            Event::Request(Some(Request::Helper { reply, .. })) => {
-                let _ = reply.send(Ok(Value::Null));
+            Event::Request(Some(Request::Helper { .. })) => {
+                cell.reply_helper(Ok(Value::Null));
             }
             Event::Request(Some(Request::Returned)) => {}
         }
@@ -110,7 +111,7 @@ async fn failed_calls_reject_and_is_error_results_throw() {
         |cell, ticket, name, arguments| {
             assert_eq!(arguments, json!({}));
             if name.ends_with("fail") {
-                cell.settle(ticket, Err("no such file".into()));
+                cell.reject(ticket, "no such file");
             } else {
                 cell.settle(ticket, Ok(json!({"isError": true, "content": []})));
             }
@@ -303,6 +304,7 @@ async fn calls_not_awaited_still_run_after_the_program_returns() {
                 ticket,
                 name,
                 arguments,
+                ..
             })) => {
                 seen.push(format!("{name} {}", arguments["id"].as_str().unwrap()));
                 cell.settle(ticket, Ok(json!({})));
@@ -322,4 +324,232 @@ async fn calls_not_awaited_still_run_after_the_program_returns() {
             "mcp.s.second b"
         ]
     );
+}
+
+#[tokio::test]
+async fn unhandled_promise_rejections_are_noted_and_handled_ones_are_cleared() {
+    let output = serve(
+        r#"
+        const handled = Promise.reject(new Error('handled error'));
+        handled.catch(() => {});
+        tools.call('mcp.s.ok').then(() => { throw new Error('floating boom'); });
+        await tools.call('mcp.s.ok');
+        return 'done';
+        "#,
+        &[],
+        SECOND,
+        CancellationToken::new(),
+        |cell, ticket, _, _| cell.settle(ticket, Ok(json!({}))),
+    )
+    .await
+    .unwrap();
+    assert!(output.starts_with("\"done\"\n"), "{output}");
+    assert!(output.contains("unhandled promise rejection(s):"), "{output}");
+    assert!(output.contains("floating boom"), "{output}");
+    assert!(!output.contains("handled error"), "{output}");
+}
+
+#[tokio::test]
+async fn prelude_normalizes_null_arguments_and_rejects_undefined_store_values() {
+    let mut calls = Vec::new();
+    let output = serve(
+        r#"
+        const res = await slim.list(null);
+        return res;
+        "#,
+        &["list"],
+        SECOND,
+        CancellationToken::new(),
+        |cell, ticket, name, arguments| {
+            calls.push((name, arguments));
+            cell.settle(ticket, Ok(json!("ok")));
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(output, "\"ok\"");
+    assert_eq!(calls, [("slim.list".to_owned(), json!({}))]);
+
+    let error = serve(
+        "store('k', undefined);",
+        &[],
+        SECOND,
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("store() requires a JSON value"), "{error}");
+    assert!(!error.contains("unhandled promise rejection(s):"), "{error}");
+}
+
+#[tokio::test]
+async fn payload_variants_finish_helper_and_warm_runtime_isolation() {
+    let mut finished = Vec::new();
+    let mut cell = engine::spawn(
+        r#"
+        const text = await slim.read({path: 'a.txt'});
+        const obj = await slim.glob({pattern: '*.rs'});
+        finish('done');
+        slim.finish('done-2');
+        globalThis.leaked = 99;
+        return {text, obj, keys: Object.keys(slim), typeofFinish: typeof finish};
+        "#
+        .into(),
+        CancellationToken::new(),
+        engine::Limits {
+            wall: SECOND,
+            cpu: SECOND,
+        },
+        vec!["read".into(), "glob".into()],
+    );
+    let output = loop {
+        let event = tokio::select! {
+            result = &mut cell.worker => Event::Worker(result.unwrap().finish(None)),
+            request = cell.requests.recv() => Event::Request(request),
+        };
+        match event {
+            Event::Worker(result) => break result.unwrap(),
+            Event::Request(None) => break (&mut cell.worker).await.unwrap().finish(None).unwrap(),
+            Event::Request(Some(Request::Call { ticket, name, .. })) => {
+                if name == "slim.read" {
+                    cell.settle(
+                        ticket,
+                        Ok(engine::Payload::Text("line1\n\"quoted\"\\raw".into())),
+                    );
+                } else {
+                    cell.settle(ticket, Ok(engine::Payload::Json(r#"{"files":["a.rs"]}"#.into())));
+                }
+            }
+            Event::Request(Some(Request::Helper { command })) => {
+                if let engine::Command::Finish { answer } = command {
+                    finished.push(answer);
+                }
+                cell.reply_helper(Ok(Value::Null));
+            }
+            Event::Request(Some(Request::Returned)) => {}
+        }
+    };
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["text"], "line1\n\"quoted\"\\raw");
+    assert_eq!(parsed["obj"], json!({"files": ["a.rs"]}));
+    assert_eq!(parsed["keys"], json!(["read", "glob"]));
+    assert_eq!(parsed["typeofFinish"], "function");
+    assert_eq!(finished, vec!["done", "done-2"]);
+
+    // Auto mode does not bind finish(), and warm runtime preserves fresh globals.
+    let next = serve(
+        "return [typeof finish, typeof leaked];",
+        &[],
+        SECOND,
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(next, r#"["undefined","undefined"]"#);
+
+    // After a CPU-exceeded cell, consecutive cells still execute cleanly.
+    let _ = serve_with(
+        "while (true) {}",
+        &[],
+        engine::Limits {
+            wall: SECOND,
+            cpu: Duration::from_millis(50),
+        },
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    let recovered = serve(
+        "return 123;",
+        &[],
+        SECOND,
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered, "123");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prelude_bytecode_prewarm_and_json_value_isolation_work() {
+    assert!(
+        engine::prelude_bytecode_len().is_some_and(|len| len > 100),
+        "PRELUDE bytecode should compile once cleanly"
+    );
+    engine::prewarm_worker_cell();
+
+    let leaked = serve(
+        "globalThis.polluted = 42; return await tools.call('mcp.probe.echo', {});",
+        &["read"],
+        SECOND,
+        CancellationToken::new(),
+        |cell, ticket, _, _| {
+            cell.settle(
+                ticket,
+                Ok(engine::Payload::JsonValue(json!({
+                    "nested": { "arr": [1, true, "ok"] },
+                }))),
+            );
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&leaked).unwrap(),
+        json!({ "nested": { "arr": [1, true, "ok"] } })
+    );
+
+    let clean = serve(
+        "return typeof globalThis.polluted;",
+        &["read"],
+        SECOND,
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(clean, r#""undefined""#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_grep_and_diff_helpers_match_contract_and_warm_runtime_survives_js_error() {
+    // First trigger a JS error; the next cell must still execute cleanly on the warm runtime.
+    let err = serve(
+        "throw new Error('recoverable boom');",
+        &["read"],
+        SECOND,
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("recoverable boom"), "{err}");
+
+    let out = serve(
+        r#"
+        const txt = "Alpha line\nbeta target\nGamma line\nBETA two\n";
+        const gLiteral = grepText(txt, "beta", { ignoreCase: true, context: 1 });
+        const gRegex = grepText(txt, /^Gamma/i, { context: 1 });
+        const dSame = diffText("a\nb\n", "a\nb\n");
+        const dChanged = diffText("a\nb\nc\n", "a\nx\nc\n", { context: 1 });
+        return { gLiteral, gRegex, dSame, dChanged };
+        "#,
+        &["read"],
+        SECOND,
+        CancellationToken::new(),
+        |_, _, _, _| {},
+    )
+    .await
+    .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["gLiteral"].as_array().unwrap().len(), 2);
+    assert_eq!(v["gLiteral"][0]["line"], 2);
+    assert_eq!(v["gLiteral"][0]["context"].as_array().unwrap().len(), 2);
+    assert_eq!(v["gRegex"][0]["line"], 3);
+    assert_eq!(v["dSame"], "");
+    assert_eq!(v["dChanged"], "@@ -1,3 +1,3 @@\n a\n-b\n+x\n c");
 }

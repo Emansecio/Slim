@@ -731,13 +731,15 @@ mod tests {
     use super::*;
 
     fn test_path() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let candidate = root.join(format!(
-            "slim-jsonl-repo-identity-{}-{stamp}",
+            "slim-jsonl-repo-identity-{}-{stamp}-{seq}",
             std::process::id()
         ));
         assert_eq!(candidate.parent(), Some(root.as_path()));

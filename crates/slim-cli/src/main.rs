@@ -84,7 +84,7 @@ fn known_options_without_prompt(args: &[String]) -> bool {
             "--recover" => return false,
             "--plan" | "--read-only" | "--code" | "--verbose" | "--jsonl" | "--headless"
             | "--tui" | "--fake" | "--abandon-pending" | "--fast" | "--normal"
-            | "--trust-project" => {}
+            | "--adaptive-reasoning" | "--trust-project" => {}
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
             | "--image" | "--effort" | "--thinking-display" | "--experiment-id" | "--task-id" => {
                 if args.get(index + 1).is_none() {

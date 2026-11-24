@@ -14,7 +14,9 @@ use unicode_width::UnicodeWidthStr;
 
 use slim_core::runtime::mode_name;
 
-use crate::api::{BlockId, LoginProvider, TodoItemStatus, UiChannels, UiCommand};
+use crate::api::{
+    BlockId, LoginProvider, QueueJournalBridge, TodoItemStatus, UiChannels, UiCommand,
+};
 use crate::app::{
     ActivityPhase, AppState, EffortOverlay, LoginOverlay, LoginStage, ModelCatalogs, ModelOverlay,
     ModelRow, NotificationPriority, SlashSuggestions, INFO_TOAST_TTL_MS,
@@ -34,14 +36,14 @@ use crate::picker::{
 use crate::reducer::{reduce, Action, Effect, ScrollIntent};
 use crate::render::{
     cached_lines_bytes, thinking_body_width, user_prompt_text_width, BodyKind, EventCoalescer,
-    InspectorPaletteKey, ScrollMetrics, WrapCache,
+    InspectorPaletteKey, ScratchRawBody, ScrollMetrics, WrapCache,
 };
 use crate::runtime_wait::{
     next_visual_deadline, runtime_clock, wait_for_runtime_signal, InputPump, WaitOutcome,
 };
 use crate::theme::{
-    detect_capabilities, glyph, mix_rgb, resolve_theme, to_terminal_color, Capabilities,
-    ColorDepth, MENU_FOCUS_FLASH_BG, MENU_SELECTION_BG,
+    detect_capabilities_fast, glyph, mix_rgb, resolve_os_reduced_motion, resolve_theme,
+    to_terminal_color, Capabilities, ColorDepth, MENU_FOCUS_FLASH_BG, MENU_SELECTION_BG,
 };
 
 const MENU_FOCUS_FLASH_MS: u64 = 166;
@@ -119,9 +121,41 @@ pub fn run_app_with_initial_prompt(
     channels: UiChannels,
     initial_prompt: Option<String>,
 ) -> io::Result<()> {
-    let capabilities = detect_capabilities();
+    run_app_with_initial_prompt_and_bridge(channels, initial_prompt, QueueJournalBridge::new())
+}
+
+pub fn run_app_with_initial_prompt_and_bridge(
+    channels: UiChannels,
+    initial_prompt: Option<String>,
+    queue_bridge: QueueJournalBridge,
+) -> io::Result<()> {
+    let (capabilities, needs_motion_probe) = detect_capabilities_fast();
     let mut backend = FullscreenBackend::start(capabilities)?;
-    let result = run_loop(&mut backend, &channels, capabilities, initial_prompt);
+    let motion_probe_rx = if needs_motion_probe {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = channels.wake.clone();
+        match std::thread::Builder::new()
+            .name("slim-tui-motion".into())
+            .spawn(move || {
+                let reduced = resolve_os_reduced_motion();
+                if tx.send(reduced).is_ok() {
+                    wake.notify();
+                }
+            }) {
+            Ok(_) => Some(rx),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let result = run_loop(
+        &mut backend,
+        &channels,
+        capabilities,
+        initial_prompt,
+        queue_bridge,
+        motion_probe_rx,
+    );
     let _ = channels.commands.send(UiCommand::Shutdown);
     let shutdown = backend.shutdown();
     result.and(shutdown)
@@ -130,11 +164,16 @@ pub fn run_app_with_initial_prompt(
 fn run_loop(
     backend: &mut FullscreenBackend,
     channels: &UiChannels,
-    capabilities: Capabilities,
+    mut capabilities: Capabilities,
     initial_prompt: Option<String>,
+    queue_bridge: QueueJournalBridge,
+    mut motion_probe_rx: Option<Receiver<bool>>,
 ) -> io::Result<()> {
     let mut state = AppState::new();
-    let mut queue = crate::prompt_queue::PersistentQueue::with_initial_prompt(initial_prompt);
+    let mut queue = crate::prompt_queue::PersistentQueue::with_initial_prompt_and_bridge(
+        initial_prompt,
+        queue_bridge,
+    );
     let mut dirty = true;
     let started = Instant::now();
     let mut last_motion_frame = 0;
@@ -159,6 +198,22 @@ fn run_loop(
         let clock = runtime_clock(started.elapsed());
         let effects = queue.reduce(&mut state, Action::SyncClock(clock))?;
         run_effects(channels, &clipboard_tx, effects)?;
+
+        if let Some(rx) = motion_probe_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(reduced) => {
+                    if capabilities.reduced_motion != reduced {
+                        capabilities.reduced_motion = reduced;
+                        dirty = true;
+                    }
+                    motion_probe_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    motion_probe_rx = None;
+                }
+            }
+        }
 
         // Clipboard jobs report back through the wake signal like lane events.
         while let Ok(outcome) = clipboard_rx.try_recv() {
@@ -257,6 +312,7 @@ fn run_loop(
         if resize_settles_at.is_some_and(|at| started.elapsed() >= at) {
             resize_settles_at = None;
         }
+        let mut frame_layout: Option<(crate::layout::LayoutRegions, bool)> = None;
         if dirty && resize_settles_at.is_none() {
             if let Some(accessible) =
                 approval_content_accessible(&state, (size.width, size.height), &mut render_cache)
@@ -269,8 +325,10 @@ fn run_loop(
             }
             // Extract from the painted frame. After Terminal::draw swaps
             // buffers, current_buffer_mut is the reset back buffer.
-            state.selection_text =
+            let (selection_text, regions, motion_visible) =
                 draw_state(backend, &mut state, capabilities, &mut render_cache)?;
+            state.selection_text = selection_text;
+            frame_layout = Some((regions, motion_visible));
             // Event-driven draws already paint the current animation/status
             // clock. Do not immediately request the same frame via a deadline.
             last_motion_frame = state.clock.frame;
@@ -281,8 +339,15 @@ fn run_loop(
             return Ok(());
         }
 
-        let regions = plan_regions(&state, size.width, size.height, &mut render_cache);
-        let motion_visible = motion_on_screen(&state, capabilities, &mut render_cache, &regions);
+        let (regions, motion_visible) = match frame_layout {
+            Some(layout) => layout,
+            None => {
+                let regions = plan_regions(&state, size.width, size.height, &mut render_cache);
+                let motion_visible =
+                    motion_on_screen(&state, capabilities, &mut render_cache, &regions);
+                (regions, motion_visible)
+            }
+        };
         // The footer's activity row needs one-second semantic redraws for
         // retry countdowns, cancellation labels and elapsed metadata. This
         // remains a status tick (not an animation loop) and is disabled only
@@ -368,8 +433,9 @@ fn run_loop(
                     // before the next normal draw, so materialize the latest
                     // bounded selection before the reducer consumes its text.
                     if dirty && state.selection.is_some() && is_selection_copy_event(&event) {
-                        state.selection_text =
+                        let (selection_text, _, _) =
                             draw_state(backend, &mut state, capabilities, &mut render_cache)?;
+                        state.selection_text = selection_text;
                         last_motion_frame = state.clock.frame;
                         last_status_second = state.clock.elapsed_ms / 1_000;
                         dirty = false;
@@ -467,7 +533,12 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 
 fn control_requires_data_barrier(events: &[crate::api::UiEvent]) -> bool {
     events.iter().any(|event| {
-        !event.is_control() || matches!(event, crate::api::UiEvent::RunCancelled { .. })
+        !event.is_control()
+            || matches!(
+                event,
+                crate::api::UiEvent::RunCancelled { .. }
+                    | crate::api::UiEvent::SessionSnapshot { .. }
+            )
     })
 }
 
@@ -1094,15 +1165,38 @@ fn scrollback_index<'a>(
 ) -> (crate::render::HeightIndex<'a>, u16, bool) {
     let content_rev = state.revisions.content;
     let fold_rev = state.revisions.fold;
+    let dirty_from = state.dirty_from_block();
+    let dirty_base = state.dirty_base_content_rev();
     if scrollbar_is_guaranteed(state.blocks(), viewport) {
         let content_width = width.saturating_sub(1);
-        let index = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
+        let index = cache.height_index(
+            state.blocks(),
+            content_rev,
+            fold_rev,
+            content_width,
+            dirty_from,
+            dirty_base,
+        );
         return (index, content_width, true);
     }
-    let index = cache.height_index(state.blocks(), content_rev, fold_rev, width);
+    let index = cache.height_index(
+        state.blocks(),
+        content_rev,
+        fold_rev,
+        width,
+        dirty_from,
+        dirty_base,
+    );
     if viewport > 0 && index.total_rows > viewport {
         let content_width = width.saturating_sub(1);
-        let index = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
+        let index = cache.height_index(
+            state.blocks(),
+            content_rev,
+            fold_rev,
+            content_width,
+            dirty_from,
+            dirty_base,
+        );
         return (index, content_width, true);
     }
     (index, width, false)
@@ -1360,12 +1454,15 @@ fn draw_state(
     state: &mut AppState,
     capabilities: Capabilities,
     cache: &mut WrapCache,
-) -> io::Result<String> {
+) -> io::Result<(String, crate::layout::LayoutRegions, bool)> {
     let mut selected = String::new();
+    let mut rendered_layout = None;
     backend.draw_synchronized(|frame| {
-        render_frame(frame, state, capabilities, cache);
+        let layout = render_frame_regions(frame, state, capabilities, cache);
         selected = extract_visible_selection(state, cache);
+        rendered_layout = Some(layout);
     })?;
+    state.clear_dirty_from_block();
     if state.selection.is_some()
         && cache
             .painted_selection
@@ -1374,7 +1471,8 @@ fn draw_state(
     {
         let _ = reduce(state, Action::ClearScreenSelection);
     }
-    Ok(selected)
+    let (regions, motion_visible) = rendered_layout.expect("frame rendered");
+    Ok((selected, regions, motion_visible))
 }
 
 pub fn render_frame(
@@ -1383,6 +1481,15 @@ pub fn render_frame(
     capabilities: Capabilities,
     cache: &mut WrapCache,
 ) {
+    let _ = render_frame_regions(frame, state, capabilities, cache);
+}
+
+pub(crate) fn render_frame_regions(
+    frame: &mut ratatui::Frame,
+    state: &AppState,
+    capabilities: Capabilities,
+    cache: &mut WrapCache,
+) -> (crate::layout::LayoutRegions, bool) {
     let modal_open = dimmed_modal_open(state);
     let modal_opened_ms = cache.note_modal_frame(modal_open, state.clock.elapsed_ms);
     cache.selection_regions = [None, None];
@@ -1427,9 +1534,9 @@ pub fn render_frame(
     // not useful.  Keep that decision separate from the user's motion
     // preference: completed blocks still receive the short transition
     // emphasis whenever reduced motion is not requested.
+    let motion_visible = motion_on_screen(state, capabilities, cache, &regions);
     let rail_motion_capabilities = Capabilities {
-        reduced_motion: capabilities.reduced_motion
-            || !motion_on_screen(state, capabilities, cache, &regions),
+        reduced_motion: capabilities.reduced_motion || !motion_visible,
         ..capabilities
     };
     let spinner_motion_enabled = !rail_motion_capabilities.reduced_motion;
@@ -1622,6 +1729,8 @@ pub fn render_frame(
             palette.selection,
         );
     }
+
+    (regions, motion_visible)
 }
 
 /// Width available to draft text after the shared chrome inset, composer
@@ -2182,99 +2291,204 @@ fn render_scrollback(
         let streaming_entry = members
             .iter()
             .any(|member| member.lifecycle == BlockLifecycle::Streaming);
-        let cached_lines = cache.get_block_lines(&key, streaming_entry);
-        let block_lines = cached_lines.unwrap_or_else(|| {
-            // Cache only the stable projection.  In particular, never retain
-            // a frame-specific spinner glyph in the body/header memo.
-            let static_ctx = BlockRender {
-                palette: ctx.palette,
-                width: ctx.width,
-                capabilities: ctx.capabilities,
-                selected: ctx.selected,
-                frame: ctx.frame,
-                now_ms: ctx.now_ms,
-                animate_thinking: false,
-                caret: ctx.caret,
-                narration: ctx.narration,
-            };
-            let mut built = if matches!(block.kind(), BlockKind::QueuedUser(_)) {
-                grouped_queued_user_lines(block, members, show_enter_hint, &static_ctx)
-            } else if matches!(block.kind(), BlockKind::Work(_)) {
-                work_lines(block, members, &static_ctx, cache)
-            } else if members.len() > 1 {
-                if crate::block::is_failed_tool(block)
-                    && !members.iter().any(crate::block::is_complete_tool)
-                {
-                    grouped_failed_tool_lines(
-                        block,
-                        members,
-                        show_enter_hint,
-                        selected_member,
-                        &static_ctx,
-                        cache,
-                    )
-                } else if crate::block::is_complete_thinking(block) {
-                    grouped_thinking_lines(block, members, &static_ctx, cache)
-                } else {
-                    grouped_tool_lines(
-                        block,
-                        members,
-                        show_enter_hint,
-                        selected_member,
-                        &static_ctx,
-                        cache,
-                    )
-                }
-            } else {
-                safe_block_lines(block, &static_ctx, cache)
-            };
-            if transition_gap {
-                built.insert(0, Line::default());
-            }
-            if let Some(header) = response_header {
-                let mut lines = response_header_lines(header, &static_ctx);
-                lines.append(&mut built);
-                built = lines;
-            }
-            cache.store_block_lines(key, built, streaming_entry)
-        });
         let search_match = !matched_ids.is_empty()
             && (matched_ids.contains(&block.id)
                 || members
                     .iter()
                     .any(|member| matched_ids.contains(&member.id)));
-        let skip = (skip_rows as usize).min(block_lines.len());
-        skip_rows = 0;
-        let written = block_lines
-            .len()
-            .saturating_sub(skip)
-            .min(capacity.saturating_sub(rows))
-            .min(usize::from(text_area.bottom().saturating_sub(y)));
         let block_start_y = y;
-        // Lines are pre-wrapped to `content_width` by the same contract the
-        // HeightIndex measures; writing straight into the buffer avoids
-        // materializing an owned Vec<Line> per frame.
-        for line in &block_lines[skip..skip + written] {
-            buf.set_line(text_area.x, y, line, content_width);
-            y += 1;
-        }
+        let (skip, written, total_block_len, last_line_width, thinking_header_present) =
+            if members.len() == 1
+                && block.lifecycle == BlockLifecycle::Streaming
+                && matches!(block.kind(), BlockKind::Assistant(_))
+            {
+                let BlockKind::Assistant(text) = block.kind() else {
+                    unreachable!();
+                };
+                let mut head = if let Some(header) = response_header {
+                    response_header_lines(header, &ctx)
+                } else {
+                    Vec::new()
+                };
+                if transition_gap {
+                    head.push(Line::default());
+                }
+                if block.turn_boundary_before() {
+                    head.push(Line::default());
+                }
+                let text_width = crate::render::assistant_text_width(content_width);
+                let styles = assistant_markdown_styles(palette);
+                let indent = Span::styled(
+                    " ".repeat(crate::render::ASSISTANT_PREFIX_COLS as usize),
+                    palette.surface,
+                );
+                let (prefix_arc, gap, mut tail) = cache.streaming_body_parts(
+                    block,
+                    text,
+                    text_width,
+                    styles,
+                    indent.clone(),
+                );
+                let reserved = Span::styled(" ", palette.assistant);
+                let mut prefix_len = prefix_arc.as_ref().map_or(0, |arc| arc.len());
+                let mut prefix_last_override: Option<Line<'static>> = None;
+                let mut gap_line = gap.then(|| Line::from(vec![indent.clone()]));
+                if let Some(last) = tail.last_mut() {
+                    last.spans.push(reserved);
+                } else if let Some(gap_row) = gap_line.as_mut() {
+                    gap_row.spans.push(reserved);
+                } else if let Some(arc) = prefix_arc.as_ref().filter(|arc| !arc.is_empty()) {
+                    let mut last = arc[arc.len() - 1].clone();
+                    last.spans.push(reserved);
+                    prefix_len -= 1;
+                    prefix_last_override = Some(last);
+                } else {
+                    tail.push(Line::from(vec![indent, reserved]));
+                }
+                let head_len = head.len();
+                let gap_len = usize::from(gap_line.is_some());
+                let override_len = usize::from(prefix_last_override.is_some());
+                let total_len = head_len + prefix_len + override_len + gap_len + tail.len();
+                let skip = (skip_rows as usize).min(total_len);
+                skip_rows = 0;
+                let written = total_len
+                    .saturating_sub(skip)
+                    .min(capacity.saturating_sub(rows))
+                    .min(usize::from(text_area.bottom().saturating_sub(y)));
+                let (full_fg, quiet_fg) = (palette.text.fg, palette.secondary.fg);
+                let mut paint_line = |line: &Line<'static>, y_pos: u16| {
+                    if ctx.narration {
+                        let mut patched = line.clone();
+                        for span in &mut patched.spans {
+                            if span.style.fg == full_fg {
+                                span.style.fg = quiet_fg;
+                            }
+                        }
+                        buf.set_line(text_area.x, y_pos, &patched, content_width);
+                    } else {
+                        buf.set_line(text_area.x, y_pos, line, content_width);
+                    }
+                };
+                for idx_in_block in skip..skip + written {
+                    let line: &Line<'static> = if idx_in_block < head_len {
+                        &head[idx_in_block]
+                    } else {
+                        let rel = idx_in_block - head_len;
+                        if rel < prefix_len {
+                            &prefix_arc.as_ref().expect("prefix")[rel]
+                        } else if rel < prefix_len + override_len {
+                            prefix_last_override.as_ref().expect("last prefix")
+                        } else if rel < prefix_len + override_len + gap_len {
+                            gap_line.as_ref().expect("gap")
+                        } else {
+                            &tail[rel - prefix_len - override_len - gap_len]
+                        }
+                    };
+                    paint_line(line, y);
+                    y += 1;
+                }
+                let last_width = tail
+                    .last()
+                    .or(gap_line.as_ref())
+                    .or(prefix_last_override.as_ref())
+                    .or_else(|| head.last())
+                    .map_or(0, Line::width);
+                (skip, written, total_len, last_width, None)
+            } else {
+                let cached_lines = cache.get_block_lines(&key, streaming_entry);
+                let block_lines = cached_lines.unwrap_or_else(|| {
+                    // Cache only the stable projection. In particular, never
+                    // retain a frame-specific spinner glyph in the body/header
+                    // memo.
+                    let static_ctx = BlockRender {
+                        palette: ctx.palette,
+                        width: ctx.width,
+                        capabilities: ctx.capabilities,
+                        selected: ctx.selected,
+                        frame: ctx.frame,
+                        now_ms: ctx.now_ms,
+                        animate_thinking: false,
+                        caret: ctx.caret,
+                        narration: ctx.narration,
+                    };
+                    let mut built = if matches!(block.kind(), BlockKind::QueuedUser(_)) {
+                        grouped_queued_user_lines(block, members, show_enter_hint, &static_ctx)
+                    } else if matches!(block.kind(), BlockKind::Work(_)) {
+                        work_lines(block, members, &static_ctx, cache)
+                    } else if members.len() > 1 {
+                        if crate::block::is_failed_tool(block)
+                            && !members.iter().any(crate::block::is_complete_tool)
+                        {
+                            grouped_failed_tool_lines(
+                                block,
+                                members,
+                                show_enter_hint,
+                                selected_member,
+                                &static_ctx,
+                                cache,
+                            )
+                        } else if crate::block::is_complete_thinking(block) {
+                            grouped_thinking_lines(block, members, &static_ctx, cache)
+                        } else {
+                            grouped_tool_lines(
+                                block,
+                                members,
+                                show_enter_hint,
+                                selected_member,
+                                &static_ctx,
+                                cache,
+                            )
+                        }
+                    } else {
+                        safe_block_lines(block, &static_ctx, cache)
+                    };
+                    if transition_gap {
+                        built.insert(0, Line::default());
+                    }
+                    if let Some(header) = response_header {
+                        let mut lines = response_header_lines(header, &static_ctx);
+                        lines.append(&mut built);
+                        built = lines;
+                    }
+                    cache.store_block_lines(key, built, streaming_entry)
+                });
+                let skip = (skip_rows as usize).min(block_lines.len());
+                skip_rows = 0;
+                let written = block_lines
+                    .len()
+                    .saturating_sub(skip)
+                    .min(capacity.saturating_sub(rows))
+                    .min(usize::from(text_area.bottom().saturating_sub(y)));
+                // Lines are pre-wrapped to `content_width` by the same contract
+                // the HeightIndex measures; writing straight into the buffer
+                // avoids materializing an owned Vec<Line> per frame.
+                for line in &block_lines[skip..skip + written] {
+                    buf.set_line(text_area.x, y, line, content_width);
+                    y += 1;
+                }
+                let last_width = block_lines.last().map_or(0, Line::width);
+                let pending_label = block
+                    .awaiting_agent()
+                    .then(|| block_lines.len().saturating_sub(1));
+                (skip, written, block_lines.len(), last_width, pending_label)
+            };
         // The streaming caret fills the cell reserved at the end of the answer
         // being written: a one-cell patch, so blinking never rebuilds lines.
         if members.len() == 1
             && matches!(block.kind(), BlockKind::Assistant(_))
             && block.lifecycle == BlockLifecycle::Streaming
             && written > 0
-            && skip + written == block_lines.len()
+            && skip + written == total_block_len
         {
             let caret_style = match ctx.caret {
                 CaretPhase::On => Some(palette.assistant),
                 CaretPhase::Stalled => Some(palette.muted),
                 CaretPhase::Off | CaretPhase::Hidden => None,
             };
-            if let Some((style, last)) = caret_style.zip(block_lines.last()) {
+            if let Some(style) = caret_style {
                 let x = text_area
                     .x
-                    .saturating_add(last.width().saturating_sub(1) as u16);
+                    .saturating_add(last_line_width.saturating_sub(1) as u16);
                 if x < text_area.right() {
                     buf[(x, y - 1)].set_char('\u{258f}').set_style(style);
                 }
@@ -2293,9 +2507,7 @@ fn render_scrollback(
             let lead_blank = response_header.map_or(0, |header| usize::from(header.lead_blank));
             // A prompt still waiting for the agent ends with the agent's header:
             // its label is the last row of the block.
-            let pending_label = block
-                .awaiting_agent()
-                .then(|| block_lines.len().saturating_sub(1));
+            let pending_label = thinking_header_present;
             // The `● Slim` label is the agent's, whichever block carries it.
             let label_row = response_header.map(|_| lead_blank).or(pending_label);
             let gap_row = transition_gap.then_some(header_rows);
@@ -2809,7 +3021,7 @@ fn last_useful_update_age_ms(state: &AppState) -> Option<u64> {
 /// the rail's phase label would.
 fn single_live_tool(state: &AppState) -> bool {
     state
-        .blocks()
+        .active_turn_blocks()
         .iter()
         .filter(|block| {
             matches!(
@@ -3516,14 +3728,21 @@ fn grouped_thinking_lines(
 /// An expanded thought under its header: italic in the reasoning hue, apart
 /// from the answer, with the titles of a summary upright and bold.
 fn thinking_body_lines(text: &str, width: u16, palette: &Palette) -> Vec<Line<'static>> {
+    let rows = crate::thought::body_rows(text, thinking_body_width(width));
+    thinking_body_lines_from_rows(&rows, palette)
+}
+
+fn thinking_body_lines_from_rows(
+    rows: &[(String, bool)],
+    palette: &Palette,
+) -> Vec<Line<'static>> {
     let prose = palette.reasoning.add_modifier(Modifier::ITALIC);
     let title = palette.reasoning.add_modifier(Modifier::BOLD);
-    crate::thought::body_rows(text, thinking_body_width(width))
-        .into_iter()
+    rows.iter()
         .map(|(row, is_title)| {
             Line::from(Span::styled(
                 format!("    {row}"),
-                if is_title { title } else { prose },
+                if *is_title { title } else { prose },
             ))
         })
         .collect()
@@ -3954,45 +4173,60 @@ fn tool_member_lines(
             bg: palette.code_block.bg,
             ..Style::default()
         });
-        lines.extend(cache.wrapped_body(
-            block,
-            BodyKind::ToolOutput,
-            width,
-            block.lifecycle != BlockLifecycle::Streaming,
-            || {
-                // The typed projection preserves the text measured by layout
-                // and keeps tool output independent of diff markers.
-                let diff_rows = state.diff_rows();
-                state
-                    .expanded_body()
-                    .split('\n')
-                    .enumerate()
-                    .flat_map(|(index, source)| {
-                        // The details sit on the same surface as a code
-                        // block: a rail on the left and the block's
-                        // background behind every row.
-                        let style = match diff_rows.get(index).map(|(kind, _)| kind) {
-                            Some(DiffRowKind::Added) => palette.diff_add.patch(palette.diff_add_bg),
-                            Some(DiffRowKind::Removed) => {
-                                palette.diff_remove.patch(palette.diff_remove_bg)
-                            }
-                            Some(DiffRowKind::Header) => palette.muted.patch(palette.code_block),
-                            None => palette.secondary.patch(palette.code_block),
-                        };
-                        render_plain(source, body_width)
-                            .into_iter()
-                            .map(move |row| {
-                                Line::from(vec![
-                                    Span::raw("  "),
-                                    Span::styled(TOOL_BODY_RAIL, rail),
-                                    Span::styled(pad_cells(&row, body_width as usize), style),
-                                ])
-                            })
-                    })
-                    .collect()
-            },
-            cached_lines_bytes,
-        ));
+        let streaming = block.lifecycle == BlockLifecycle::Streaming;
+        let pre_wrapped = if streaming {
+            cache.scratch_raw_body(block, BodyKind::ToolOutput, width)
+        } else {
+            None
+        };
+        let style_for_kind = |kind: Option<DiffRowKind>| match kind {
+            Some(DiffRowKind::Added) => palette.diff_add.patch(palette.diff_add_bg),
+            Some(DiffRowKind::Removed) => palette.diff_remove.patch(palette.diff_remove_bg),
+            Some(DiffRowKind::Header) => palette.muted.patch(palette.code_block),
+            None => palette.secondary.patch(palette.code_block),
+        };
+        if let Some(ScratchRawBody::ToolOutput(rows)) = pre_wrapped.as_deref() {
+            lines.extend(rows.iter().map(|(padded, kind)| {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(TOOL_BODY_RAIL, rail),
+                    Span::styled(padded.clone(), style_for_kind(*kind)),
+                ])
+            }));
+        } else {
+            lines.extend(cache.wrapped_body(
+                block,
+                BodyKind::ToolOutput,
+                width,
+                !streaming,
+                || {
+                    // The typed projection preserves the text measured by
+                    // layout and keeps tool output independent of diff markers.
+                    let diff_rows = state.diff_rows();
+                    state
+                        .expanded_body()
+                        .split('\n')
+                        .enumerate()
+                        .flat_map(|(index, source)| {
+                            // The details sit on the same surface as a code
+                            // block: a rail on the left and the block's
+                            // background behind every row.
+                            let style = style_for_kind(diff_rows.get(index).map(|(kind, _)| *kind));
+                            render_plain(source, body_width)
+                                .into_iter()
+                                .map(move |row| {
+                                    Line::from(vec![
+                                        Span::raw("  "),
+                                        Span::styled(TOOL_BODY_RAIL, rail),
+                                        Span::styled(pad_cells(&row, body_width as usize), style),
+                                    ])
+                                })
+                        })
+                        .collect()
+                },
+                cached_lines_bytes,
+            ));
+        }
     }
     if block.fold == FoldState::Expanded {
         if let Some(note) = state.page_note() {
@@ -4891,16 +5125,26 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
             let streaming = block.lifecycle == BlockLifecycle::Streaming;
             let mut lines = vec![thinking_header(block, 1, ctx)];
             if block.fold == FoldState::Expanded {
-                // Expanded bodies are wrapped once per generation and shared
-                // with the height probe instead of re-wrapping every frame.
-                lines.extend(cache.wrapped_body(
-                    block,
-                    BodyKind::Thinking,
-                    ctx.width,
-                    !streaming,
-                    || thinking_body_lines(text, ctx.width, ctx.palette),
-                    cached_lines_bytes,
-                ));
+                // Expanded bodies are wrapped once per generation during height
+                // probing and shared with paint without re-wrapping or mixing
+                // palette depths.
+                let pre_wrapped = if streaming {
+                    cache.scratch_raw_body(block, BodyKind::Thinking, ctx.width)
+                } else {
+                    None
+                };
+                if let Some(ScratchRawBody::Thinking(rows)) = pre_wrapped.as_deref() {
+                    lines.extend(thinking_body_lines_from_rows(rows, ctx.palette));
+                } else {
+                    lines.extend(cache.wrapped_body(
+                        block,
+                        BodyKind::Thinking,
+                        ctx.width,
+                        !streaming,
+                        || thinking_body_lines(text, ctx.width, ctx.palette),
+                        cached_lines_bytes,
+                    ));
+                }
             }
             lines
         }
@@ -5150,6 +5394,26 @@ fn note_lines(
         .collect()
 }
 
+fn assistant_markdown_styles(palette: &Palette) -> MarkdownStyles {
+    MarkdownStyles {
+        text: palette.text,
+        h1: palette.h1,
+        h2: palette.heading,
+        // A sub-heading is never dimmer than the prose under it.
+        h3: palette.heading,
+        link: palette.link,
+        code: palette.inline_code,
+        code_block: palette.code_block,
+        code_rail: palette.code_rail,
+        code_label: palette.code_label,
+        diff_add: palette.diff_add,
+        diff_remove: palette.diff_remove,
+        diff_add_bg: palette.diff_add_bg,
+        diff_remove_bg: palette.diff_remove_bg,
+        quote: palette.quote,
+    }
+}
+
 fn assistant_body(
     text: &str,
     ctx: &BlockRender<'_>,
@@ -5158,23 +5422,7 @@ fn assistant_body(
     block: &Block,
 ) -> Vec<Line<'static>> {
     let text_width = crate::render::assistant_text_width(ctx.width);
-    let styles = MarkdownStyles {
-        text: ctx.palette.text,
-        h1: ctx.palette.h1,
-        h2: ctx.palette.heading,
-        // A sub-heading is never dimmer than the prose under it.
-        h3: ctx.palette.heading,
-        link: ctx.palette.link,
-        code: ctx.palette.inline_code,
-        code_block: ctx.palette.code_block,
-        code_rail: ctx.palette.code_rail,
-        code_label: ctx.palette.code_label,
-        diff_add: ctx.palette.diff_add,
-        diff_remove: ctx.palette.diff_remove,
-        diff_add_bg: ctx.palette.diff_add_bg,
-        diff_remove_bg: ctx.palette.diff_remove_bg,
-        quote: ctx.palette.quote,
-    };
+    let styles = assistant_markdown_styles(ctx.palette);
     let indent = Span::styled(
         " ".repeat(crate::render::ASSISTANT_PREFIX_COLS as usize),
         ctx.palette.surface,
@@ -5183,7 +5431,14 @@ fn assistant_body(
     // this render: a stable body wraps once into the LRU, indent included;
     // the body being written keeps its prefix wrapped and wraps its tail.
     let mut lines = if streaming {
-        cache.streaming_body(block, text, text_width, styles, indent.clone())
+        let (prefix, gap, tail) =
+            cache.streaming_body_parts(block, text, text_width, styles, indent.clone());
+        let mut lines = prefix.map_or_else(Vec::new, |arc| arc.as_ref().clone());
+        if gap {
+            lines.push(Line::from(vec![indent.clone()]));
+        }
+        lines.extend(tail);
+        lines
     } else {
         let projection = cache.markdown_projection(block, text, text_width);
         cache.wrapped_body(
@@ -7869,16 +8124,19 @@ fn render_session_picker(
                 }
                 PickerRow::Turn(turn) => {
                     let removed = picker.turns.len().saturating_sub(turn.index);
+                    let suffix = if removed == 1 { "" } else { "s" };
+                    let meta = if turn.has_checkpoint {
+                        format!("volta {removed} turno{suffix} · [arquivos]")
+                    } else {
+                        format!("volta {removed} turno{suffix}")
+                    };
                     (
                         format!(
                             "#{} {}",
                             turn.index + 1,
                             sanitize_terminal_text(&turn.prompt)
                         ),
-                        format!(
-                            "volta {removed} turno{}",
-                            if removed == 1 { "" } else { "s" }
-                        ),
+                        meta,
                         palette.muted,
                     )
                 }
@@ -7913,6 +8171,9 @@ fn render_session_picker(
     if regions.detail.is_some() {
         let detail = match picker.selected_row() {
             Some(PickerRow::Session(session)) => format!(" {}", session.id),
+            Some(PickerRow::Turn(turn)) if turn.has_checkpoint => {
+                " Enter restaura conversa + arquivos · Shift+Enter só conversa".to_owned()
+            }
             Some(PickerRow::Turn(_)) => {
                 " Só a conversa volta; arquivos alterados ficam como estão".to_owned()
             }
@@ -7930,14 +8191,31 @@ fn render_session_picker(
         ));
     }
     lines.push(picker_rule(width, palette));
+    let has_selected_checkpoint = matches!(
+        picker.selected_row(),
+        Some(PickerRow::Turn(turn)) if turn.has_checkpoint
+    );
     let action = if rewind { "voltar" } else { "retomar" };
-    let hints = [
-        format!(
-            "{} navegar · {} {action} · {} fechar",
-            keys.up_down, keys.enter, keys.esc
-        ),
-        format!("{} {action} · {} fechar", keys.enter, keys.esc),
-    ];
+    let hints = if has_selected_checkpoint {
+        [
+            format!(
+                "{} navegar · {} {action} · Shift+{} só conversa · {} fechar",
+                keys.up_down, keys.enter, keys.enter, keys.esc
+            ),
+            format!(
+                "{} {action} · Shift+{} só conversa · {} fechar",
+                keys.enter, keys.enter, keys.esc
+            ),
+        ]
+    } else {
+        [
+            format!(
+                "{} navegar · {} {action} · {} fechar",
+                keys.up_down, keys.enter, keys.esc
+            ),
+            format!("{} {action} · {} fechar", keys.enter, keys.esc),
+        ]
+    };
     let hints: Vec<&str> = hints.iter().map(String::as_str).collect();
     lines.push(picker_hints(&hints, width, palette));
     frame.render_widget(Clear, area);

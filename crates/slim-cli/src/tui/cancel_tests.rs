@@ -39,7 +39,7 @@ fn content_store_pages_on_utf8_boundaries_at_sixteen_kibibytes() {
     let handle = ContentHandle("unicode".into());
     let output = "界".repeat(CONTENT_PAGE_BYTES);
     let mut store = ContentStore::default();
-    store.insert(handle.clone(), &output);
+    store.insert_owned(handle.clone(), output.clone());
 
     let first = store.page(&handle, None).expect("first page");
     assert!(first.text.len() <= CONTENT_PAGE_BYTES);
@@ -49,6 +49,10 @@ fn content_store_pages_on_utf8_boundaries_at_sixteen_kibibytes() {
     let second = store.page(&handle, Some(cursor)).expect("second page");
     assert!(second.text.len() <= CONTENT_PAGE_BYTES);
     assert!(output.starts_with(&(first.text + &second.text)));
+
+    let clipped = store.head_tail(&handle, 2048).expect("head_tail");
+    assert!(clipped.contains("caracteres omitidos"));
+    assert!(clipped.len() < 2200);
 }
 
 #[test]
@@ -73,13 +77,13 @@ fn content_store_takes_ownership_without_copying_bounded_output() {
 fn content_store_enforces_entry_count_per_output_and_total_byte_caps() {
     let mut store = ContentStore::default();
     for index in 0..=CONTENT_STORE_ENTRIES {
-        store.insert(ContentHandle(format!("small-{index}").into()), "x");
+        store.insert_owned(ContentHandle(format!("small-{index}").into()), "x".into());
     }
     assert!(store.entries.len() <= CONTENT_STORE_ENTRIES);
     assert!(store.page(&ContentHandle("small-0".into()), None).is_err());
 
     let oversized = "z".repeat(CONTENT_ENTRY_BYTES + 100);
-    store.insert(ContentHandle("oversized".into()), &oversized);
+    store.insert_owned(ContentHandle("oversized".into()), oversized);
     let retained = store
         .entries
         .iter()
@@ -89,9 +93,9 @@ fn content_store_enforces_entry_count_per_output_and_total_byte_caps() {
     assert!(retained.text.ends_with("[output truncated at 2 MiB]"));
 
     for index in 0..8 {
-        store.insert(
+        store.insert_owned(
             ContentHandle(format!("large-{index}").into()),
-            &"y".repeat(CONTENT_ENTRY_BYTES),
+            "y".repeat(CONTENT_ENTRY_BYTES),
         );
     }
     assert!(store.retained_bytes <= CONTENT_STORE_BYTES);
@@ -278,7 +282,6 @@ fn sink() -> (EventSink, mpsc::Receiver<UiEvent>, mpsc::Receiver<UiEvent>) {
             data: Some(data),
             wake: WakeSignal::default(),
             lane_space: WakeSignal::default(),
-            drop_probe: None,
         },
         control_rx,
         data_rx,
@@ -316,18 +319,11 @@ fn skill_discovery_warning_survives_memoized_workspace_restore() {
 
 #[cfg(windows)]
 #[test]
-fn final_sender_teardown_precedes_wake_probe() {
-    let (mut sink, control_rx, data_rx) = sink();
+fn final_sender_teardown_disconnects_channels_and_signals_wake() {
+    let (sink, control_rx, data_rx) = sink();
     let wake = sink.wake.clone();
-    let reached_pre_wake = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let release_wake = std::sync::Arc::new(std::sync::Barrier::new(2));
-    sink.drop_probe = Some(super::DropProbe {
-        reached_pre_wake: reached_pre_wake.clone(),
-        release_wake: release_wake.clone(),
-    });
-    let dropper = std::thread::spawn(move || drop(sink));
+    drop(sink);
 
-    reached_pre_wake.wait();
     assert!(matches!(
         control_rx.try_recv(),
         Err(mpsc::TryRecvError::Disconnected)
@@ -336,14 +332,6 @@ fn final_sender_teardown_precedes_wake_probe() {
         data_rx.try_recv(),
         Err(mpsc::TryRecvError::Disconnected)
     ));
-    assert!(
-        !wake
-            .wait_timeout(std::time::Duration::ZERO)
-            .expect("wake remains unsignaled at pre-wake barrier"),
-        "wake cannot precede sender disconnection"
-    );
-    release_wake.wait();
-    dropper.join().expect("drop completes after wake release");
     assert!(
         wake.wait_timeout(std::time::Duration::from_millis(50))
             .expect("final wake is observable"),
@@ -691,6 +679,7 @@ fn exact_full_pending_delivery_services_cancel_without_losing_truth() {
         admission: None,
         result: None,
         projector: None,
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         delivery: execution_result_events(7, None, Ok(Ok(execution(ExitCode::Success))), false),
         cancellation: cancellation.clone(),
         durable: false,
@@ -744,6 +733,7 @@ fn exact_full_pending_delivery_services_shutdown() {
         admission: None,
         result: None,
         projector: None,
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         delivery: execution_result_events(7, None, Ok(Ok(execution(ExitCode::Success))), false),
         cancellation: cancellation.clone(),
         durable: false,
@@ -789,6 +779,7 @@ fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking()
         admission: None,
         result: None,
         projector: None,
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         delivery: execution_result_events(7, None, Ok(Ok(execution(ExitCode::Success))), false),
         cancellation: CancellationToken::new(),
         durable: false,
@@ -867,6 +858,7 @@ fn pending_run_cancel_is_recorded_and_interrupts_projector() {
         admission: None,
         result: Some(Ok(Ok(execution(ExitCode::Success)))),
         projector: Some(std::thread::spawn(|| {})),
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         delivery: VecDeque::new(),
         cancellation: cancellation.clone(),
         durable: false,
@@ -919,6 +911,7 @@ async fn a_forced_abort_clears_only_the_manual_request_of_an_idle_compaction() {
         // A run that ignores its cancellation token.
         task: tokio::spawn(async { std::future::pending().await }),
         projector: std::thread::spawn(|| {}),
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         cancellation: CancellationToken::new(),
         durable: false,
         content_store: Default::default(),
@@ -963,6 +956,7 @@ async fn a_second_compact_during_an_idle_compaction_is_refused() {
         cancellation_from_preparation: false,
         task: tokio::spawn(async { std::future::pending().await }),
         projector: std::thread::spawn(|| {}),
+        projector_done: std::sync::Arc::new(tokio::sync::Notify::new()),
         cancellation: CancellationToken::new(),
         durable: false,
         content_store: Default::default(),

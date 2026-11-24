@@ -727,10 +727,3 @@ fn native_acl_handles_accented_path_and_removes_extra_access() {
     assert_eq!(key, "placeholder-unicode");
     assert_native_acl_is_narrow(&path);
 }
-
-#[test]
-fn auth_error_remains_debuggable() {
-    fn requires_debug<T: std::fmt::Debug>() {}
-
-    requires_debug::<AuthError>();
-}

@@ -102,6 +102,7 @@ struct OAuthWorker {
     store: OAuthStore,
     refresh_gate: Arc<[AsyncMutex<()>; 3]>,
     shared: Arc<Mutex<OAuthSharedState>>,
+    warning_notify: Arc<tokio::sync::Notify>,
     background_inflight: Arc<[AtomicBool; 3]>,
     lifecycle: Arc<OAuthLifecycle>,
 }
@@ -168,6 +169,7 @@ impl OAuthService {
                 AsyncMutex::new(()),
             ]),
             shared: Arc::new(Mutex::new(OAuthSharedState::new())),
+            warning_notify: Arc::new(tokio::sync::Notify::new()),
             background_inflight: Arc::new([
                 AtomicBool::new(false),
                 AtomicBool::new(false),
@@ -230,6 +232,18 @@ impl OAuthService {
             self.worker.invalidate_local(OAuthProvider::Xai);
         }
         Ok(())
+    }
+
+    pub(crate) fn store_path(&self) -> &std::path::Path {
+        self.worker.store.path()
+    }
+
+    pub(crate) fn note_store_credential_seen(&self, provider: OAuthProvider) {
+        self.worker.note_store_credential_seen(provider);
+    }
+
+    pub(crate) fn warning_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.worker.warning_notify)
     }
 
     pub fn active_provider_key(&self) -> Result<Option<String>, OAuthError> {
@@ -629,6 +643,7 @@ struct SelectedCredential {
 struct BackgroundRefreshFinish {
     inflight: Arc<[AtomicBool; 3]>,
     shared: Arc<Mutex<OAuthSharedState>>,
+    warning_notify: Arc<tokio::sync::Notify>,
     slot: usize,
     succeeded: bool,
 }
@@ -639,6 +654,7 @@ impl Drop for BackgroundRefreshFinish {
         if !self.succeeded {
             add_warning(
                 &self.shared,
+                &self.warning_notify,
                 "OAuth background refresh task ended unexpectedly".into(),
             );
         }
@@ -987,6 +1003,7 @@ impl OAuthWorker {
             let mut finish = BackgroundRefreshFinish {
                 inflight: Arc::clone(&worker.background_inflight),
                 shared: Arc::clone(&worker.shared),
+                warning_notify: Arc::clone(&worker.warning_notify),
                 slot,
                 succeeded: false,
             };
@@ -1005,7 +1022,7 @@ impl OAuthWorker {
                     finish.succeeded = true
                 }
                 Err(error) => {
-                    add_warning(&worker.shared, error.to_string());
+                    add_warning(&worker.shared, &worker.warning_notify, error.to_string());
                     finish.succeeded = true;
                 }
             }
@@ -1138,22 +1155,29 @@ impl OAuthWorker {
 
     fn release_pending_at_shutdown(&self, provider: OAuthProvider) {
         let slot = background_inflight_slot(provider);
-        let mut state = lock_mutex(&self.shared);
-        if let Some(pending) = state.pending[slot].take() {
-            if let Some(warning) = pending.warning {
-                push_warning(&mut state.warnings, warning);
+        let pushed = {
+            let mut state = lock_mutex(&self.shared);
+            let mut pushed = false;
+            if let Some(pending) = state.pending[slot].take() {
+                if let Some(warning) = pending.warning {
+                    pushed |= push_warning(&mut state.warnings, warning);
+                }
+                pushed |= push_warning(
+                    &mut state.warnings,
+                    "OAuth successor could not be persisted before service shutdown".into(),
+                );
             }
-            push_warning(
-                &mut state.warnings,
-                "OAuth successor could not be persisted before service shutdown".into(),
-            );
-        }
-        if let Some(volatile) = state.volatile[slot].take() {
-            push_warning(&mut state.warnings, volatile.warning);
-            push_warning(
-                &mut state.warnings,
-                "OAuth successor remained process-local because the auth store was unavailable at shutdown".into(),
-            );
+            if let Some(volatile) = state.volatile[slot].take() {
+                pushed |= push_warning(&mut state.warnings, volatile.warning);
+                pushed |= push_warning(
+                    &mut state.warnings,
+                    "OAuth successor remained process-local because the auth store was unavailable at shutdown".into(),
+                );
+            }
+            pushed
+        };
+        if pushed {
+            self.warning_notify.notify_one();
         }
     }
 
@@ -1455,13 +1479,23 @@ fn set_refresh_window(
         Some((credential.clone(), now.saturating_add(delay)));
 }
 
-fn add_warning(shared: &Mutex<OAuthSharedState>, warning: String) {
-    push_warning(&mut lock_mutex(shared).warnings, warning);
+fn add_warning(
+    shared: &Mutex<OAuthSharedState>,
+    notify: &tokio::sync::Notify,
+    warning: String,
+) {
+    let pushed = push_warning(&mut lock_mutex(shared).warnings, warning);
+    if pushed {
+        notify.notify_one();
+    }
 }
 
-fn push_warning(warnings: &mut Vec<String>, warning: String) {
+fn push_warning(warnings: &mut Vec<String>, warning: String) -> bool {
     if !warning.is_empty() && !warnings.contains(&warning) {
         warnings.push(warning);
+        true
+    } else {
+        false
     }
 }
 

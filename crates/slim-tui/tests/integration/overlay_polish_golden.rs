@@ -348,6 +348,7 @@ fn rewind_picker_lists_turns_newest_first_with_the_conversation_only_note() {
                 index,
                 first_seq: index as u64 * 10 + 2,
                 prompt: format!("pedido número {index}"),
+                has_checkpoint: false,
             })
             .collect(),
         error: None,

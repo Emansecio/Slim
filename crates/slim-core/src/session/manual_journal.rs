@@ -93,10 +93,17 @@ impl ManualRunJournal {
         &mut self.repo
     }
 
-    pub(crate) fn record_fact(&mut self, fact: DurableFact) -> io::Result<()> {
+    pub fn record_fact(&mut self, fact: DurableFact) -> io::Result<()> {
         self.check()?;
         let seq = self.repo.next_seq()?;
         let result = self.repo.append(DurableRecord::Fact { seq, fact });
+        self.remember_failure(result)
+    }
+
+    pub(crate) fn record_fact_unsynced(&mut self, fact: DurableFact) -> io::Result<()> {
+        self.check()?;
+        let seq = self.repo.next_seq()?;
+        let result = self.repo.append_unsynced(DurableRecord::Fact { seq, fact });
         self.remember_failure(result)
     }
 
@@ -151,6 +158,19 @@ impl ManualRunJournal {
 
     /// Whether [`Self::record_event`] may write `event` to disk (an entry,
     /// a fact or an artifact); the other events only update memory.
+    pub fn event_persists_to_journal(event: &EventKind) -> bool {
+        matches!(
+            event,
+            EventKind::ShellJobChanged { .. }
+                | EventKind::ToolStarted { .. }
+                | EventKind::ToolOutput { .. }
+                | EventKind::ToolFinished { .. }
+                | EventKind::ToolProcessFinished { .. }
+                | EventKind::ToolJobOutput { .. }
+                | EventKind::ArtifactStored { .. }
+        )
+    }
+
     pub fn event_reaches_disk(event: &EventKind) -> bool {
         matches!(
             event,
@@ -158,6 +178,8 @@ impl ManualRunJournal {
                 | EventKind::ToolOutput { .. }
                 | EventKind::ToolFinished { .. }
                 | EventKind::ToolProcessFinished { .. }
+                | EventKind::ArtifactStored { .. }
+                | EventKind::ToolJobOutput { .. }
         )
     }
 
@@ -371,6 +393,7 @@ impl ManualRunJournal {
                     "input_tokens": usage.map(|usage| usage.input_tokens),
                     "output_tokens": usage.map(|usage| usage.output_tokens),
                     "cache_read_tokens": usage.and_then(|usage| usage.cache_read_tokens),
+                    "delta_transport": telemetry.delta_transport,
                     "cache_write_tokens": usage.and_then(|usage| usage.cache_write_tokens),
                     "input_items": telemetry.input_items,
                     "reused_input_items": telemetry.reused_input_items,
@@ -863,6 +886,7 @@ mod tests {
                 input_items: 3,
                 reused_input_items: None,
                 turn_state: Some("captured"),
+                delta_transport: None,
             })
             .unwrap();
         journal
@@ -885,6 +909,7 @@ mod tests {
                 input_items: 5,
                 reused_input_items: Some(3),
                 turn_state: Some("replayed"),
+                delta_transport: None,
             })
             .unwrap();
         drop(journal);
@@ -980,6 +1005,7 @@ mod tests {
             input_items: 0,
             reused_input_items: None,
             turn_state: None,
+            delta_transport: None,
         };
         let first = journal.record_provider_call(&telemetry).unwrap();
         let later = journal.record_provider_call(&telemetry).unwrap();

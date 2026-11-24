@@ -78,10 +78,22 @@ pub(super) struct LoopState<'m> {
     finalize_steered: bool,
     /// Sticky routing and prefix diagnosis shared by this run's requests.
     pub(super) routing: crate::provider::TurnRouting,
+    /// Whether any workspace mutation succeeded so far in this run.
+    pub(super) had_mutation: bool,
+    /// Whether the most recent check after a mutation passed cleanly with no failures.
+    pub(super) clean_check_passed: bool,
+    /// Whether this run has already observed a warm prompt cache hit (>=2k cached tokens).
+    pub(super) had_warm_cache_hit: bool,
+    /// Set to true when compaction rewrites the prefix in the current turn.
+    pub(super) compacted_this_turn: bool,
+    /// Cause classification from comparing consecutive request prefixes.
+    pub(super) last_prefix_diagnosis: String,
+    /// Background mid-run speculative compaction spawned during long tool batches.
+    mid_run_speculative: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
 }
 
 impl<'m> LoopState<'m> {
-    fn new(
+    pub(super) fn new(
         messages: &'m mut Vec<ProviderMessage>,
         next_seq: u64,
         config: AgentLoopConfig,
@@ -109,6 +121,19 @@ impl<'m> LoopState<'m> {
             started: Instant::now(),
             finalize_steered: false,
             routing: crate::provider::TurnRouting::default(),
+            had_mutation: false,
+            clean_check_passed: false,
+            had_warm_cache_hit: false,
+            compacted_this_turn: false,
+            last_prefix_diagnosis: String::new(),
+            mid_run_speculative: None,
+        }
+    }
+
+    pub(super) fn cancel_mid_run_speculative(&mut self) {
+        if let Some((cancel, handle)) = self.mid_run_speculative.take() {
+            cancel.cancel();
+            handle.abort();
         }
     }
 
@@ -124,16 +149,31 @@ impl<'m> LoopState<'m> {
     /// limit follows it. A truncation recovery's raised limit keeps its
     /// reserve: the model needs the room.
     fn output_reserve(&self, input_tokens: u64) -> u64 {
-        let configured = self.config.context_reserve_tokens;
-        let floor = self.config.context_reserve_floor_tokens;
-        if floor == 0 || self.recovery.recovery_output_limit.is_some() {
-            return configured;
-        }
-        let room = self
-            .config
-            .context_window_tokens
-            .saturating_sub(input_tokens);
-        configured.min(room.max(floor))
+        output_reserve_for(
+            &self.config,
+            self.recovery.recovery_output_limit.is_some(),
+            input_tokens,
+        )
+    }
+}
+
+fn output_reserve_for(
+    config: &AgentLoopConfig,
+    has_recovery_limit: bool,
+    input_tokens: u64,
+) -> u64 {
+    let configured = config.context_reserve_tokens;
+    let floor = config.context_reserve_floor_tokens;
+    if floor == 0 || has_recovery_limit {
+        return configured;
+    }
+    let room = config.context_window_tokens.saturating_sub(input_tokens);
+    configured.min(room.max(floor))
+}
+
+impl Drop for LoopState<'_> {
+    fn drop(&mut self) {
+        self.cancel_mid_run_speculative();
     }
 }
 
@@ -169,9 +209,9 @@ struct BatchReport {
     budget_cut: ToolBudgetCut,
     suppressed: Vec<ProviderToolCall>,
     repeated_failure: bool,
-    /// `then_run.final` of a batch whose every call succeeded and whose
-    /// fused check passed: the run may end with it, without another turn.
-    concluded: Option<String>,
+    /// `(answer, reason)` from `then_run.final` or `codemode` `finish(answer)`:
+    /// the run may end with it, without another turn.
+    concluded: Option<(String, &'static str)>,
 }
 
 /// How the loop leaves a turn early. Phases return it as their `Err` so `?`
@@ -199,7 +239,7 @@ enum TurnEnd {
 }
 
 impl AgentLoopResult {
-    fn empty(next_seq: u64, stop: AgentLoopStop) -> Self {
+    pub fn empty(next_seq: u64, stop: AgentLoopStop) -> Self {
         Self {
             next_seq,
             turns: 0,
@@ -344,6 +384,7 @@ impl Runtime {
             request,
             request_next_seq,
             false,
+            None,
         )
         .await
     }
@@ -355,7 +396,9 @@ impl Runtime {
         request: PreparedProviderRequest,
         next_seq: u64,
         require_output: bool,
+        early_dispatch: Option<(crate::OperatingMode, PathBuf, usize)>,
     ) -> Result<ProviderTurnResult, ProviderError> {
+        self.clear_speculative_reads();
         self.pending_argument_repair = None;
         let mut sensitive_values = self.sensitive_values.0.clone();
         sensitive_values.extend_from_slice(request.sensitive_values());
@@ -364,6 +407,7 @@ impl Runtime {
         let mut normalizer =
             ProviderStreamNormalizer::new(adapter.wire_kind(), next_seq, sensitive_values)
                 .with_reasoning_classification(adapter.reasoning_classification())
+                .with_reasoning_provenance(adapter.reasoning_scope_fingerprint())
                 .with_thinking_scope(
                     adapter.response_cache_scope_id(),
                     adapter.model(),
@@ -371,11 +415,32 @@ impl Runtime {
                 );
         let output_start = self.app.events().len();
         let request_started = Instant::now();
-        let cancellation = CancellationToken::cancelled_or_pending(self.cancellation.clone());
+        let run_cancellation = self.cancellation.clone();
+        let cancellation = CancellationToken::cancelled_or_pending(run_cancellation.clone());
         let provider_call_journal = self.app.run_journal.clone();
         let mut provider_call_id = None;
+        let spec_cancel = CancellationToken::new();
+        let mut speculator = early_dispatch
+            .filter(|_| speculative_v2_enabled())
+            .map(|(mode, cwd, max_read_calls)| {
+                let canonical_workspace = std::fs::canonicalize(&cwd).ok();
+                let mut stream_secrets = self.sensitive_values.0.clone();
+                stream_secrets.extend_from_slice(request.sensitive_values());
+                crate::provider::normalize_sensitive_values(&mut stream_secrets);
+                StreamSpeculator::new(StreamSpeculatorConfig {
+                    mode,
+                    cwd,
+                    canonical_workspace,
+                    max_read_calls,
+                    tools: self.tools.clone(),
+                    code_intel: self.code_intel.clone(),
+                    spec_cancel: spec_cancel.clone(),
+                    run_cancel: run_cancellation.clone(),
+                    sensitive_values: stream_secrets,
+                })
+            });
         let stream_result = client
-            .stream_prepared_cancellable_observed(
+            .stream_prepared_cancellable_with_speculation(
                 request,
                 cancellation,
                 |event| {
@@ -385,8 +450,22 @@ impl Runtime {
                     provider_call_id = persist_provider_call(&provider_call_journal, telemetry)?;
                     Ok(())
                 },
+                |raw_event| {
+                    if let Some(spec) = speculator.as_mut() {
+                        spec.on_event(raw_event);
+                    }
+                },
             )
             .await;
+        if let Some(spec) = speculator {
+            let (local_speculative, _prewarms) = spec.finish(stream_result.is_ok() && !self.is_cancelled());
+            if !local_speculative.is_empty() {
+                for (id, entry) in local_speculative {
+                    self.speculative_reads.insert(id, entry);
+                }
+                self.speculative_cancel = Some(spec_cancel);
+            }
+        }
         let stream_succeeded = stream_result.is_ok();
         let cancelled = matches!(&stream_result, Err(ProviderError::Cancelled));
         if stream_result.is_err() {
@@ -544,14 +623,16 @@ impl Runtime {
         }
         let batch_id = format!("slim-batch-direct-{}", provider_turn.next_seq);
         assign_missing_call_ids(&mut calls, &batch_id);
-        self.codemode.remaining_calls = AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS
-            .saturating_sub(
+        self.codemode.remaining_calls = usize::MAX;
+        self.codemode.remaining_mutating_calls = Some(
+            AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS.saturating_sub(
                 calls
                     .iter()
                     .filter(|call| !tool_call_is_read_only(&call.name))
                     .map(tool_call_slots)
                     .sum::<usize>(),
-            );
+            ),
+        );
         self.codemode.used_calls = 0;
         let mut governor = CausalGovernor::default();
         let (results, next_seq) = self
@@ -614,6 +695,63 @@ impl Runtime {
     /// follows, and the compacted history is left in `conversation()`. The
     /// commit waits in the compaction handle like any other. Nothing to
     /// compact is not an error: the history comes back as it was.
+    /// Renews the remote provider's KV-cache TTL using the exact active `tools`,
+    /// `system`, and `ChannelFrame` prefix with a minimal-output request. Does
+    /// not mutate journals or emit UI events. Returns `(cache_read, cache_write)`.
+    pub async fn run_keep_alive_ping<A: ProviderAdapter + Send + Sync + 'static>(
+        &mut self,
+        client: &HttpProviderClient<A>,
+        initial_messages: &[ProviderMessage],
+        mode: crate::OperatingMode,
+        cwd: impl AsRef<Path>,
+        config: AgentLoopConfig,
+    ) -> Result<(u64, u64), ProviderError> {
+        let cwd = cwd.as_ref();
+        self.prepare_loop_capabilities(cwd)?;
+        let tools = self.workspace_tool_definitions_for(mode, cwd, config.stable_tool_envelope);
+        let mut seeded = self.redact_messages(initial_messages);
+        let write_penalty = client
+            .adapter()
+            .cache_write_penalty_multiplier()
+            .max(1);
+        let _ = elide_superseded_tool_outputs_with_penalty(&mut seeded, write_penalty);
+        if seeded.last().is_none_or(|m| m.role != "user") {
+            seeded.push(ProviderMessage::user("."));
+        }
+        let preserve = config.stable_tool_envelope || self.frozen_tools_override.is_some();
+        let frame = self.readonly_channel_frame_for(mode, &seeded, preserve);
+        let request = {
+            let overlay = self.overlay_channel(&mut seeded, mode, &frame);
+            client.prepare_keep_alive_ping(overlay.view(), &tools)?
+        };
+        let mut read = 0u64;
+        let mut write = 0u64;
+        client
+            .stream_prepared_cancellable(request, std::future::pending(), |event| {
+                if let ProviderEvent::UsageBreakdown { usage } = event {
+                    read = read.max(usage.cache_read_tokens);
+                    write = write.max(usage.cache_write_tokens);
+                }
+            })
+            .await?;
+        let cached = read.saturating_add(write);
+        if cached > 0 {
+            if let Some(handle) = &self.compaction_handle {
+                let provider = crate::provider::provider_kind_name(client.adapter().kind());
+                let model = client.adapter().model();
+                let ttl_secs = crate::context::CompactionHandle::warm_cache_ttl_secs(provider);
+                handle.record_warm_cache(
+                    provider,
+                    model,
+                    super::compaction_foreground::current_unix_secs(),
+                    ttl_secs,
+                    cached,
+                );
+            }
+        }
+        Ok((read, write))
+    }
+
     pub async fn compact_messages<A: ProviderAdapter + Send + Sync + 'static>(
         &mut self,
         client: &HttpProviderClient<A>,
@@ -745,19 +883,26 @@ impl Runtime {
             });
         }
         self.prepare_loop_capabilities(ctx.cwd)?;
-        // The summarizer reads what a run's model would: own reasoning only
-        // and no superseded tool output.
-        retain_own_reasoning(ctx.client.adapter(), messages);
-        let elision = elide_superseded_tool_outputs(messages);
-        let anchor = self.seed_usage_anchor(ctx, messages, elision.elided);
-        let channel = self.channel_frame(ctx.mode, messages);
+        // Keep the live prefix untouched so cache-friendly in-place compaction
+        // reads the provider's warm cache instead of re-ingesting it.
+        let anchor = self.seed_usage_anchor(ctx, messages, 0);
+        let channel = self.channel_frame_for(
+            ctx.mode,
+            messages,
+            config.stable_tool_envelope || self.frozen_tools_override.is_some(),
+        );
         let mut st = LoopState::new(messages, next_seq, config, anchor, channel);
-        let tools = self.workspace_tool_definitions(ctx.mode, ctx.cwd);
+        let tools = self.workspace_tool_definitions_for(
+            ctx.mode,
+            ctx.cwd,
+            st.config.stable_tool_envelope,
+        );
         let usage = self.context_usage(ctx.client.adapter(), &st, &tools);
         let trigger = CompactionTrigger {
             reason: CompactionReason::Manual,
             required: true,
             usage,
+            build_next_request: false,
         };
         let outcome = self.compact_for_turn(ctx, &mut st, &tools, trigger).await;
         let stop = match outcome? {
@@ -767,6 +912,32 @@ impl Runtime {
             }
         };
         Ok(AgentLoopResult::empty(st.next_seq, stop))
+    }
+
+    /// Runs a read-only background speculative compaction over `initial_messages`
+    /// without mutating live history, emitting UI events, or touching journals.
+    pub async fn run_speculative_compaction<A: ProviderAdapter + Send + Sync + 'static>(
+        &mut self,
+        client: &HttpProviderClient<A>,
+        initial_messages: &[ProviderMessage],
+        mode: crate::OperatingMode,
+        cwd: impl AsRef<Path>,
+        config: AgentLoopConfig,
+    ) -> Result<Option<crate::context::SpeculativeCompaction>, ProviderError> {
+        let cwd = cwd.as_ref();
+        if self.is_cancelled() || !config.context_compaction_enabled {
+            return Ok(None);
+        }
+        self.prepare_loop_capabilities(cwd)?;
+        let mut messages = self.redact_messages(initial_messages);
+        if self.is_already_compacted(&messages) {
+            return Ok(None);
+        }
+        let ctx = LoopCtx::new(client, initial_messages, mode, cwd, 0);
+        let anchor = self.seed_usage_anchor(&ctx, &messages, 0);
+        let channel = self.readonly_channel_frame(mode, &messages);
+        self.run_speculative_compaction_inner(&ctx, &mut messages, config, anchor, channel)
+            .await
     }
 
     pub(super) async fn run_agent_loop_inner<A: ProviderAdapter + Send + Sync + 'static>(
@@ -790,6 +961,18 @@ impl Runtime {
             if st.time_budget_spent() {
                 st.stop = AgentLoopStop::TimeLimit;
                 break;
+            }
+            if let Some(token_limit) = st.config.max_total_tokens {
+                let spent = usage_since(&self.app, ctx.loop_event_start);
+                let total = spent
+                    .uncached_input_tokens
+                    .saturating_add(spent.cache_write_tokens)
+                    .saturating_add(spent.cache_read_tokens)
+                    .saturating_add(spent.output_tokens);
+                if total >= token_limit {
+                    st.stop = AgentLoopStop::TokenLimit;
+                    break;
+                }
             }
             proceed!(st, self.begin_turn(ctx, &mut st).await);
             let prepared = proceed!(st, self.prepare_request(ctx, &mut st).await);
@@ -826,7 +1009,7 @@ impl Runtime {
     }
 
     /// Prepares the run: capabilities, the seeded history and the loop state.
-    fn seed_loop<'m, A: ProviderAdapter>(
+    fn seed_loop<'m, A: ProviderAdapter + Send + Sync + 'static>(
         &mut self,
         ctx: &LoopCtx<'_, A>,
         mut next_seq: u64,
@@ -834,6 +1017,26 @@ impl Runtime {
         messages: &'m mut Vec<ProviderMessage>,
     ) -> Result<LoopState<'m>, ProviderError> {
         self.prepare_loop_capabilities(ctx.cwd)?;
+        let caps = ctx.client.adapter().capabilities();
+        let now = super::compaction_foreground::current_unix_secs();
+        // Asked first: `has_warm_cache` drops the expired entry.
+        let cache_expired = self
+            .compaction_handle
+            .as_ref()
+            .is_some_and(|handle| handle.warm_cache_expired(ctx.provider, ctx.model, now));
+        let warm_cache = self
+            .compaction_handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_warm_cache(ctx.provider, ctx.model, now));
+        self.prompt_cache_active = caps.supports_explicit_cache_breakpoints
+            || caps.supports_prompt_cache_key
+            || caps.supports_prompt_cache_options
+            || warm_cache;
+        self.cache_write_penalty = ctx
+            .client
+            .adapter()
+            .cache_write_penalty_multiplier()
+            .max(if warm_cache { 2 } else { 1 });
         let mut seeded = self.redact_messages(ctx.initial_messages);
         self.add_initial_workspace_context(
             ctx.client.adapter(),
@@ -842,10 +1045,19 @@ impl Runtime {
             ctx.cwd,
             config,
         );
-        retain_own_reasoning(ctx.client.adapter(), &mut seeded);
+        // Opaque reasoning stays attached to live history and is filtered on
+        // the wire via `belongs_to(adapter)` so A → B → A round-trips keep A's
+        // signed thinking blocks and prompt cache intact.
         // The provider may still hold the previous run's prefix in its cache:
-        // an elision that would re-ingest more than it saves waits.
-        let seed_elision = elide_superseded_tool_outputs_if_it_pays(&mut seeded);
+        // weigh saved bytes against cache-write re-ingestion penalty. A prefix
+        // known to have expired is rewritten whole either way: no penalty.
+        let write_penalty = if cache_expired {
+            1
+        } else {
+            self.cache_write_penalty.max(1)
+        };
+        let seed_elision =
+            elide_superseded_tool_outputs_with_penalty(&mut seeded, write_penalty);
         *messages = seeded;
         if seed_elision.elided > 0 {
             push_runtime_event(
@@ -861,9 +1073,41 @@ impl Runtime {
         self.edited = EditedFiles::default();
         self.tuning_closed = false;
         self.run_guards = run_guards::RunGuards::default();
+        let preserve_channel_modes = config.stable_tool_envelope || self.frozen_tools_override.is_some();
+        if self.subagent_depth == 0 {
+            if let Some(reg) = self.subagents.as_ref() {
+                let parent_tools = self.workspace_tool_definitions_for(
+                    ctx.mode,
+                    ctx.cwd,
+                    config.stable_tool_envelope,
+                );
+                reg.set_spawner(
+                    Arc::new(super::native_subagent::ConcreteSubagentSpawner {
+                        client: ctx.client.clone(),
+                        mode: ctx.mode,
+                        cwd: ctx.cwd.to_path_buf(),
+                        base_config: config.clone(),
+                        artifact_store: self.artifact_store.clone(),
+                        sensitive_values: self.sensitive_values.clone(),
+                        code_intel: self.code_intel.clone(),
+                        mcp: self.mcp.clone(),
+                        compaction_policy: self.compaction_policy(),
+                        initial_workspace_snapshot: self
+                            .compaction_handle
+                            .as_ref()
+                            .and_then(|handle| handle.initial_workspace_snapshot()),
+                        skill_discovery: self.skill_discovery_cache.clone(),
+                        parent_tools: Some(parent_tools),
+                    }),
+                    ctx.mode,
+                );
+            }
+        }
         let anchor = self.seed_usage_anchor(ctx, messages, seed_elision.elided);
-        let channel = self.channel_frame(ctx.mode, messages);
-        Ok(LoopState::new(messages, next_seq, config, anchor, channel))
+        let channel = self.channel_frame_for(ctx.mode, messages, preserve_channel_modes);
+        let mut st = LoopState::new(messages, next_seq, config, anchor, channel);
+        st.had_warm_cache_hit = warm_cache;
+        Ok(st)
     }
 
     /// The usage anchor the previous run left in the compaction handle, when
@@ -892,13 +1136,49 @@ impl Runtime {
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
     ) -> Result<(), TurnExit> {
+        if let Some(gate) = self.pause_gate.clone() {
+            let cancel = self.cancellation.clone().unwrap_or_default();
+            if !gate.wait_if_paused(&cancel).await {
+                return Err(self.cancel_loop(ctx, st, Vec::new()));
+            }
+        }
         if self.is_cancelled() {
             return Err(self.cancel_loop(ctx, st, Vec::new()));
         }
         self.deliver_loop_shell_jobs(st)?;
         self.deliver_steers(st)?;
+        self.deliver_finished_subagents(st, ctx.mode)?;
         st.turns = st.turn + 1;
         Ok(())
+    }
+
+    /// Tells the model, once per subagent, that one it left running has ended
+    /// and still holds a result nobody collected.
+    fn deliver_finished_subagents(
+        &mut self,
+        st: &mut LoopState<'_>,
+        mode: crate::OperatingMode,
+    ) -> Result<(), ProviderError> {
+        let ended = self
+            .subagents
+            .as_ref()
+            .map(|registry| registry.take_unannounced_terminal())
+            .unwrap_or_default();
+        if ended.is_empty() {
+            return Ok(());
+        }
+        let collect_hint = if mode == crate::OperatingMode::Code {
+            r#"slim.subagent_control({ action: "wait", id })"#
+        } else {
+            r#"subagent_control (action: "wait", id)"#
+        };
+        self.append_conversation_message(
+            st.messages,
+            ProviderMessage::user(format!(
+                "[Subagents ended with uncollected results: {}. Collect each with {collect_hint}.]",
+                ended.join(", ")
+            )),
+        )
     }
 
     /// Builds this turn's request: preflight, compaction when Pi's trigger
@@ -909,38 +1189,62 @@ impl Runtime {
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
     ) -> Result<PreparedTurn, TurnExit> {
-        let tools = self.workspace_tool_definitions(ctx.mode, ctx.cwd);
-        let (preflight_chars, preflight_tokens, mut request) =
-            self.preflight_request(ctx, st.messages, &tools, &st.channel)?;
-        if let Some(trigger) = self.compaction_trigger(ctx, st, &tools, preflight_tokens) {
-            match self.compact_for_turn(ctx, st, &tools, trigger).await {
-                Ok(CompactionOutcome::Applied(applied)) => {
-                    request = Some(*applied);
-                    st.compaction_applied = true;
-                    st.guard = LoopGuard::default();
-                    // What the guards remember was read is now a summary.
-                    self.run_guards = run_guards::RunGuards::default();
+        if ctx.mode == crate::OperatingMode::Code {
+            codemode::prewarm_worker_cell();
+        }
+        let tools = self.workspace_tool_definitions_for(
+            ctx.mode,
+            ctx.cwd,
+            st.config.stable_tool_envelope,
+        );
+        if !self.prompt_cache_active {
+            let dropped = drop_earlier_reasoning(st.messages);
+            if dropped.elided > 0 {
+                st.routing.reset_delta_chain();
+                st.usage_anchor = None;
+                if let Some(handle) = &self.compaction_handle {
+                    handle.clear_usage_anchor();
                 }
-                Ok(CompactionOutcome::Skipped) => {}
-                Ok(CompactionOutcome::Cancelled) => {
-                    return Err(TurnExit::Return(self.cancelled_result(ctx, st, Vec::new())));
-                }
-                Err(error) if trigger.required || matches!(error, ProviderError::Cancelled) => {
-                    return Err(error.into());
-                }
-                Err(error) => {
-                    // Pi reports a failed automatic compaction and sends the
-                    // request as it is; the context gate below still rejects
-                    // a request that does not fit. The next attempt waits for
-                    // a response, as after a compaction.
-                    let error = self.redact_provider_error(error);
-                    st.next_seq = self.observed_next_seq(st.next_seq);
-                    push_runtime_event(
-                        &mut self.app,
-                        &mut st.next_seq,
-                        crate::EventKind::auto_compaction_failed(&provider_retry_reason(&error)),
-                    )?;
-                    st.awaiting_response = true;
+            }
+        }
+        let (preflight_chars, mut request, trigger) =
+            self.preflight_request_and_trigger(ctx, st, &tools)?;
+        if let Some(trigger) = trigger {
+            if self.try_pre_threshold_micro_prune(st, trigger)? {
+                st.routing.reset_delta_chain();
+                request = None;
+            } else {
+                match self.compact_for_turn(ctx, st, &tools, trigger).await {
+                    Ok(CompactionOutcome::Applied(applied)) => {
+                        st.routing.reset_delta_chain();
+                        request = applied.map(|boxed| *boxed);
+                        st.compaction_applied = true;
+                        st.compacted_this_turn = true;
+                        st.guard = LoopGuard::default();
+                        // What the guards remember was read is now a summary.
+                        self.run_guards = run_guards::RunGuards::default();
+                    }
+                    Ok(CompactionOutcome::Skipped) => {}
+                    Ok(CompactionOutcome::Cancelled) => {
+                        return Err(TurnExit::Return(self.cancelled_result(ctx, st, Vec::new())));
+                    }
+                    Err(error) if trigger.required || matches!(error, ProviderError::Cancelled) => {
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        // Pi reports a failed automatic compaction and sends the
+                        // request as it is; the context gate below still rejects
+                        // a request that does not fit. The next attempt waits for
+                        // a response, as after a compaction.
+                        let error = self.redact_provider_error(error);
+                        st.next_seq = self.observed_next_seq(st.next_seq);
+                        push_runtime_event(
+                            &mut self.app,
+                            &mut st.next_seq,
+                            crate::EventKind::auto_compaction_failed(&provider_retry_reason(&error)),
+                        )?;
+                        st.awaiting_response = true;
+                    }
                 }
             }
         }
@@ -995,6 +1299,7 @@ impl Runtime {
                 .into());
             };
             // What the last response's usage described has changed.
+            st.routing.reset_delta_chain();
             st.usage_anchor = None;
             if let Some(handle) = &self.compaction_handle {
                 handle.clear_usage_anchor();
@@ -1016,6 +1321,12 @@ impl Runtime {
             request =
                 self.prepare_loop_request(ctx.client, st.messages, &tools, ctx.mode, &st.channel)?;
         };
+        if st.config.adaptive_reasoning && st.clean_check_passed {
+            request = ctx
+                .client
+                .adapter()
+                .with_adaptive_reasoning_effort(request, "low");
+        }
         Ok(PreparedTurn {
             request,
             tools,
@@ -1023,83 +1334,53 @@ impl Runtime {
         })
     }
 
-    /// Whether this turn compacts before its request, and why: a manual or
-    /// overflow request, Pi's threshold (the context estimate above the window
-    /// minus the reserve), or the request not fitting the context gate that
-    /// follows (`preflight_tokens` and the output reserve against the window:
-    /// the reserve there is the output limit, which can exceed Pi's). The
-    /// threshold waits for a response after a compaction, so a window too
-    /// small to get under it cannot compact on every request. `[compaction]
-    /// enabled` gates the automatic reasons; a manual request always runs.
-    fn compaction_trigger<A: ProviderAdapter>(
+    /// Estimates the turn's request and evaluates compaction triggers in a
+    /// single `ChannelOverlay` pass: normal turns serialize their request right
+    /// inside the same overlay instead of applying and dropping it twice.
+    fn preflight_request_and_trigger<A: ProviderAdapter>(
         &self,
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
         tools: &[Value],
-        preflight_tokens: u64,
-    ) -> Option<CompactionTrigger> {
+    ) -> Result<(u64, Option<PreparedProviderRequest>, Option<CompactionTrigger>), ProviderError> {
         let overflow = std::mem::take(&mut st.recovery.overflow_compaction_pending);
+        let config = st.config.clone();
+        let awaiting_response = st.awaiting_response;
+        let has_recovery_limit = st.recovery.recovery_output_limit.is_some();
+        let enabled = config.context_compaction_enabled;
         let policy = self.compaction_policy();
-        if !st.config.context_compaction_enabled {
-            return None;
-        }
-        let manual = self
-            .compaction_handle
-            .as_ref()
-            .and_then(CompactionHandle::manual_instructions)
-            .is_some();
-        let usage = self.context_usage(ctx.client.adapter(), st, tools);
-        // The request not fitting the gate is a hard need; Pi's line alone is
-        // not.
-        let over_gate = preflight_tokens.saturating_add(st.output_reserve(preflight_tokens))
-            > st.config.context_window_tokens;
-        let (reason, required) = if overflow && policy.enabled {
-            (CompactionReason::Overflow, true)
-        } else if manual {
-            (CompactionReason::Manual, true)
-        } else if policy.enabled
-            && !st.awaiting_response
-            && (over_gate
-                || should_compact(
+        let precheck = if enabled {
+            let manual = self
+                .compaction_handle
+                .as_ref()
+                .and_then(CompactionHandle::manual_instructions)
+                .is_some();
+            let usage = self.context_usage(ctx.client.adapter(), st, tools);
+            let policy_triggered = policy.enabled
+                && !awaiting_response
+                && should_compact(
                     estimate_context_tokens(st.messages, usage).tokens,
-                    st.config.context_window_tokens,
-                    &policy.settings(),
-                ))
-        {
-            (CompactionReason::Threshold, over_gate)
+                    config.context_window_tokens,
+                    &policy.effective_settings_for_window(config.context_window_tokens),
+                );
+            Some((manual, usage, policy_triggered))
         } else {
-            return None;
+            None
         };
-        Some(CompactionTrigger {
-            reason,
-            required,
-            usage,
-        })
-    }
 
-    /// Estimates the turn's request before compaction: structurally when the
-    /// adapter has an envelope bound, otherwise by preparing it.
-    fn preflight_request<A: ProviderAdapter>(
-        &self,
-        ctx: &LoopCtx<'_, A>,
-        messages: &mut [ProviderMessage],
-        tools: &[Value],
-        channel: &mode::ChannelFrame,
-    ) -> Result<(u64, u64, Option<PreparedProviderRequest>), ProviderError> {
-        let overlay = self.overlay_channel(messages, ctx.mode, channel);
+        let overlay = self.overlay_channel(st.messages, ctx.mode, &st.channel);
         let structural_chars =
             estimate_unprepared_request_chars(ctx.client.adapter(), overlay.view(), tools, None);
-        match structural_chars {
-            Some(chars) => Ok((
+        let (chars, tokens, mut request) = match structural_chars {
+            Some(chars) => (
                 chars,
                 self.token_estimator
                     .estimate(ctx.provider, ctx.model, chars),
                 None,
-            )),
+            ),
             None => {
-                let mut request = ctx
-                    .client
-                    .prepare_messages_with_tools(overlay.view(), tools)?;
+                let mut request =
+                    self.prepare_overlay_request(ctx.client, overlay.view(), tools)?;
                 let chars = request
                     .serialized_chars
                     .saturating_sub(image_payload_discount_chars(overlay.view()));
@@ -1107,9 +1388,95 @@ impl Runtime {
                     .token_estimator
                     .estimate(ctx.provider, ctx.model, chars);
                 request.estimated_tokens = tokens;
-                Ok((chars, tokens, Some(request)))
+                (chars, tokens, Some(request))
             }
+        };
+
+        let trigger = precheck.and_then(|(manual, usage, policy_triggered)| {
+            let over_gate = tokens.saturating_add(output_reserve_for(
+                &config,
+                has_recovery_limit,
+                tokens,
+            )) > config.context_window_tokens;
+            let (reason, required) = if overflow && policy.enabled {
+                (CompactionReason::Overflow, true)
+            } else if manual {
+                (CompactionReason::Manual, true)
+            } else if policy.enabled && !awaiting_response && (over_gate || policy_triggered) {
+                (CompactionReason::Threshold, over_gate)
+            } else {
+                return None;
+            };
+            Some(CompactionTrigger {
+                reason,
+                required,
+                usage,
+                build_next_request: true,
+            })
+        });
+
+        if trigger.is_none() && request.is_none() {
+            request = Some(self.prepare_overlay_request(ctx.client, overlay.view(), tools)?);
         }
+        Ok((chars, request, trigger))
+    }
+
+    /// Deterministically collapses large (>4 KiB) read/search tool results strictly
+    /// before the compaction cut point when a non-required soft threshold triggers
+    /// and no speculative summary is already ready, reclaiming >=15% of the window
+    /// in 0 ms without an LLM call.
+    fn try_pre_threshold_micro_prune(
+        &mut self,
+        st: &mut LoopState<'_>,
+        trigger: CompactionTrigger,
+    ) -> Result<bool, TurnExit> {
+        if trigger.reason != CompactionReason::Threshold || trigger.required {
+            return Ok(false);
+        }
+        let policy = self.compaction_policy();
+        let settings = policy.effective_settings_for_window(st.config.context_window_tokens);
+        let Some(preparation) = prepare_compaction(st.messages, &settings, trigger.usage) else {
+            return Ok(false);
+        };
+        // Pruning rewrites the prefix a ready checkpoint summarizes.
+        if self
+            .compaction_handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_valid_speculative(st.messages))
+        {
+            return Ok(false);
+        }
+        let window = st.config.context_window_tokens;
+        let savings_chars =
+            estimate_micro_prune_savings_chars(st.messages, preparation.first_kept_index);
+        let saved_tokens = savings_chars / 4;
+        let min_savings = (window.saturating_mul(15) / 100).min(16_000).max(1);
+        if window == 0 || saved_tokens < min_savings {
+            return Ok(false);
+        }
+        let current_tokens = estimate_context_tokens(st.messages, trigger.usage).tokens;
+        if current_tokens.saturating_sub(saved_tokens) > window.saturating_sub(settings.reserve_tokens) {
+            return Ok(false);
+        }
+        let stats = micro_prune_before_cut(st.messages, preparation.first_kept_index);
+        if stats.elided == 0 {
+            return Ok(false);
+        }
+        st.usage_anchor = None;
+        if let Some(handle) = &self.compaction_handle {
+            handle.clear_usage_anchor();
+        }
+        let detail = format!(
+            "pruned {} old read outputs before compaction ({} to {} bytes)",
+            stats.elided, stats.original_bytes, stats.emitted_bytes
+        );
+        st.next_seq = self.observed_next_seq(st.next_seq);
+        push_runtime_event(
+            &mut self.app,
+            &mut st.next_seq,
+            crate::EventKind::context_trimmed(&detail),
+        )?;
+        Ok(true)
     }
 
     /// Records the request snapshot and calls the provider, then applies the
@@ -1140,6 +1507,10 @@ impl Runtime {
             )?;
             return Err(self.cancel_loop(ctx, st, Vec::new()));
         }
+        let item_hashes = request.input_item_hashes();
+        st.last_prefix_diagnosis = st
+            .routing
+            .diagnose_prefix_change(request.stable_prefixes, item_hashes);
         let provider_result = self
             .run_provider_messages_with_tools_after_snapshot(
                 ctx.client,
@@ -1147,6 +1518,11 @@ impl Runtime {
                 request.with_turn_routing(&st.routing),
                 st.next_seq,
                 true,
+                Some((
+                    ctx.mode,
+                    ctx.cwd.to_path_buf(),
+                    st.config.max_read_tool_calls,
+                )),
             )
             .await;
         st.recovery.provider_attempts = st.recovery.provider_attempts.saturating_add(1);
@@ -1166,6 +1542,31 @@ impl Runtime {
             ProviderAttempt::NextTurn => return Err(TurnExit::NextTurn),
         };
         let usage = self.response_usage(event_start);
+        if let Some(u) = usage {
+            let total_input = u.total_input_tokens();
+            if st.had_warm_cache_hit && !st.compacted_this_turn && total_input >= 8_000 {
+                let hit_ratio_pct =
+                    ((u.cache_read_tokens.saturating_mul(100)) / total_input.max(1)).min(100) as u8;
+                if hit_ratio_pct < 40 {
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut st.next_seq,
+                        crate::EventKind::CacheDriftDetected {
+                            provider: ctx.provider.to_owned(),
+                            model: ctx.model.to_owned(),
+                            hit_ratio_pct,
+                            input_tokens: total_input,
+                            cache_read_tokens: u.cache_read_tokens,
+                            cause: st.last_prefix_diagnosis.clone(),
+                        },
+                    )?;
+                }
+            }
+            if u.cache_read_tokens >= 2_000 {
+                st.had_warm_cache_hit = true;
+            }
+        }
+        st.compacted_this_turn = false;
         Ok(ActiveTurn {
             provider_turn,
             tools,
@@ -1261,14 +1662,19 @@ impl Runtime {
         st: &mut LoopState<'_>,
         active: &mut ActiveTurn,
     ) -> Result<TurnEnd, ProviderError> {
-        let assistant_text = assistant_text_since(&self.app, active.event_start);
-        let assistant = active
-            .provider_turn
-            .take_assistant_message(assistant_text, Vec::new());
-        self.append_conversation_message(st.messages, assistant)?;
-        self.anchor_usage(ctx, st, active.usage);
-        self.uncommitted_event_start = None;
         let provider_stop = active.provider_turn.stop;
+        let assistant_text = assistant_text_since(&self.app, active.event_start);
+        // When a model's safety filter refuses before emitting any text (0
+        // output tokens), do not append an empty phantom assistant turn or
+        // anchor usage on the blocked response.
+        if !(provider_stop == ProviderTurnStop::Filtered && assistant_text.trim().is_empty()) {
+            let assistant = active
+                .provider_turn
+                .take_assistant_message(assistant_text, Vec::new());
+            self.append_conversation_message(st.messages, assistant)?;
+            self.anchor_usage(ctx, st, active.usage);
+        }
+        self.uncommitted_event_start = None;
         // An idle agent waits on local job events, not more model calls.
         // Completed output resumes the loop as an explicit harness message.
         if !self.session_shell_jobs
@@ -1281,6 +1687,9 @@ impl Runtime {
         if self.deliver_loop_shell_jobs(st)? {
             return Ok(TurnEnd::NextTurn);
         }
+        if provider_stop != ProviderTurnStop::Normal {
+            st.routing.reset_delta_chain();
+        }
         // Truncated tools are never executed. Preserve the partial answer
         // and completed tool results, then ask for a small next step.
         if provider_stop == ProviderTurnStop::Truncated
@@ -1291,7 +1700,7 @@ impl Runtime {
             return Ok(TurnEnd::NextTurn);
         }
         if provider_stop == ProviderTurnStop::Normal
-            && ctx.mode == crate::OperatingMode::Auto
+            && ctx.mode.allows_mutation()
             && active.more_turns
             && st.todo_cadence.before_final(&self.todo_items())
         {
@@ -1411,14 +1820,17 @@ impl Runtime {
         self.codemode.remaining_calls = st
             .config
             .max_total_tool_calls
-            .saturating_sub(st.reserved_tool_slots)
-            .min(
-                st.config
-                    .max_mutating_tool_calls
-                    .saturating_sub(mutating_slots),
-            );
+            .saturating_sub(st.reserved_tool_slots);
+        self.codemode.remaining_mutating_calls = Some(
+            st.config
+                .max_mutating_tool_calls
+                .saturating_sub(mutating_slots),
+        );
         self.codemode.used_calls = 0;
+        self.codemode.pending_final_answer = None;
+        self.codemode.cell_effects.clear();
         if budget_cut.suppressed > 0 {
+            st.routing.reset_delta_chain();
             push_runtime_event(
                 &mut self.app,
                 &mut st.next_seq,
@@ -1427,13 +1839,54 @@ impl Runtime {
                 },
             )?;
         }
-        let batch = self
-            .execute_batch(ctx, st, active.event_start, calls)
-            .await?;
+        if calls
+            .iter()
+            .any(|call| matches!(call.name.as_str(), "shell" | "subagent" | "codemode" | "batch_code"))
+        {
+            self.maybe_spawn_mid_run_speculative(ctx, st);
+        }
+        if self.subagent_depth == 0
+            && self.subagents.is_some()
+            && super::native_subagent::needs_fork_context(&calls)
+        {
+            let forked = super::native_subagent::sanitize_fork_context(st.messages);
+            let mut anchors = self
+                .compaction_handle
+                .as_ref()
+                .map(|handle| handle.export_channel_anchors(&forked))
+                .unwrap_or_default();
+            if let Some(current_idx) = st.channel.current_anchor(&forked) {
+                if !anchors.iter().any(|(idx, _, _)| *idx == current_idx) {
+                    anchors.push((
+                        current_idx,
+                        ctx.mode,
+                        st.channel.applied_text(ctx.mode, self.can_ask(ctx.mode)),
+                    ));
+                }
+            }
+            self.active_fork_channel_anchors = anchors;
+            self.active_fork_context = Some(Arc::from(forked));
+        }
+        let batch_result = self.execute_batch(ctx, st, active.event_start, calls).await;
+        self.active_fork_context = None;
+        self.active_fork_channel_anchors.clear();
+        let batch = batch_result?;
         st.reserved_tool_slots = st
             .reserved_tool_slots
             .saturating_add(self.codemode.used_calls);
-        let concluded = then_run_final_answer(&batch.calls, &batch.results);
+        let codemode_final = self.codemode.pending_final_answer.take();
+        let concluded = then_run_final_answer(&batch.calls, &batch.results)
+            .map(|answer| (answer, "then_run_passed"))
+            .or_else(|| {
+                (ctx.mode == crate::OperatingMode::Code
+                    && !batch.calls.is_empty()
+                    && batch.calls.len() == batch.results.len()
+                    && batch.results.iter().all(|result| result.success)
+                    && batch.calls.iter().any(|call| call.name == "codemode"))
+                .then_some(codemode_final)
+                .flatten()
+                .map(|answer| (answer, "codemode_finish"))
+            });
         let repeated_failure = self.record_batch(ctx, st, active, batch).await?;
         Ok(BatchReport {
             budget_cut,
@@ -1453,6 +1906,9 @@ impl Runtime {
         mut calls: Vec<ProviderToolCall>,
     ) -> Result<ToolBatch, TurnExit> {
         let id = format!("slim-batch-{}-{}", st.turn, st.next_seq);
+        if calls.iter().any(|call| call.id.trim().is_empty()) {
+            st.routing.reset_delta_chain();
+        }
         assign_missing_call_ids(&mut calls, &id);
         // Tool execution emits no assistant text, so this snapshot also
         // serves the assistant message appended after the batch.
@@ -1553,6 +2009,8 @@ impl Runtime {
                 },
             );
         }
+        let allow_elision = !(ctx.client.adapter().capabilities().supports_previous_response_id
+            && st.routing.has_active_delta_chain());
         let outcome = self
             .record_batch_results(
                 BatchRecord {
@@ -1561,6 +2019,7 @@ impl Runtime {
                     presentations: &presentations,
                     reacquisitions: &mut reacquisitions,
                     event_start: active.event_start,
+                    allow_elision,
                 },
                 &mut st.guard,
                 st.messages,
@@ -1582,6 +2041,29 @@ impl Runtime {
                 if proves_task_progress(*kind))
         }) {
             st.recovery.renew_after_progress();
+        }
+        let batch_all_ok = results.iter().all(|result| result.success);
+        let mutated_this_batch = self.app.events()[active.event_start..].iter().any(|event| {
+            matches!(
+                &event.kind,
+                crate::EventKind::CausalProgressObserved {
+                    kind: crate::CausalProgressKind::WorkspaceChanged,
+                    ..
+                }
+            )
+        });
+        let verified_this_batch = calls.iter().any(|call| {
+            is_verification_check_call(call)
+                || (matches!(call.name.as_str(), "codemode" | "batch_code")
+                    && self.codemode.effects_for(&call.id).had_validation_green)
+        });
+        if !batch_all_ok {
+            st.clean_check_passed = false;
+        } else if mutated_this_batch {
+            st.had_mutation = true;
+            st.clean_check_passed = verified_this_batch;
+        } else if st.had_mutation && verified_this_batch {
+            st.clean_check_passed = true;
         }
         st.all_results.extend(results);
         Ok(repeated_failure)
@@ -1618,13 +2100,15 @@ impl Runtime {
             self.app.discard_projected_payloads();
             return Ok(Some(AgentLoopStop::NoProgress));
         }
-        // A passing `then_run.final` concludes the run: no steer may hold it.
+        // A passing `then_run.final` or `codemode` `finish()` concludes the
+        // run: advisory steers must not hold it.
         if report.concluded.is_none() && active.more_turns && !self.is_cancelled() {
             if let Some(steer) = self.enter_finalize_phase(st) {
                 self.append_conversation_message(st.messages, ProviderMessage::user(steer))?;
             }
         }
-        if ctx.mode == crate::OperatingMode::Auto
+        if report.concluded.is_none()
+            && ctx.mode.allows_mutation()
             && active.more_turns
             && st.todo_cadence.after_batch(&self.todo_items())
         {
@@ -1639,7 +2123,11 @@ impl Runtime {
                 ProviderMessage::user(suppressed_calls_steer(&report.suppressed)),
             )?;
         }
-        let causal_steer = causal_reuse_steer(&self.app.events()[active.event_start..]);
+        let causal_steer = report
+            .concluded
+            .is_none()
+            .then(|| causal_reuse_steer(&self.app.events()[active.event_start..]))
+            .flatten();
         if let Some(steer) = causal_steer.filter(|_| {
             st.budget_steers_used < MAX_BUDGET_STEERS && !self.is_cancelled() && active.more_turns
         }) {
@@ -1652,17 +2140,18 @@ impl Runtime {
             }
         }
         // Conclusion on success: the model already wrote its closing answer
-        // into `then_run.final`, so a passing check ends the run here instead
-        // of paying a turn that would only restate it. Anything the harness
-        // still has to tell the model (diagnostics, steers, reviews, jobs)
-        // keeps the loop going.
-        if let Some(answer) = report.concluded.as_deref() {
+        // into `then_run.final` or `finish(answer)`, so a passing check ends
+        // the run here instead of paying a turn that would only restate it.
+        // Anything the harness still has to deliver (diagnostics, user steer,
+        // suppressed calls, running jobs) keeps the loop going.
+        if let Some((answer, reason)) = report.concluded.as_ref() {
             if suppressed_calls == 0
                 && st.messages.len() == messages_before
                 && !self.shell_jobs.running()
+                && !self.steer_pending()
                 && !self.is_cancelled()
             {
-                self.conclude_with_answer(st, answer)?;
+                self.conclude_with_answer(st, answer, reason)?;
                 return Ok(Some(AgentLoopStop::ProviderCompleted));
             }
         }
@@ -1692,6 +2181,7 @@ impl Runtime {
         &mut self,
         st: &mut LoopState<'_>,
         answer: &str,
+        reason: &str,
     ) -> Result<(), ProviderError> {
         push_runtime_event(
             &mut self.app,
@@ -1704,7 +2194,7 @@ impl Runtime {
             &mut self.app,
             &mut st.next_seq,
             crate::EventKind::AssistantEnded {
-                reason: "then_run_passed".into(),
+                reason: reason.to_owned(),
             },
         )?;
         self.append_conversation_message(
@@ -1721,6 +2211,7 @@ impl Runtime {
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
     ) -> Result<AgentLoopResult, ProviderError> {
+        st.cancel_mid_run_speculative();
         // A terminal budget/filter/stop must not leave hidden native work alive.
         if !self.session_shell_jobs {
             self.shell_jobs.shutdown().await;
@@ -1732,6 +2223,7 @@ impl Runtime {
             AgentLoopStop::TurnLimit
                 | AgentLoopStop::ToolLimit
                 | AgentLoopStop::TimeLimit
+                | AgentLoopStop::TokenLimit
                 | AgentLoopStop::NoProgress
                 | AgentLoopStop::RepeatedFailedTool
         ) && !self.is_cancelled()
@@ -1743,6 +2235,7 @@ impl Runtime {
             st.stop = AgentLoopStop::Cancelled;
         }
         if st.stop == AgentLoopStop::ProviderCompleted {
+            crate::memory::persist_scratchpad_learnings(ctx.cwd, &self.scratchpad);
             let verified = st.governor.validations_satisfied()
                 && runtime_goal_assurance(&self.app.events()[ctx.loop_event_start..]);
             push_runtime_event(
@@ -1784,7 +2277,97 @@ impl Runtime {
         st: &mut LoopState<'_>,
         completed_batch_prefix: Vec<ToolResult>,
     ) -> TurnExit {
+        st.cancel_mid_run_speculative();
         TurnExit::Return(self.cancelled_result(ctx, st, completed_batch_prefix))
+    }
+
+    fn maybe_spawn_mid_run_speculative<A: ProviderAdapter + Send + Sync + 'static>(
+        &mut self,
+        ctx: &LoopCtx<'_, A>,
+        st: &mut LoopState<'_>,
+    ) {
+        if self.subagent_depth > 0
+            || self.is_cancelled()
+            || st
+                .mid_run_speculative
+                .as_ref()
+                .is_some_and(|(_, handle)| !handle.is_finished())
+            || self.is_already_compacted(st.messages)
+        {
+            return;
+        }
+        let Some(handle) = self.compaction_handle.clone() else {
+            return;
+        };
+        let policy = self.compaction_policy();
+        if !st.config.context_compaction_enabled || !policy.enabled || !policy.speculative {
+            return;
+        }
+        let tools = self.workspace_tool_definitions_for(
+            ctx.mode,
+            ctx.cwd,
+            st.config.stable_tool_envelope,
+        );
+        let usage = self.context_usage(ctx.client.adapter(), st, &tools);
+        let current_tokens = estimate_context_tokens(st.messages, usage).tokens;
+        let window = st.config.context_window_tokens;
+        let effective_settings = policy.effective_settings_for_window(window);
+        if window == 0
+            || current_tokens.saturating_mul(100) < window.saturating_mul(70)
+            || crate::context::should_compact(current_tokens, window, &effective_settings)
+        {
+            return;
+        }
+        // One checkpoint per cycle: an older one is still taken at its own cut.
+        if crate::context::prepare_compaction(st.messages, &effective_settings, usage).is_none()
+            || handle.has_valid_speculative(st.messages)
+        {
+            return;
+        }
+        let cancel = CancellationToken::new();
+        let job_cancel = cancel.clone();
+        let parent_cancel = self.cancellation.clone();
+        let client = ctx.client.clone();
+        let snapshot_messages = st.messages.clone();
+        let mode = ctx.mode;
+        let cwd = ctx.cwd.to_path_buf();
+        let config = st.config.clone();
+        let sensitive_values = self.sensitive_values.clone();
+        let mcp = self.mcp.clone();
+        let code_intel = self.code_intel.clone();
+        let skill_discovery = self.skill_discovery_cache.clone();
+        let workspace_snapshot = handle.initial_workspace_snapshot();
+        let scratchpad = self.scratchpad.clone();
+        let join = tokio::spawn(async move {
+            let mut spec_runtime = Runtime::new();
+            spec_runtime.sensitive_values = sensitive_values;
+            spec_runtime.mcp = mcp;
+            spec_runtime.code_intel = code_intel;
+            spec_runtime.preseeded_skill_discovery = skill_discovery;
+            spec_runtime.preseeded_workspace_snapshot = workspace_snapshot;
+            spec_runtime.scratchpad = scratchpad;
+            spec_runtime.set_cancellation_token(job_cancel.clone());
+            spec_runtime.set_compaction_handle(handle.clone());
+            let fut = spec_runtime.run_speculative_compaction(
+                &client,
+                &snapshot_messages,
+                mode,
+                &cwd,
+                config,
+            );
+            tokio::pin!(fut);
+            let outcome = tokio::select! {
+                res = &mut fut => res,
+                _ = CancellationToken::cancelled_or_pending(parent_cancel) => {
+                    job_cancel.cancel();
+                    return;
+                }
+            };
+            if let Ok(Some(spec)) = outcome {
+                handle.store_speculative(spec);
+            }
+        });
+        st.mid_run_speculative = Some((cancel, join));
     }
 
     fn deliver_loop_shell_jobs(&mut self, st: &mut LoopState<'_>) -> Result<bool, ProviderError> {
@@ -1803,7 +2386,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn steer_pending(&self) -> bool {
+    pub(super) fn steer_pending(&self) -> bool {
         self.steer_inbox
             .as_ref()
             .is_some_and(|inbox| !inbox.is_empty())
@@ -1829,7 +2412,11 @@ impl Runtime {
             }
             _ => BUDGET_FINALIZE_PROMPT,
         };
-        let turn_tools = self.workspace_tool_definitions(ctx.mode, ctx.cwd);
+        let turn_tools = self.workspace_tool_definitions_for(
+            ctx.mode,
+            ctx.cwd,
+            st.config.stable_tool_envelope,
+        );
         let mut final_messages = st.messages.clone();
         final_messages.push(ProviderMessage::user(closing_prompt));
         // The closing call obeys the same context budget as loop turns:
@@ -1844,10 +2431,13 @@ impl Runtime {
                 reason: CompactionReason::Threshold,
                 required: true,
                 usage: self.context_usage(ctx.client.adapter(), st, &turn_tools),
+                build_next_request: true,
             };
             match self.compact_for_turn(ctx, st, &turn_tools, trigger).await {
                 Ok(CompactionOutcome::Applied(_)) => {
+                    st.routing.reset_delta_chain();
                     st.compaction_applied = true;
+                    st.compacted_this_turn = true;
                     final_messages = st.messages.clone();
                     final_messages.push(ProviderMessage::user(closing_prompt));
                 }
@@ -1897,6 +2487,7 @@ impl Runtime {
     ) -> Result<bool, ProviderError> {
         let finalize_event_start = self.app.events().len();
         self.uncommitted_event_start = Some(finalize_event_start);
+        st.routing.reset_delta_chain();
         let closing = Some(Closing {
             forbid_tools,
             routing: &st.routing,
@@ -1983,11 +2574,13 @@ impl Runtime {
         if messages.len() != 1
             || messages[0].role != "user"
             || messages[0].content.contains(workspace::SNAPSHOT_MARKER)
+            || messages[0].content.contains(workspace::CONTEXT_HINT_MARKER)
             || self.is_cancelled()
         {
             return;
         }
-        let tools = self.workspace_tool_definitions(mode, cwd);
+        let raw_user_prompt = messages[0].content.clone();
+        let tools = self.workspace_tool_definitions_for(mode, cwd, config.stable_tool_envelope);
         let settings = self.compaction_policy().settings();
         let fits = |messages: &[ProviderMessage]| {
             estimate_unprepared_request_chars(adapter, messages, tools.as_ref(), None).is_some_and(
@@ -2006,15 +2599,50 @@ impl Runtime {
         if !fits(messages) {
             return;
         }
-        let Some(snapshot) = workspace::initial_paths(cwd, self.cancellation.as_ref()) else {
+        let Some(snapshot) = self
+            .preseeded_workspace_snapshot
+            .clone()
+            .or_else(|| {
+                workspace::initial_workspace_context(cwd, self.cancellation.as_ref())
+                    .map(|snap| snap.to_string())
+            })
+        else {
             return;
         };
         let original_len = messages[0].content.len();
-        messages[0]
-            .content
-            .push_str(&self.redact_sensitive(&snapshot));
+        let redacted_snapshot = self.redact_sensitive(&snapshot);
+        messages[0].content.push_str(&redacted_snapshot);
+        let mut snapshot_fitted = true;
         if !fits(messages) || self.is_cancelled() {
+            snapshot_fitted = false;
             messages[0].content.truncate(original_len);
+            if !self.is_cancelled() && self.preseeded_workspace_snapshot.is_none() {
+                if let Some(paths_only) = workspace::initial_paths(cwd, self.cancellation.as_ref()) {
+                    let redacted_paths = self.redact_sensitive(&paths_only);
+                    messages[0].content.push_str(&redacted_paths);
+                    if !fits(messages) || self.is_cancelled() {
+                        messages[0].content.truncate(original_len);
+                    } else {
+                        snapshot_fitted = true;
+                        if let Some(handle) = &self.compaction_handle {
+                            handle.set_initial_workspace_snapshot(redacted_paths);
+                        }
+                    }
+                }
+            }
+        } else if let Some(handle) = &self.compaction_handle {
+            handle.set_initial_workspace_snapshot(redacted_snapshot);
+        }
+
+        if snapshot_fitted && !self.is_cancelled() {
+            if let Some(hint) = workspace::query_context_hint(cwd, &raw_user_prompt) {
+                let redacted_hint = self.redact_sensitive(&hint);
+                let pre_hint_len = messages[0].content.len();
+                messages[0].content.push_str(&redacted_hint);
+                if !fits(messages) || self.is_cancelled() {
+                    messages[0].content.truncate(pre_hint_len);
+                }
+            }
         }
     }
 
@@ -2032,14 +2660,48 @@ impl Runtime {
         mode: crate::OperatingMode,
         messages: &[ProviderMessage],
     ) -> mode::ChannelFrame {
+        self.channel_frame_for(mode, messages, false)
+    }
+
+    pub(super) fn channel_frame_for(
+        &self,
+        mode: crate::OperatingMode,
+        messages: &[ProviderMessage],
+        preserve_prior_modes: bool,
+    ) -> mode::ChannelFrame {
+        let frame = self.readonly_channel_frame_for(mode, messages, preserve_prior_modes);
+        self.record_channel_anchor(mode, messages, &frame);
+        frame
+    }
+
+    pub(super) fn readonly_channel_frame(
+        &self,
+        mode: crate::OperatingMode,
+        messages: &[ProviderMessage],
+    ) -> mode::ChannelFrame {
+        self.readonly_channel_frame_for(mode, messages, false)
+    }
+
+    pub(super) fn readonly_channel_frame_for(
+        &self,
+        mode: crate::OperatingMode,
+        messages: &[ProviderMessage],
+        preserve_prior_modes: bool,
+    ) -> mode::ChannelFrame {
         let prior = self
             .compaction_handle
             .as_ref()
-            .map(|handle| handle.channel_anchors(messages, mode))
+            .map(|handle| {
+                if preserve_prior_modes {
+                    handle.channel_anchors_preserving_modes(messages)
+                } else {
+                    handle.channel_anchors(messages, mode)
+                }
+            })
             .unwrap_or_default();
-        let frame = mode::ChannelFrame::with_prior(messages, self.mcp_awareness(mode), prior);
-        self.record_channel_anchor(mode, messages, &frame);
-        frame
+        let subagents_on = self.subagent_depth == 0 && self.subagents.is_some();
+        mode::ChannelFrame::with_prior(messages, self.mcp_awareness(mode), prior)
+            .with_subagents(subagents_on)
     }
 
     /// [`Self::channel_frame`] for a history a compaction just rewrote: the
@@ -2052,7 +2714,9 @@ impl Runtime {
         if let Some(handle) = &self.compaction_handle {
             handle.clear_channel_anchors();
         }
-        let frame = mode::ChannelFrame::rebuilt_for(messages, self.mcp_awareness(mode));
+        let subagents_on = self.subagent_depth == 0 && self.subagents.is_some();
+        let frame = mode::ChannelFrame::rebuilt_for(messages, self.mcp_awareness(mode))
+            .with_subagents(subagents_on);
         self.record_channel_anchor(mode, messages, &frame);
         frame
     }
@@ -2078,11 +2742,27 @@ impl Runtime {
 
     /// The MCP server block of the overlay as it is now (Auto only).
     pub(super) fn mcp_awareness(&self, mode: crate::OperatingMode) -> Option<String> {
-        self.mcp
+        if !mode.allows_mutation() {
+            return None;
+        }
+        let mut block = self
+            .mcp
             .as_ref()
-            .filter(|_| mode.allows_mutation())
-            .and_then(|manager| manager.awareness_block())
-            .map(|block| self.redact_sensitive(&block))
+            .and_then(|manager| manager.awareness_block_for(mode == crate::OperatingMode::Code));
+        if mode != crate::OperatingMode::Code {
+            let (_, deferred) = self.split_direct_mcp_definitions();
+            if !deferred.is_empty() {
+                let compact = crate::mcp::compact_deferred_direct_list(&deferred);
+                match &mut block {
+                    Some(existing) => {
+                        existing.push_str("\n\n");
+                        existing.push_str(&compact);
+                    }
+                    None => block = Some(compact),
+                }
+            }
+        }
+        block.map(|text| self.redact_sensitive(&text))
     }
 
     pub(super) fn overlay_channel<'a>(
@@ -2100,6 +2780,34 @@ impl Runtime {
         )
     }
 
+    fn prepare_overlay_request<A: ProviderAdapter>(
+        &self,
+        client: &HttpProviderClient<A>,
+        view: &[ProviderMessage],
+        tools: &[Value],
+    ) -> Result<PreparedProviderRequest, ProviderError> {
+        let mut request = match client.prepare_messages_with_tools(view, tools) {
+            Ok(request) => request,
+            Err(err) if client.adapter().wire_kind() == ProviderKind::Anthropic => {
+                if let Some(degraded) =
+                    crate::provider::image_limits::degrade_history_images_for_anthropic(view)
+                {
+                    client.prepare_messages_with_tools(&degraded, tools)?
+                } else {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(target) = self.model_override.as_deref() {
+            request = crate::provider::override_request_model(client.adapter(), request, target);
+        } else if self.deep_reasoning {
+            request =
+                crate::provider::raise_request_reasoning_effort(client.adapter(), request, "high");
+        }
+        Ok(request)
+    }
+
     pub(super) fn prepare_loop_request<A: ProviderAdapter>(
         &self,
         client: &HttpProviderClient<A>,
@@ -2109,13 +2817,26 @@ impl Runtime {
         frame: &mode::ChannelFrame,
     ) -> Result<PreparedProviderRequest, ProviderError> {
         let overlay = self.overlay_channel(messages, mode, frame);
-        client.prepare_messages_with_tools(overlay.view(), tools)
+        self.prepare_overlay_request(client, overlay.view(), tools)
     }
 
     pub(super) fn prepare_loop_capabilities(&mut self, cwd: &Path) -> Result<(), ProviderError> {
         self.restore_task_facts(&self.task_facts(), cwd)?;
-        // Bound skill-discovery memoization to one loop run.
-        self.skill_discovery_cache = None;
+        if let Some(handle) = &self.compaction_handle {
+            self.token_estimator = handle.token_estimator();
+        }
+        // Snapshot direct MCP tool definitions once per run so a lazy server
+        // finishing its handshake mid-run does not mutate `tools` and bust the
+        // provider prompt cache.
+        self.frozen_direct_mcp_tools = self
+            .mcp
+            .as_ref()
+            .map(|manager| manager.direct_tool_definitions());
+        // Bound skill-discovery memoization to one loop run (unless preseeded by parent).
+        self.skill_discovery_cache = self
+            .preseeded_skill_discovery
+            .take()
+            .filter(|(dir, _)| dir == cwd);
         self.write_projection_cache
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2161,22 +2882,6 @@ fn usage_source(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
 }
 
-/// Drops opaque reasoning state that another provider produced.
-fn retain_own_reasoning<A: ProviderAdapter>(adapter: &A, messages: &mut [ProviderMessage]) {
-    for message in messages {
-        message
-            .responses_reasoning
-            .retain(|state| state.belongs_to(adapter));
-        if message
-            .chat_reasoning
-            .as_ref()
-            .is_some_and(|state| !state.belongs_to(adapter))
-        {
-            message.chat_reasoning = None;
-        }
-    }
-}
-
 /// `then_run.final` when every call of the batch succeeded and the
 /// write/patch carrying it reported a passing fused check; the last one wins.
 fn then_run_final_answer(calls: &[ProviderToolCall], results: &[ToolResult]) -> Option<String> {
@@ -2194,4 +2899,38 @@ fn then_run_final_answer(calls: &[ProviderToolCall], results: &[ToolResult]) -> 
             let answer = arguments.get("then_run")?.get("final")?.as_str()?.trim();
             (!answer.is_empty()).then(|| answer.to_owned())
         })
+}
+
+fn is_verification_check_call(call: &ProviderToolCall) -> bool {
+    let command = match call.name.as_str() {
+        "shell" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|v| v.get("command").and_then(Value::as_str).map(str::to_owned)),
+        "write" | "patch" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("then_run")
+                    .and_then(|tr| tr.get("command"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        _ => None,
+    };
+    let Some(cmd) = command else {
+        return false;
+    };
+    let lower = cmd.to_ascii_lowercase();
+    [
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "pytest",
+        "npm test",
+        "vitest",
+        "jest",
+        "go test",
+        "tsc",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
 }

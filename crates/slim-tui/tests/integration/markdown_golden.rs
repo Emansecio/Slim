@@ -923,13 +923,6 @@ fn queued_user_stays_muted_without_prompt_surface() {
 }
 
 #[test]
-fn terminal_control_payload_is_not_materialized() {
-    let text = render("safe\u{1b}]52;c2VjcmV0\u{7}tail", 80).text();
-    assert!(text.contains("safetail"));
-    assert!(!text.contains("52;c2VjcmV0"));
-}
-
-#[test]
 fn every_untrusted_block_kind_strips_terminal_controls() {
     let payload = "safe\u{1b}]52;c2VjcmV0\u{7}tail";
     let kinds = vec![
@@ -1159,23 +1152,6 @@ fn command_palette_groups_session_and_runtime() {
     assert!(text.contains("execução"), "{text}");
     assert!(text.contains("/login"), "{text}");
     assert!(text.contains("/mode"), "{text}");
-}
-
-#[test]
-fn bounded_cache_does_not_cascade_miss_above_capacity() {
-    let mut state = AppState::new();
-    for index in 0..16_385 {
-        assert!(state.append_block(Block::new(
-            format!("cache-{index}"),
-            BlockKind::User("row".into()),
-            BlockLifecycle::Complete,
-        )));
-    }
-    let mut cache = WrapCache::default();
-    HeightIndex::build(state.blocks(), 80, &mut cache);
-    let before = cache.height_misses();
-    HeightIndex::build(state.blocks(), 80, &mut cache);
-    assert_eq!(cache.height_misses() - before, 1);
 }
 
 #[test]

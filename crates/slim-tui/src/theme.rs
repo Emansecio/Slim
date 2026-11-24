@@ -95,29 +95,75 @@ pub fn env_flag_from_value(value: Option<&std::ffi::OsStr>, default_enabled: boo
 }
 
 pub fn detect_capabilities() -> Capabilities {
+    let (mut capabilities, needs_probe) = detect_capabilities_fast();
+    if needs_probe {
+        capabilities.reduced_motion = resolve_os_reduced_motion();
+    }
+    capabilities
+}
+
+pub(crate) fn detect_capabilities_fast() -> (Capabilities, bool) {
     let no_color = std::env::var_os("NO_COLOR").is_some();
     let truecolor = std::env::var("COLORTERM")
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "truecolor" | "24bit"))
         .unwrap_or(false)
         || std::env::var_os("WT_SESSION").is_some();
-    Capabilities {
-        color_depth: if no_color {
-            ColorDepth::None
-        } else if truecolor {
-            ColorDepth::TrueColor
-        } else {
-            ColorDepth::Ansi16
+    let explicit_reduced_motion = std::env::var_os("SLIM_REDUCED_MOTION");
+    let (reduced_motion, needs_motion_probe) = detect_reduced_motion_fast_from(
+        explicit_reduced_motion.as_deref(),
+        cfg!(target_os = "macos"),
+        os_animations_enabled,
+    );
+    (
+        Capabilities {
+            color_depth: if no_color {
+                ColorDepth::None
+            } else if truecolor {
+                ColorDepth::TrueColor
+            } else {
+                ColorDepth::Ansi16
+            },
+            // Default on: capturing without in-app selection stole native copy/paste.
+            // SLIM_MOUSE=0 restores the previous "leave the mouse to the terminal" mode.
+            mouse: env_flag_enabled("SLIM_MOUSE", true),
+            clipboard: cfg!(any(windows, target_os = "macos"))
+                || std::env::var_os("SLIM_CLIPBOARD").is_some_and(|value| value == "1"),
+            images: std::env::var_os("SLIM_IMAGES").is_some_and(|value| value == "1"),
+            reduced_motion,
         },
-        // Default on: capturing without in-app selection stole native copy/paste.
-        // SLIM_MOUSE=0 restores the previous "leave the mouse to the terminal" mode.
-        mouse: env_flag_enabled("SLIM_MOUSE", true),
-        clipboard: cfg!(any(windows, target_os = "macos"))
-            || std::env::var_os("SLIM_CLIPBOARD").is_some_and(|value| value == "1"),
-        images: std::env::var_os("SLIM_IMAGES").is_some_and(|value| value == "1"),
-        reduced_motion: reduced_motion_from(
-            std::env::var_os("SLIM_REDUCED_MOTION").as_deref(),
-            os_animations_enabled(),
-        ),
+        needs_motion_probe,
+    )
+}
+
+pub(crate) fn resolve_os_reduced_motion() -> bool {
+    os_animations_enabled() == Some(false)
+}
+
+fn detect_reduced_motion_fast_from(
+    explicit: Option<&std::ffi::OsStr>,
+    is_macos: bool,
+    os_animations_enabled: impl FnOnce() -> Option<bool>,
+) -> (bool, bool) {
+    match explicit.and_then(|value| value.to_str()) {
+        Some("1") => (true, false),
+        Some("0") => (false, false),
+        _ if is_macos => (true, true),
+        _ => (os_animations_enabled() == Some(false), false),
+    }
+}
+
+/// Motion preference with lazy OS fallback. An explicit `SLIM_REDUCED_MOTION=1`
+/// or `=0` always decides without invoking `os_animations_enabled`; without it
+/// the operating system's "animation effects" setting decides, and an unknown
+/// setting keeps motion on.
+pub fn reduced_motion_from_lazy(
+    explicit: Option<&std::ffi::OsStr>,
+    os_animations_enabled: impl FnOnce() -> Option<bool>,
+) -> bool {
+    match explicit.and_then(|value| value.to_str()) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => os_animations_enabled() == Some(false),
     }
 }
 
@@ -128,11 +174,7 @@ pub fn reduced_motion_from(
     explicit: Option<&std::ffi::OsStr>,
     os_animations_enabled: Option<bool>,
 ) -> bool {
-    match explicit.and_then(|value| value.to_str()) {
-        Some("1") => true,
-        Some("0") => false,
-        _ => os_animations_enabled == Some(false),
-    }
+    reduced_motion_from_lazy(explicit, || os_animations_enabled)
 }
 
 /// Windows "Show animations" (Settings, Accessibility, Visual effects).
@@ -161,7 +203,7 @@ fn os_animations_enabled() -> Option<bool> {
 /// never set or `defaults` does not answer.
 #[cfg(target_os = "macos")]
 fn os_animations_enabled() -> Option<bool> {
-    let output = std::process::Command::new("defaults")
+    let output = std::process::Command::new("/usr/bin/defaults")
         .args(["read", "com.apple.universalaccess", "reduceMotion"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -380,6 +422,63 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_lazy_short_circuits_and_macos_provisional_probe_defers() {
+        use std::cell::Cell;
+        use std::ffi::OsStr;
+
+        let queried = Cell::new(false);
+        assert!(super::reduced_motion_from_lazy(
+            Some(OsStr::new("1")),
+            || {
+                queried.set(true);
+                Some(true)
+            }
+        ));
+        assert!(!queried.get());
+
+        assert!(!super::reduced_motion_from_lazy(
+            Some(OsStr::new("0")),
+            || {
+                queried.set(true);
+                Some(false)
+            }
+        ));
+        assert!(!queried.get());
+
+        assert!(super::reduced_motion_from_lazy(None, || {
+            queried.set(true);
+            Some(false)
+        }));
+        assert!(queried.get());
+
+        let probed = Cell::new(false);
+        assert_eq!(
+            super::detect_reduced_motion_fast_from(Some(OsStr::new("0")), true, || {
+                probed.set(true);
+                Some(false)
+            }),
+            (false, false)
+        );
+        assert!(!probed.get());
+        assert_eq!(
+            super::detect_reduced_motion_fast_from(None, true, || {
+                probed.set(true);
+                Some(true)
+            }),
+            (true, true)
+        );
+        assert!(!probed.get());
+        assert_eq!(
+            super::detect_reduced_motion_fast_from(None, false, || {
+                probed.set(true);
+                Some(false)
+            }),
+            (true, false)
+        );
+        assert!(probed.get());
+    }
+
+    #[test]
     fn mixing_two_tokens_is_exact_at_the_ends_and_clamps_outside_them() {
         let (black, white) = ((0, 0, 0), (200, 100, 50));
         assert_eq!(super::mix_rgb(black, white, 0.0), black);
@@ -424,12 +523,6 @@ mod tests {
                 None
             );
         }
-    }
-
-    #[test]
-    fn asking_the_system_for_its_animation_setting_does_not_panic() {
-        // The answer depends on the machine; only the call itself is checked.
-        let _ = super::os_animations_enabled();
     }
 
     #[test]

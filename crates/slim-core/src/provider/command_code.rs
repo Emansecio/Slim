@@ -354,12 +354,26 @@ impl ProviderAdapter for CommandCodeAdapter {
         self.wire.capabilities()
     }
 
+    fn closing_tool_choice(&self) -> Option<Value> {
+        self.wire.closing_tool_choice()
+    }
+
+    fn compaction_low_effort(&self) -> Option<&'static str> {
+        super::gateway_reasoning_levels(self.kind(), &self.model_id)
+            .contains(&"low")
+            .then_some("low")
+    }
+
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
         self.wire.materialize_prompt_cache_intent(body);
     }
 
     fn response_cache_scope_id(&self) -> Option<u64> {
         self.wire.response_cache_scope_id()
+    }
+
+    fn reasoning_scope_fingerprint(&self) -> u64 {
+        self.wire.reasoning_scope_fingerprint()
     }
 
     fn system_prompt_for_budget(&self) -> Option<&str> {

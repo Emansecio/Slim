@@ -230,7 +230,7 @@ pub(super) fn recoverable_provider_error(error: &ProviderError) -> bool {
     }
 }
 
-pub(super) const MAX_AUTOMATIC_RECOVERIES: u32 = 6;
+pub(super) const MAX_AUTOMATIC_RECOVERIES: u32 = 8;
 
 /// Failure texts that double as identities: created where the failure is
 /// detected and compared by the recovery policy.
@@ -277,10 +277,12 @@ pub(super) fn request_emitted_tools(app: &AppHandle, event_start: usize) -> bool
         })
 }
 
-pub(super) const MAX_PROVIDER_RECOVERIES: u32 = 2;
+pub(super) const MAX_PROVIDER_RECOVERIES: u32 = 4;
 
 pub(super) const MAX_PROVIDER_RECOVERY_WAIT: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+const FAST_TRANSPORT_FIRST_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(super) fn provider_recovery_backoff(
     base: std::time::Duration,
@@ -290,22 +292,58 @@ pub(super) fn provider_recovery_backoff(
     base.saturating_mul(1u32 << shift)
 }
 
+fn is_rate_limit_or_overload(error: &ProviderError) -> bool {
+    if matches!(error.status(), Some(429 | 529)) {
+        return true;
+    }
+    matches!(
+        error,
+        ProviderError::Api { metadata, .. }
+            if matches!(
+                metadata.classification_code(),
+                Some(
+                    "rate_limit_error"
+                        | "rate_limit_exceeded"
+                        | "too_many_requests"
+                        | "slow_down"
+                        | "overloaded_error"
+                        | "overloaded"
+                        | "server_is_overloaded"
+                )
+            )
+    )
+}
+
 pub(super) fn requested_provider_recovery_delay(
     error: &ProviderError,
     attempt: u32,
     base: std::time::Duration,
 ) -> std::time::Duration {
-    let backoff = provider_recovery_backoff(base, attempt);
-    match error {
-        ProviderError::Api { metadata, .. } => {
-            backoff.max(metadata.retry_after.unwrap_or_default())
-        }
-        ProviderError::Http {
-            retry_after: Some(delay),
-            ..
-        } => backoff.max(*delay),
-        _ => backoff,
+    let explicit_retry_after = match error {
+        ProviderError::Api { metadata, .. } => metadata.retry_after,
+        ProviderError::Http { retry_after, .. } => *retry_after,
+        _ => None,
+    };
+    if let Some(delay) = explicit_retry_after {
+        return delay;
     }
+    let backoff = if attempt == 1 && !is_rate_limit_or_overload(error) {
+        base.min(FAST_TRANSPORT_FIRST_RETRY)
+    } else {
+        provider_recovery_backoff(base, attempt)
+    };
+    // Add small bounded jitter (0..=20%) on rate-limit/overload or >=2nd
+    // attempt so parallel Swarm workers do not collide on retry.
+    if backoff.is_zero() || (attempt == 1 && !is_rate_limit_or_overload(error)) {
+        return backoff;
+    }
+    let jitter_cap_ms = (backoff.as_millis() as u64 / 5).max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter_ms = nanos % (jitter_cap_ms + 1);
+    backoff.saturating_add(std::time::Duration::from_millis(jitter_ms))
 }
 
 pub(super) fn provider_recovery_delay(
@@ -477,6 +515,7 @@ impl Runtime {
         st.recovery.empty_recovery_used = true;
         st.recovery.automatic_recoveries += 1;
         st.recovery.provider_recoveries += 1;
+        st.routing.reset_delta_chain();
         self.append_conversation_message(st.messages, ProviderMessage::user(
             "The provider returned an empty response. Produce an effective answer or make the needed tool call; do not return an empty response.",
         ))?;
@@ -527,6 +566,7 @@ impl Runtime {
         attempt: &AttemptCtx,
     ) -> Result<ProviderAttempt, ProviderError> {
         let note = self.pending_argument_repair.take().unwrap_or_default();
+        st.routing.reset_delta_chain();
         let partial = assistant_text_since(&self.app, attempt.event_start);
         if !partial.is_empty() {
             self.append_conversation_message(
@@ -574,6 +614,7 @@ impl Runtime {
     ) -> Result<ProviderAttempt, ProviderError> {
         st.recovery.overflow_retry_used = true;
         st.recovery.overflow_compaction_pending = true;
+        st.routing.reset_delta_chain();
         st.next_seq = self.observed_next_seq(st.next_seq);
         Ok(ProviderAttempt::Retry)
     }

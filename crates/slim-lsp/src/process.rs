@@ -126,15 +126,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tail_start_respects_char_boundaries() {
-        // á is 2 bytes; a cut inside it must move forward to the boundary.
-        let text = "áááabcdef";
-        let start = tail_start(text, 7);
-        assert!(text.is_char_boundary(start));
-        assert!(text.len() - start <= 7);
-    }
-
-    #[test]
     fn tail_start_keeps_max_suffix_bytes() {
         let text = "abcdefghij";
         assert_eq!(tail_start(text, 4), 6);

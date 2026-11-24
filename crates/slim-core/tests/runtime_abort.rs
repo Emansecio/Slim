@@ -729,6 +729,9 @@ fn cancellation_during_mcp_call_finishes_lifecycle_with_uncertain_output_and_con
             name: "ping".into(),
             description: Some("controlled cancellation fixture".into()),
             schema: json!({"type":"object"}),
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
         }],
     );
 
@@ -927,6 +930,9 @@ data: [DONE]
             name: "ping".into(),
             description: None,
             schema: json!({"type":"object"}),
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
         }],
     );
 

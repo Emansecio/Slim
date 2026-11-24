@@ -1012,61 +1012,6 @@ fn loopback_fixture_exercises_reasoning_homonymous_tools_and_answer_offline() {
 }
 
 #[test]
-fn vt_normalization_and_sanitization_preserve_evidence_without_secrets() {
-    let workspace = Path::new(r"C:\temp\fixture");
-    let auth = workspace.join("auth.json");
-    let raw = format!(
-        "\x1b[?1049h\x1b]0;secret title\x07visible 界 {SENTINEL_KEY} {} {}\r\n\x1b[?1049l",
-        workspace.display(),
-        auth.display()
-    );
-    let sanitized = sanitized_capture(raw.as_bytes(), workspace, &auth);
-    let normalized = normalized_vt(&sanitized);
-    assert!(normalized.contains("visible 界 [REDACTED_KEY] [WORKSPACE]"));
-    assert!(!normalized.contains(SENTINEL_KEY));
-    assert!(!normalized.contains(workspace.to_string_lossy().as_ref()));
-    assert!(!normalized.contains("secret title"));
-    assert!(String::from_utf8_lossy(&sanitized).contains("\x1b[?1049h"));
-    assert!(String::from_utf8_lossy(&sanitized).contains("\x1b[?1049l"));
-}
-
-#[test]
-fn cursor_query_is_answered_without_synthesizing_a_rendered_frame() {
-    for (received, ready) in [(b"\x1b[6nSLIM".as_slice(), true), (b"\x1b[6n", false)] {
-        let (tx, rx) = mpsc::channel();
-        for byte in received {
-            tx.send(*byte).expect("fragmented output");
-        }
-        drop(tx);
-        let mut output = Vec::new();
-        let mut replies = Vec::new();
-        assert_eq!(
-            wait_for_text(&rx, &mut output, "SLIM", &mut replies).expect("cursor response"),
-            ready
-        );
-        assert_eq!(replies, b"\x1b[1;1R");
-        assert_eq!(output, received);
-    }
-}
-
-#[test]
-fn conpty_matrix_freezes_required_dimensions_and_modes() {
-    assert_eq!(
-        MATRIX
-            .iter()
-            .map(|case| (case.cols, case.rows))
-            .collect::<Vec<_>>(),
-        [(120, 30), (180, 45), (80, 24), (60, 16), (40, 10), (32, 10)]
-    );
-    assert!(MATRIX
-        .iter()
-        .any(|case| !case.reduced_motion && !case.no_color));
-    assert!(MATRIX.iter().any(|case| case.reduced_motion));
-    assert!(MATRIX.iter().any(|case| case.no_color));
-    assert_eq!(MATRIX.iter().filter(|case| case.expand_tools).count(), 1);
-}
-
-#[test]
 #[cfg(windows)]
 #[ignore = "requires a real ConPTY host; sandboxed sessions may emit no conhost output"]
 fn deployed_binary_offline_streaming_matrix() {

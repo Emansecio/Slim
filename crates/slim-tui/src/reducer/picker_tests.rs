@@ -33,6 +33,7 @@ fn turns(count: usize) -> Vec<TurnListItem> {
             index,
             first_seq: index as u64 * 10 + 2,
             prompt: format!("prompt {index}"),
+            has_checkpoint: false,
         })
         .collect()
 }
@@ -245,13 +246,61 @@ fn rewind_lists_newest_first_and_enter_sends_the_turns_sequence() {
         PickerKind::Rewind
     );
     let effects = press(&mut state, KeyCode::Enter);
-    assert!(effects.contains(&Effect::Send(UiCommand::RewindSession { first_seq: 22 })));
+    assert!(effects.contains(&Effect::Send(UiCommand::RewindSession {
+        first_seq: 22,
+        restore_files: false,
+    })));
     assert!(state.session_picker.is_none());
 
     let mut state = open_rewind(3);
     press(&mut state, KeyCode::End);
     let effects = press(&mut state, KeyCode::Enter);
-    assert!(effects.contains(&Effect::Send(UiCommand::RewindSession { first_seq: 2 })));
+    assert!(effects.contains(&Effect::Send(UiCommand::RewindSession {
+        first_seq: 2,
+        restore_files: false,
+    })));
+}
+
+#[test]
+fn rewind_picker_restores_checkpoint_by_default_shift_enter_skips_files_and_undo_command() {
+    let mut state = AppState::new();
+    let effects = submit(&mut state, "/rewind");
+    let request_id = list_request(&effects).expect("turns request");
+    let items = vec![TurnListItem {
+        index: 0,
+        first_seq: 12,
+        prompt: "editar arquivo".into(),
+        has_checkpoint: true,
+    }];
+    state.apply_event(UiEvent::TurnsListed {
+        request_id,
+        items: items.clone(),
+        error: None,
+    });
+    let effects = press(&mut state, KeyCode::Enter);
+    assert!(effects.contains(&Effect::Send(UiCommand::RewindSession {
+        first_seq: 12,
+        restore_files: true,
+    })));
+
+    let effects = submit(&mut state, "/rewind");
+    let request_id = list_request(&effects).expect("turns request 2");
+    state.apply_event(UiEvent::TurnsListed {
+        request_id,
+        items,
+        error: None,
+    });
+    let effects = reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    );
+    assert!(effects.contains(&Effect::Send(UiCommand::RewindSession {
+        first_seq: 12,
+        restore_files: false,
+    })));
+
+    let effects = submit(&mut state, "/rewind --undo");
+    assert!(effects.contains(&Effect::Send(UiCommand::UndoLastRewind)));
 }
 
 #[test]

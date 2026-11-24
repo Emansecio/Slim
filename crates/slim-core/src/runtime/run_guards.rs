@@ -6,8 +6,8 @@
 //!   the native `read`;
 //! - a read, native or shell, that would return more than
 //!   [`MAX_READ_LINES`] lines;
-//! - a full `write` over an existing file worth a `patch`: the first one in a
-//!   run goes through with a note, a later one is held;
+//! - a full `write` over an existing file worth a `patch` goes through with a
+//!   note: holding it would make the model send the whole file again;
 //! - a shell command run again right after it failed, or after it failed
 //!   twice in a row.
 //!
@@ -115,8 +115,11 @@ pub(super) struct RunGuards {
     held: HashSet<String>,
     /// Ids of the calls a guard held, until their results are recorded.
     holding: HashSet<String>,
-    rewrote: bool,
     pending: HashMap<String, Pending>,
+    consecutive_patch_failures: u32,
+    consecutive_single_read_turns: u32,
+    patch_health_advised: bool,
+    read_batch_health_advised: bool,
 }
 
 impl RunGuards {
@@ -129,6 +132,22 @@ impl RunGuards {
     /// Holds `prepared` back when a guard applies; otherwise remembers what
     /// its outcome must settle.
     pub(super) fn admit(&mut self, call_id: &str, prepared: &mut PreparedToolInvocation) {
+        self.admit_inner(call_id, prepared, true);
+    }
+
+    /// Like [`admit`](Self::admit) for internal `codemode` calls: reads are not
+    /// shown directly to the model (`shown == false`), so bounded reads skip
+    /// synchronous disk line-counting on the async host thread.
+    pub(super) fn admit_codemode(&mut self, call_id: &str, prepared: &mut PreparedToolInvocation) {
+        self.admit_inner(call_id, prepared, false);
+    }
+
+    fn admit_inner(
+        &mut self,
+        call_id: &str,
+        prepared: &mut PreparedToolInvocation,
+        track_reads: bool,
+    ) {
         if prepared.error.is_some() {
             return;
         }
@@ -149,10 +168,23 @@ impl RunGuards {
                 }
                 hold
             }
-            PreparedToolArguments::Read { offset, max_lines } => prepared
-                .target_paths
-                .first()
-                .and_then(|path| self.admit_read(call_id, path, *offset, *max_lines)),
+            PreparedToolArguments::Read {
+                offset,
+                max_lines,
+                outline,
+                ranges,
+                symbols,
+                ..
+            } => {
+                if *outline || !ranges.is_empty() || !symbols.is_empty() {
+                    None
+                } else {
+                    prepared
+                        .target_paths
+                        .first()
+                        .and_then(|path| self.admit_read(call_id, path, *offset, *max_lines, track_reads))
+                }
+            }
             _ => {
                 if prepared
                     .spec
@@ -174,6 +206,47 @@ impl RunGuards {
     /// call repeated does.
     pub(super) fn was_held(&mut self, call_id: &str) -> bool {
         self.holding.remove(call_id)
+    }
+
+    /// Observes tool-batch ergonomics and emits a one-shot advisory when a
+    /// run shows repeated patch failures (>=3) or repeated single-read turns (>=4).
+    pub(super) fn observe_batch_health(
+        &mut self,
+        calls: &[crate::provider::ProviderToolCall],
+        results: &[crate::tools::ToolResult],
+    ) -> Option<String> {
+        for (call, result) in calls.iter().zip(results.iter()) {
+            if call.name == "patch" {
+                if result.success {
+                    self.consecutive_patch_failures = 0;
+                } else {
+                    self.consecutive_patch_failures =
+                        self.consecutive_patch_failures.saturating_add(1);
+                }
+            }
+        }
+        if calls.len() == 1 && calls[0].name == "read" {
+            self.consecutive_single_read_turns =
+                self.consecutive_single_read_turns.saturating_add(1);
+        } else {
+            self.consecutive_single_read_turns = 0;
+        }
+
+        if !self.patch_health_advised && self.consecutive_patch_failures >= 3 {
+            self.patch_health_advised = true;
+            return Some(
+                "[harness advisory] 3+ consecutive patch failures — read the exact target lines (or use read with outline/ranges) before patching again, or use write if edits span most of the file."
+                    .into(),
+            );
+        }
+        if !self.read_batch_health_advised && self.consecutive_single_read_turns >= 4 {
+            self.read_batch_health_advised = true;
+            return Some(
+                "[harness advisory] 4+ consecutive single-read turns — batch independent read calls in one turn (or use read with ranges/symbols/outline) to cut round-trip latency."
+                    .into(),
+            );
+        }
+        None
     }
 
     fn admit_shell(
@@ -246,16 +319,29 @@ impl RunGuards {
         path: &Path,
         offset: usize,
         max_lines: Option<usize>,
+        track_reads: bool,
     ) -> Option<String> {
         let (path, stamp) = locate(path)?;
         let first = offset.max(1);
         let lines = read_page_lines(first, max_lines, stamp.len);
         let first = u64::try_from(first).unwrap_or(END);
+        let wanted = u64::try_from(lines).unwrap_or(END);
+        if !track_reads {
+            // CodeMode never remembers read spans (`shown == false`) and filters in JS RAM;
+            // allow up to `MAX_READ_LINES_CAP` lines while avoiding serial disk scans on small reads.
+            let code_cap = u64::try_from(crate::tools::MAX_READ_LINES_CAP).unwrap_or(4096);
+            let over = first.saturating_add(code_cap);
+            if wanted <= code_cap || stamp.len < over {
+                return None;
+            }
+            if count_lines(&path, over).is_some_and(|count| count >= over) {
+                return Some(format!("{}: this read would return more than {code_cap} lines. Find the part you need with search, or read up to {code_cap} lines per call with max_lines and offset.", file_name(&path)));
+            }
+            return None;
+        }
         let span = Span {
             start: Start::Line(first),
-            to: first
-                .saturating_add(u64::try_from(lines).unwrap_or(END))
-                .saturating_sub(1),
+            to: first.saturating_add(wanted).saturating_sub(1),
             numbered: false,
         };
         let Some(span) = fit(span, &path) else {
@@ -274,17 +360,8 @@ impl RunGuards {
             return None;
         }
         let name = file_name(path);
-        if !self.rewrote {
-            self.rewrote = true;
-            self.pending
-                .insert(call_id.to_owned(), Pending::Rewrite { name });
-            return None;
-        }
-        let key = format!("write\0{}", path.display());
-        if self.held.insert(key.clone()) {
-            return Some(format!("{name} exists; change it with patch, not a full write. If a full rewrite is intended, retry the same write."));
-        }
-        self.held.remove(&key);
+        self.pending
+            .insert(call_id.to_owned(), Pending::Rewrite { name });
         None
     }
 
@@ -381,7 +458,7 @@ fn locate(path: &Path) -> Option<(PathBuf, Stamp)> {
 /// many. `None` when it cannot be read, or is too long to tell.
 fn count_lines(path: &Path, cap: u64) -> Option<u64> {
     let mut file = std::fs::File::open(path).ok()?;
-    let mut chunk = vec![0u8; 64 * 1024];
+    let mut chunk = [0u8; 16 * 1024];
     let (mut lines, mut scanned, mut line_start) = (0u64, 0u64, true);
     loop {
         let read = file.read(&mut chunk).ok()?;
@@ -1045,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_full_rewrite_is_noted_and_a_later_one_is_held_once() {
+    fn the_first_full_rewrite_is_noted_and_so_is_a_later_one() {
         let mut rig = Rig::new("rewrite");
         let big = "x".repeat(4096);
         for name in ["a.txt", "b.txt"] {
@@ -1058,16 +1135,12 @@ mod tests {
         let note = rig.guards.settle("1", true, true).expect("note");
         assert!(note.starts_with("You rewrote all of a.txt."), "{note}");
 
-        let held = rig.admit("2", "write", write("b.txt")).unwrap_err();
         assert!(
-            held.starts_with("b.txt exists; change it with patch"),
-            "{held}"
+            rig.admit("2", "write", write("b.txt")).is_ok(),
+            "a later rewrite is not held: its tokens are already spent"
         );
-        assert!(
-            rig.admit("3", "write", write("b.txt")).is_ok(),
-            "a deliberate rewrite goes through"
-        );
-        assert_eq!(rig.guards.settle("3", true, true), None);
+        let note = rig.guards.settle("2", true, true).expect("note");
+        assert!(note.starts_with("You rewrote all of b.txt."), "{note}");
 
         assert!(
             rig.admit("4", "write", write("small.txt")).is_ok(),
@@ -1077,5 +1150,65 @@ mod tests {
             rig.admit("5", "write", write("new.txt")).is_ok(),
             "new files are left alone"
         );
+    }
+
+    #[test]
+    fn health_advisories_fire_once_at_thresholds_and_reset_cleanly() {
+        let mut guards = super::RunGuards::default();
+        let patch_call = crate::provider::ProviderToolCall {
+            id: "p".into(),
+            name: "patch".into(),
+            arguments: "{}".into(),
+        };
+        let fail_patch = crate::tools::ToolResult::fail("patch", "err");
+        let ok_patch = crate::tools::ToolResult::ok("patch", "ok");
+        assert!(guards
+            .observe_batch_health(&[patch_call.clone()], &[fail_patch.clone()])
+            .is_none());
+        assert!(guards
+            .observe_batch_health(&[patch_call.clone()], &[ok_patch])
+            .is_none());
+        assert!(guards
+            .observe_batch_health(&[patch_call.clone()], &[fail_patch.clone()])
+            .is_none());
+        assert!(guards
+            .observe_batch_health(&[patch_call.clone()], &[fail_patch.clone()])
+            .is_none());
+        let first_adv = guards
+            .observe_batch_health(&[patch_call.clone()], &[fail_patch.clone()])
+            .expect("3 consecutive failed patches should emit advisory");
+        assert!(first_adv.contains("3+ consecutive patch failures"));
+        // Never fires twice.
+        assert!(guards
+            .observe_batch_health(&[patch_call], &[fail_patch])
+            .is_none());
+
+        let read_call = crate::provider::ProviderToolCall {
+            id: "r".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let ok_read = crate::tools::ToolResult::ok("read", "content");
+        for _ in 0..3 {
+            assert!(guards
+                .observe_batch_health(std::slice::from_ref(&read_call), std::slice::from_ref(&ok_read))
+                .is_none());
+        }
+        // Batched read resets the streak.
+        assert!(guards
+            .observe_batch_health(&[read_call.clone(), read_call.clone()], &[ok_read.clone(), ok_read.clone()])
+            .is_none());
+        for _ in 0..3 {
+            assert!(guards
+                .observe_batch_health(std::slice::from_ref(&read_call), std::slice::from_ref(&ok_read))
+                .is_none());
+        }
+        let read_adv = guards
+            .observe_batch_health(std::slice::from_ref(&read_call), std::slice::from_ref(&ok_read))
+            .expect("4 consecutive single-read turns should emit advisory");
+        assert!(read_adv.contains("4+ consecutive single-read turns"));
+        assert!(guards
+            .observe_batch_health(&[read_call], &[ok_read])
+            .is_none());
     }
 }

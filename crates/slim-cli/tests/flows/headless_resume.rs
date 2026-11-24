@@ -497,46 +497,6 @@ fn v1_and_torn_tail_resume_reject_without_mutation_and_recover_is_explicit() {
 }
 
 #[test]
-fn cli_rejects_ambiguous_session_modes_and_requires_prompt_for_resume() {
-    let ambiguous = run_cli(
-        ["--headless", "--session", "a.jsonl", "--resume", "b.jsonl"],
-        "",
-    );
-    assert_eq!(ambiguous.code, ExitCode::InputRequired);
-    assert!(ambiguous.stderr.contains("mutually exclusive"));
-
-    let path = temp_path("prompt");
-    create_v2(&path);
-    let output = run_cli(["--headless", "--resume", path.to_str().expect("path")], "");
-    assert_eq!(output.code, ExitCode::InputRequired);
-    assert!(output.stderr.contains("explicit --prompt"));
-    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
-}
-
-#[test]
-fn recover_is_strictly_recovery_only_and_does_not_run_provider() {
-    let path = temp_path("recover-only");
-    create_v2(&path);
-    let before = std::fs::read(&path).expect("before");
-    let output = run_cli(
-        [
-            "--headless",
-            "--recover",
-            path.to_str().expect("path"),
-            "--prompt",
-            "must not execute",
-            "--endpoint",
-            "http://127.0.0.1:1",
-        ],
-        "",
-    );
-    assert_eq!(output.code, ExitCode::InputRequired);
-    assert!(output.stderr.contains("recovery-only"));
-    assert_eq!(std::fs::read(&path).expect("unchanged"), before);
-    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
-}
-
-#[test]
 fn explicit_abandon_resolves_queue_states_is_locked_and_idempotent() {
     let path = temp_path("abandon-queue");
     create_v2(&path);

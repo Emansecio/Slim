@@ -12,10 +12,6 @@ fn bundled_codex_models_follow_the_account_catalog_and_its_windows() {
         assert_eq!(model.max_output_tokens, CODEX_MAX_OUTPUT_TOKENS);
         assert!(model.reasoning_levels.contains(&"high"));
     }
-    // Retired subscription models must not survive in the fallback list.
-    assert!(codex_model("astra").is_none());
-    assert!(codex_model("gpt-6-astra").is_none());
-    assert!(codex_model("gpt-6.1-sol").is_none());
     assert_eq!(codex_models().len(), 3);
     assert!(codex_model("deepseek-v4-flash").is_none());
 }

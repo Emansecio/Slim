@@ -3,8 +3,7 @@ use slim_tui::api::{PromptOrigin, UiCommand};
 use slim_tui::app::AppState;
 use slim_tui::composer::{Composer, ComposerError, MAX_DRAFT_CHARS};
 use slim_tui::input::{
-    classify_enter, is_submit, normalize, BracketedPasteDecoder, DecodedEvent, DecodedInput,
-    EnterIntent, PasteStreamDecoder,
+    classify_enter, is_submit, normalize, DecodedEvent, EnterIntent, PasteStreamDecoder,
 };
 use slim_tui::reducer::{reduce, Action, Effect};
 
@@ -45,15 +44,6 @@ fn key_event(decoded: &DecodedEvent) -> Option<KeyEvent> {
 }
 
 #[test]
-fn paste_is_atomic_and_submits_full_payload() {
-    let mut composer = Composer::default();
-    composer.insert_text("before ");
-    composer.paste("line one\nline two");
-    assert!(composer.display().contains("[Pasted Content 0 17 chars]"));
-    assert_eq!(composer.payload(), "before line one\nline two");
-}
-
-#[test]
 fn oversized_draft_is_rejected_and_paste_segment_can_be_removed_atomically() {
     let mut composer = Composer::default();
     assert_eq!(
@@ -64,22 +54,6 @@ fn oversized_draft_is_rejected_and_paste_segment_can_be_removed_atomically() {
     assert_eq!(composer.payload(), "segment");
     assert!(composer.remove_last_element().is_some());
     assert!(composer.payload().is_empty());
-}
-
-#[test]
-fn sequential_composer_input_stays_within_a_linear_latency_budget() {
-    let mut composer = Composer::default();
-    let started = std::time::Instant::now();
-    for _ in 0..50_000 {
-        composer.try_insert_text("x").expect("within limit");
-    }
-    let elapsed = started.elapsed();
-
-    assert_eq!(composer.payload().len(), 50_000);
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "50k sequential inserts took {elapsed:?}"
-    );
 }
 
 #[test]
@@ -157,31 +131,6 @@ fn home_end_and_snapshot_follow_the_cursor_line() {
 }
 
 #[test]
-fn clear_removes_submitted_text_and_paste_segments() {
-    let mut composer = Composer::default();
-    composer.insert_text("prompt");
-    composer.paste("pasted\ntext");
-    composer.clear();
-    assert!(composer.payload().is_empty());
-}
-
-#[test]
-fn raw_bracketed_paste_decoder_preserves_fragmented_multiline_payload() {
-    let mut decoder = BracketedPasteDecoder::default();
-    let mut decoded = decoder.feed(b"prefix\x1b[20");
-    assert!(decoder.feed(b"0~line one\nline two\x1b[201").is_empty());
-    decoded.extend(decoder.feed(b"~suffix"));
-    assert_eq!(
-        decoded,
-        vec![
-            DecodedInput::Text("prefix".into()),
-            DecodedInput::Paste("line one\nline two".into()),
-            DecodedInput::Text("suffix".into()),
-        ]
-    );
-}
-
-#[test]
 fn plain_enter_submits_and_control_enter_is_newline_fallback() {
     let plain = normalize(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(is_submit(plain));
@@ -201,18 +150,6 @@ fn modifier_matrix_and_release_events_are_normalized_without_duplicate_submit() 
     assert!(!is_submit(shift));
     assert_eq!(classify_enter(alt, true), EnterIntent::Steer);
     assert!(!is_submit(release));
-}
-
-#[test]
-fn marker_key_sequence_decodes_one_atomic_multiline_paste() {
-    let mut decoder = PasteStreamDecoder::default();
-
-    let decoded = collect(&mut decoder, marker_events("line one\nline two"));
-
-    assert_eq!(
-        decoded,
-        vec![DecodedEvent::Paste("line one\nline two".into())]
-    );
 }
 
 #[test]

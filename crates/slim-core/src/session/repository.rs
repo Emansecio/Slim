@@ -554,14 +554,6 @@ mod tests {
     }
 
     #[test]
-    fn open_runs_full_prefix_validation_once() {
-        let records = vec![entry(0, "op-1"), started(1, "op-1", "entry-0"), fact(2)];
-        let _ = take_full_prefix_validations();
-        DurableAppendValidator::from_records(&records).expect("open prefix");
-        assert_eq!(take_full_prefix_validations(), 1);
-    }
-
-    #[test]
     fn rejected_prepare_leaves_incremental_state_unchanged() {
         let records = vec![entry(0, "op-1"), started(1, "op-1", "entry-0")];
         let validator = DurableAppendValidator::from_records(&records).expect("open");

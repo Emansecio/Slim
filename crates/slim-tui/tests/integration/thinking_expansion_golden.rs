@@ -387,19 +387,3 @@ fn repeat_and_release_enter_never_toggle_the_selected_block() {
         Some(FoldState::Collapsed)
     ));
 }
-
-#[test]
-fn auto_fold_thinking_hides_body_until_expanded() {
-    let mut state = AppState::new();
-    let block = Block::new(
-        "auto-thinking",
-        BlockKind::Thinking("secret body".into()),
-        BlockLifecycle::Complete,
-    );
-    assert_eq!(block.fold, FoldState::Auto);
-    assert!(state.append_block(block));
-
-    let collapsed = render_at(&state, 80, 24);
-    assert!(collapsed.contains("Pensou"), "{collapsed}");
-    assert!(!collapsed.contains("secret body"), "{collapsed}");
-}

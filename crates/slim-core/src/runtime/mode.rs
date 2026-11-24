@@ -14,9 +14,11 @@ pub fn mode_name(mode: crate::OperatingMode) -> &'static str {
 pub(super) const CHANNEL_MARKER: &str = "\n\nHarness channel:";
 
 const PROJECTION_CACHE_BYTES: usize = 1024 * 1024;
-const PROJECTION_CACHE_ENTRIES: usize = 16;
-/// Smaller `write` arguments are not worth eliding.
-const MIN_ELIDED_ARGUMENT_BYTES: usize = 4096;
+const PROJECTION_CACHE_ENTRIES: usize = 64;
+/// Smaller `write`, `patch` or `codemode` arguments are not worth eliding.
+const MIN_ELIDED_WRITE_BYTES: usize = 1536;
+const MIN_ELIDED_PATCH_BYTES: usize = 1536;
+const MIN_ELIDED_CODEMODE_BYTES: usize = 384;
 
 struct CachedWrite {
     id: String,
@@ -78,6 +80,8 @@ pub(super) struct ChannelFrame {
     /// carried then. They keep it so the provider still finds the prefix it
     /// cached for those runs.
     prior: Vec<(usize, String)>,
+    /// Whether ad-hoc `subagent` / `subagent_control` tools are advertised on this turn.
+    subagents: bool,
 }
 
 impl ChannelFrame {
@@ -95,7 +99,13 @@ impl ChannelFrame {
             anchor: messages.iter().rposition(|message| message.role == "user"),
             mcp_servers,
             prior,
+            subagents: false,
         }
+    }
+
+    pub(super) fn with_subagents(mut self, enabled: bool) -> Self {
+        self.subagents = enabled;
+        self
     }
 
     /// The frame for `messages` that replace the history this one described.
@@ -123,6 +133,9 @@ impl ChannelFrame {
             text.push_str("\n\n");
             text.push_str(block);
         }
+        if self.subagents && mode != crate::OperatingMode::Code {
+            text.push_str("\n\nAd-hoc subagents: you may call `subagent` (up to 6 concurrently in one turn or with `background: true`) to parallelize independent analyses, exploration, audits, or edits using the conversation's active model (`model_tier` defaults to `\"same\"`; opt into `\"fast\"` or `\"deep\"`, `isolation: \"worktree\"`, `output_format`, `max_result_chars`, `fork_context: true`, `max_tokens`, `timeout_ms`). Use `subagent_control` to check status, wait, pause, resume (even after completion with `id` + `message` preserving transcript/cache), message (`steer`/`queue`), or cancel.");
+        }
         text
     }
 }
@@ -136,19 +149,9 @@ pub(super) struct ChannelOverlay<'a> {
 }
 
 impl<'a> ChannelOverlay<'a> {
-    #[cfg(test)]
-    pub(super) fn apply(
-        messages: &'a mut [ProviderMessage],
-        mode: crate::OperatingMode,
-        can_ask: bool,
-        cache: Option<&mut WriteProjectionCache>,
-    ) -> Self {
-        Self::apply_with_mcp(messages, mode, can_ask, cache, &ChannelFrame::default())
-    }
-
-    /// [`Self::apply`] at the frame's message, with its MCP server awareness
-    /// block (Auto only), which follows the stanza and is stripped with it.
-    /// Without a usable anchor the newest user message carries them.
+    /// Applies the channel stanza and MCP awareness block at the frame's
+    /// message (Code/Auto), stripping prior stale stanzas and restoring them on
+    /// drop. Without a usable anchor the newest user message carries them.
     pub(super) fn apply_with_mcp(
         messages: &'a mut [ProviderMessage],
         mode: crate::OperatingMode,
@@ -237,18 +240,19 @@ fn project_completed_writes(
 fn reconcile_cache(cache: &mut WriteProjectionCache, messages: &[ProviderMessage]) {
     cache.entries.retain(|entry| {
         messages.iter().any(|message| {
-            message
-                .tool_calls
-                .iter()
-                .any(|call| call.id == entry.id && call.arguments == entry.arguments)
+            message.tool_calls.iter().any(|call| {
+                call.id == entry.id
+                    && call.arguments.len() == entry.arguments.len()
+                    && call.arguments == entry.arguments
+            })
         })
     });
     cache.bytes = cache.entries.iter().map(CachedWrite::bytes).sum();
 }
 
-/// The elided arguments for the `write` call `call` (in `messages[index]`), or
-/// `None` when it must stay verbatim. A fresh projection is remembered in
-/// `cache`.
+/// The elided arguments for a completed large `write` or `codemode` call (in
+/// `messages[index]`), or `None` when it must stay verbatim. A fresh
+/// projection is remembered in `cache`.
 fn project_call(
     messages: &[ProviderMessage],
     index: usize,
@@ -256,16 +260,33 @@ fn project_call(
     cache: Option<&mut WriteProjectionCache>,
 ) -> Option<String> {
     use sha2::{Digest, Sha256};
-    if call.name != "write" || call.arguments.len() <= MIN_ELIDED_ARGUMENT_BYTES {
+    let min_bytes = match call.name.as_str() {
+        "write" => MIN_ELIDED_WRITE_BYTES,
+        "patch" => MIN_ELIDED_PATCH_BYTES,
+        "codemode" | "batch_code" => MIN_ELIDED_CODEMODE_BYTES,
+        _ => return None,
+    };
+    if call.arguments.len() <= min_bytes {
         return None;
     }
     let succeeded = |receipt: &str| {
         messages[index + 1..].iter().any(|result| {
             result.role == "tool"
-                && result.name.as_deref() == Some("write")
+                && result.name.as_deref() == Some(call.name.as_str())
                 && result.tool_call_id.as_deref() == Some(call.id.as_str())
-                && result.content.starts_with("written ")
-                && result.content.contains(receipt)
+                && match call.name.as_str() {
+                    "write" => {
+                        result.content.starts_with("written ") && result.content.contains(receipt)
+                    }
+                    "patch" => result.content.starts_with("patched "),
+                    "codemode" | "batch_code" => {
+                        !result.content.starts_with("codemode failed after ")
+                            && !result.content.starts_with("batch_code failed after ")
+                            && !result.content.starts_with("codemode is not available ")
+                            && !result.content.starts_with("batch_code is disabled")
+                    }
+                    _ => false,
+                }
         })
     };
     if let Some(entry) = cache.as_deref().and_then(|cache| {
@@ -278,21 +299,83 @@ fn project_call(
         return succeeded(&entry.receipt).then(|| entry.projected.clone());
     }
     let mut arguments = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
-    let content = arguments.get("content")?.as_str()?;
-    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
-    let receipt = format!(
-        "; bytes={}; sha256={}; exists=true;",
-        content.len(),
-        &hash[..12]
-    );
-    if !succeeded(&receipt) {
-        return None;
-    }
-    arguments["content"] = serde_json::Value::String(format!(
-        "[successful write content elided; bytes={}; sha256={hash}; read the file if needed]",
-        content.len()
-    ));
-    let projected = arguments.to_string();
+    let (receipt, projected) = match call.name.as_str() {
+        "write" => {
+            let content = arguments.get("content")?.as_str()?;
+            let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+            let receipt = format!(
+                "; bytes={}; sha256={}; exists=true;",
+                content.len(),
+                &hash[..12]
+            );
+            if !succeeded(&receipt) {
+                return None;
+            }
+            arguments["content"] = serde_json::Value::String(format!(
+                "[successful write content elided; bytes={}; sha256={hash}; read the file if needed]",
+                content.len()
+            ));
+            (receipt, arguments.to_string())
+        }
+        "patch" => {
+            if !succeeded("") {
+                return None;
+            }
+            let obj = arguments.as_object_mut()?;
+            let edits_count = obj
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .map_or(1, Vec::len);
+            if !obj.contains_key("edits")
+                && !obj.contains_key("expected")
+                && !obj.contains_key("replacement")
+            {
+                return None;
+            }
+            obj.remove("expected");
+            obj.remove("replacement");
+            let hash = format!("{:x}", Sha256::digest(call.arguments.as_bytes()));
+            obj.insert(
+                "edits".into(),
+                serde_json::Value::String(format!(
+                    "[successful patch elided; edits={edits_count}; bytes={}; sha256={}]",
+                    call.arguments.len(),
+                    &hash[..12]
+                )),
+            );
+            (String::new(), arguments.to_string())
+        }
+        "codemode" | "batch_code" => {
+            if !succeeded("") {
+                return None;
+            }
+            let code = arguments.get("code")?.as_str()?;
+            let hash = format!("{:x}", Sha256::digest(code.as_bytes()));
+            let summary = crate::tools::summarize_tool_arguments_for(call.name.as_str(), &call.arguments)
+                .replace("*/", "* /")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let tool_label = call.name.as_str();
+            let note = if summary.is_empty() {
+                format!(
+                    "/* completed {tool_label} program elided; bytes={}; sha256={} */",
+                    code.len(),
+                    &hash[..12]
+                )
+            } else {
+                format!(
+                    "/* completed {tool_label} program elided; bytes={}; sha256={}; first={summary} */",
+                    code.len(),
+                    &hash[..12]
+                )
+            };
+            arguments["code"] = serde_json::Value::String(note);
+            (String::new(), arguments.to_string())
+        }
+        _ => return None,
+    };
     if projected.len() >= call.arguments.len() {
         return None;
     }
@@ -364,8 +447,16 @@ pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'sta
 /// tools whose result belongs to the conversation (a question, the visible
 /// plan, skill instructions, a stored artifact). Workspace and MCP tools are
 /// reached from a `codemode` program, which calls the registry itself.
-const CODE_MODE_DIRECT_TOOLS: [&str; 5] =
-    ["codemode", "artifact_read", "ask_question", "todo", "skill"];
+const CODE_MODE_DIRECT_TOOLS: [&str; 8] = [
+    "codemode",
+    "artifact_read",
+    "history_recall",
+    "ask_question",
+    "todo",
+    "skill",
+    "subagent",
+    "subagent_control",
+];
 
 /// Refusal for a provider call that Code mode does not accept directly.
 /// `None` in every other mode and for the tools Code mode advertises.
@@ -378,10 +469,39 @@ pub(super) fn code_mode_direct_refusal(mode: crate::OperatingMode, name: &str) -
     })
 }
 
+/// Refusal when the model mimics prior Code-mode history and calls `codemode`
+/// in Auto mode even though no MCP servers are enabled.
+pub(super) fn auto_mode_codemode_refusal(
+    mode: crate::OperatingMode,
+    name: &str,
+    mcp_enabled: bool,
+) -> Option<String> {
+    (mode == crate::OperatingMode::Auto && name == "codemode" && !mcp_enabled).then(|| {
+        "codemode is not available in Auto mode without MCP servers; call native workspace tools (read, list, search, write, patch, shell) directly".to_owned()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{channel_stanza, CHANNEL_MARKER};
     use crate::OperatingMode;
+
+    impl<'a> super::ChannelOverlay<'a> {
+        pub(super) fn apply(
+            messages: &'a mut [crate::provider::ProviderMessage],
+            mode: OperatingMode,
+            can_ask: bool,
+            cache: Option<&mut super::WriteProjectionCache>,
+        ) -> Self {
+            Self::apply_with_mcp(
+                messages,
+                mode,
+                can_ask,
+                cache,
+                &super::ChannelFrame::default(),
+            )
+        }
+    }
 
     fn cached_write_fixture(count: usize) -> Vec<crate::provider::ProviderMessage> {
         use crate::provider::{ProviderMessage, ProviderToolCall};
@@ -495,7 +615,7 @@ mod tests {
             retained.iter().collect::<Vec<_>>()
         );
         // A compacted history releases old entries and admits the remaining ones.
-        messages.drain(1..41);
+        messages.drain(1..61);
         drop(super::ChannelOverlay::apply(
             &mut messages,
             OperatingMode::Auto,
@@ -836,5 +956,186 @@ mod tests {
         let refusal = code_mode_direct_refusal(OperatingMode::Code, &long).unwrap();
         assert!(refusal.starts_with(&"x".repeat(64)));
         assert!(!refusal.starts_with(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn completed_large_codemode_calls_are_elided_while_failed_ones_stay_verbatim() {
+        use crate::provider::{ProviderMessage, ProviderToolCall};
+        let big_code = format!("const ok = true;\n{}", "// pad\n".repeat(700));
+        let mid_code = format!("const mid = 1;\n{}", "// pad\n".repeat(200));
+        let tiny_code = "return 42;";
+        let fail_code = format!("const fail = true;\n{}", "// pad\n".repeat(700));
+        let mut messages = vec![
+            ProviderMessage::user("run"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "c1".into(),
+                    name: "codemode".into(),
+                    arguments: serde_json::json!({"code": big_code}).to_string(),
+                }],
+            ),
+            ProviderMessage::tool("codemode", "c1", "{\"done\":true}"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "c2".into(),
+                    name: "codemode".into(),
+                    arguments: serde_json::json!({"code": fail_code}).to_string(),
+                }],
+            ),
+            ProviderMessage::tool(
+                "codemode",
+                "c2",
+                "codemode failed after 0 tool call(s); stored values and prior tool effects remain, do not replay the cell automatically.\nError: boom",
+            ),
+            ProviderMessage::assistant(
+                "",
+                vec![
+                    ProviderToolCall {
+                        id: "c3".into(),
+                        name: "codemode".into(),
+                        arguments: serde_json::json!({"code": mid_code}).to_string(),
+                    },
+                    ProviderToolCall {
+                        id: "c4".into(),
+                        name: "codemode".into(),
+                        arguments: serde_json::json!({"code": tiny_code}).to_string(),
+                    },
+                ],
+            ),
+            ProviderMessage::tool("codemode", "c3", "1"),
+            ProviderMessage::tool("codemode", "c4", "42"),
+        ];
+        let mut cache = super::WriteProjectionCache::default();
+        let overlay = super::ChannelOverlay::apply(
+            &mut messages,
+            OperatingMode::Code,
+            false,
+            Some(&mut cache),
+        );
+        let view = overlay.view();
+        let ok_args = &view[1].tool_calls[0].arguments;
+        assert!(ok_args.contains("completed codemode program elided"));
+        assert!(ok_args.contains("first=const ok = true;"));
+        assert!(view[3].tool_calls[0].arguments.contains("const fail = true;"));
+        let mid_args = &view[5].tool_calls[0].arguments;
+        assert!(
+            mid_args.contains("completed codemode program elided"),
+            "1.5 KiB cell above 1 KiB threshold should elide: {mid_args}"
+        );
+        assert!(mid_args.contains("first=const mid = 1;"));
+        assert_eq!(
+            view[5].tool_calls[1].arguments,
+            serde_json::json!({"code": tiny_code}).to_string()
+        );
+        drop(overlay);
+        assert!(messages[1].tool_calls[0].arguments.contains("// pad"));
+        assert!(messages[5].tool_calls[0].arguments.contains("// pad"));
+    }
+
+    #[test]
+    fn auto_mode_refuses_codemode_only_when_mcp_is_absent() {
+        use super::auto_mode_codemode_refusal;
+        let refusal = auto_mode_codemode_refusal(OperatingMode::Auto, "codemode", false)
+            .expect("Auto without MCP must guide back to native tools");
+        assert!(refusal.contains("native workspace tools"));
+        assert_eq!(
+            auto_mode_codemode_refusal(OperatingMode::Auto, "codemode", true),
+            None
+        );
+        assert_eq!(
+            auto_mode_codemode_refusal(OperatingMode::Code, "codemode", false),
+            None
+        );
+        assert_eq!(
+            auto_mode_codemode_refusal(OperatingMode::Auto, "read", false),
+            None
+        );
+    }
+
+    #[test]
+    fn codemode_elides_medium_programs_above_384_bytes_and_keeps_refused_calls_verbatim() {
+        use crate::provider::{ProviderMessage, ProviderToolCall};
+        let medium = format!("const ok = 1;\n{}", "// pad\n".repeat(70));
+        assert!(medium.len() > super::MIN_ELIDED_CODEMODE_BYTES && medium.len() < 1024);
+        let refused_code = format!("const bad = 1;\n{}", "// pad\n".repeat(70));
+        let mut messages = vec![
+            ProviderMessage::user("run"),
+            ProviderMessage::assistant(
+                "",
+                vec![
+                    ProviderToolCall {
+                        id: "m1".into(),
+                        name: "codemode".into(),
+                        arguments: serde_json::json!({"code": medium}).to_string(),
+                    },
+                    ProviderToolCall {
+                        id: "m2".into(),
+                        name: "codemode".into(),
+                        arguments: serde_json::json!({"code": refused_code}).to_string(),
+                    },
+                ],
+            ),
+            ProviderMessage::tool("codemode", "m1", "{\"ok\":true}"),
+            ProviderMessage::tool(
+                "codemode",
+                "m2",
+                "codemode is not available in Auto mode without MCP servers; call native workspace tools directly",
+            ),
+        ];
+        let overlay = super::ChannelOverlay::apply(&mut messages, OperatingMode::Code, false, None);
+        assert!(overlay.view()[1].tool_calls[0]
+            .arguments
+            .contains("completed codemode program elided"));
+        assert!(overlay.view()[1].tool_calls[1]
+            .arguments
+            .contains("const bad = 1;"));
+    }
+
+    #[test]
+    fn completed_large_patch_calls_are_projected_while_failures_stay_verbatim() {
+        use crate::provider::{ProviderMessage, ProviderToolCall};
+        let big_expected = "old line;\n".repeat(200);
+        let big_replacement = "new line;\n".repeat(200);
+        let ok_args = serde_json::json!({
+            "path": "src/lib.rs",
+            "edits": [{"expected": big_expected, "replacement": big_replacement}]
+        })
+        .to_string();
+        let fail_args = serde_json::json!({
+            "path": "src/other.rs",
+            "edits": [{"expected": big_expected, "replacement": big_replacement}]
+        })
+        .to_string();
+        assert!(ok_args.len() > super::MIN_ELIDED_PATCH_BYTES);
+        let mut messages = vec![
+            ProviderMessage::user("patch files"),
+            ProviderMessage::assistant(
+                "",
+                vec![
+                    ProviderToolCall {
+                        id: "p1".into(),
+                        name: "patch".into(),
+                        arguments: ok_args.clone(),
+                    },
+                    ProviderToolCall {
+                        id: "p2".into(),
+                        name: "patch".into(),
+                        arguments: fail_args.clone(),
+                    },
+                ],
+            ),
+            ProviderMessage::tool("patch", "p1", "patched src/lib.rs; 1 edits applied atomically"),
+            ProviderMessage::tool("patch", "p2", "patch failed: expected text not found\nCurrent file is below:"),
+        ];
+        let mut cache = super::WriteProjectionCache::default();
+        let overlay = super::ChannelOverlay::apply(&mut messages, OperatingMode::Auto, false, Some(&mut cache));
+        let p1 = &overlay.view()[1].tool_calls[0].arguments;
+        assert!(p1.contains("successful patch elided; edits=1"), "{p1}");
+        assert!(!p1.contains("old line;"));
+        assert_eq!(overlay.view()[1].tool_calls[1].arguments, fail_args);
+        drop(overlay);
+        assert_eq!(messages[1].tool_calls[0].arguments, ok_args);
     }
 }

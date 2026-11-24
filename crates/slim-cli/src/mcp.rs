@@ -243,6 +243,15 @@ pub(crate) fn load_mcp_from(
     workspace: &Path,
     session_trust: bool,
 ) -> McpLoad {
+    load_mcp_from_cached(layered, workspace, session_trust, None)
+}
+
+pub(crate) fn load_mcp_from_cached(
+    layered: &crate::config::LayeredConfig,
+    workspace: &Path,
+    session_trust: bool,
+    cached_decision: Option<&Result<Option<TrustDecision>, String>>,
+) -> McpLoad {
     let needs_trust = layered
         .mcp
         .servers
@@ -253,7 +262,15 @@ pub(crate) fn load_mcp_from(
     let trusted = if !needs_trust || session_trust {
         true
     } else {
-        match TrustStore::default_store().and_then(|store| store.decision(workspace)) {
+        let fetched;
+        let decision = match cached_decision {
+            Some(decision) => decision,
+            None => {
+                fetched = TrustStore::default_store().and_then(|store| store.decision(workspace));
+                &fetched
+            }
+        };
+        match decision {
             Ok(Some(TrustDecision::Trusted)) => true,
             Ok(Some(TrustDecision::Denied)) => {
                 denied = true;
@@ -261,7 +278,7 @@ pub(crate) fn load_mcp_from(
             }
             Ok(None) => false,
             Err(error) => {
-                trust_error = Some(error);
+                trust_error = Some(error.clone());
                 false
             }
         }
@@ -319,6 +336,18 @@ pub(crate) fn build_mcp_manager(load: &McpLoad, cwd: &Path) -> Option<Arc<McpMan
     }
     manager.set_startup_wait(load.startup_wait);
     Some(Arc::new(manager))
+}
+
+pub(crate) fn build_empty_mcp_manager(cwd: &Path) -> Arc<McpManager> {
+    let mut manager = McpManager::new(
+        std::collections::BTreeMap::new(),
+        cwd.to_path_buf(),
+        ExecutableResolver::default(),
+    );
+    if let Some(path) = mcp_log_path() {
+        manager = manager.with_log_path(path);
+    }
+    Arc::new(manager)
 }
 
 /// Before the first model request of a session: waits (bounded by

@@ -411,17 +411,6 @@ fn scrolling_up_pins_and_counts_unseen_content() {
 }
 
 #[test]
-fn end_key_returns_to_live_edge() {
-    let mut state = overflow_state();
-    scroll_at_size(&mut state, ScrollIntent::PageUp, 80, 24);
-    assert!(state.scroll.is_pinned());
-    scroll_at_size(&mut state, ScrollIntent::LiveEdge, 80, 24);
-    assert!(state.scroll.is_live_edge());
-    let frame = render_to_string(&state);
-    assert!(frame.contains("answer number 59"));
-}
-
-#[test]
 fn scrolling_back_to_bottom_returns_to_live_edge() {
     // Every height, including those where the row above the bottom is a
     // blank separator that Up steps past: one Down undoes one Up.

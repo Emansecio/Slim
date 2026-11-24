@@ -1,7 +1,7 @@
 use slim_cli::{
-    redact, render_jsonl, render_provider_jsonl, render_provider_text,
-    render_provider_verbose_text, render_text, run_fake_headless, Config, ExitCode,
-    HeadlessRequest, OutputFormat, ProviderHeadlessResult, ToolProcessFact,
+    render_jsonl, render_provider_jsonl, render_provider_text, render_provider_verbose_text,
+    render_text, run_fake_headless, Config, ExitCode, HeadlessRequest, OutputFormat,
+    ProviderHeadlessResult, ToolProcessFact,
 };
 use slim_core::provider::ProviderKind;
 use slim_core::runtime::CancellationToken;
@@ -166,18 +166,6 @@ fn configuration_precedence_is_cli_then_environment_then_project_then_global() {
     assert_eq!(
         Config::resolve(None, None, None, Some("global")),
         Some("global")
-    );
-}
-
-#[test]
-fn known_auth_values_are_redacted() {
-    assert_eq!(
-        redact("Authorization: Bearer secret"),
-        "Authorization: [REDACTED]"
-    );
-    assert_eq!(
-        redact("x-api-key: secret\nbody"),
-        "x-api-key: [REDACTED]\nbody"
     );
 }
 

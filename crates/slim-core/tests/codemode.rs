@@ -538,3 +538,268 @@ fn cancelling_a_sent_mcp_call_stops_the_cell_without_replay() {
         slim_core::EventKind::ToolOutput { output, .. } if output.contains("uncertain"))));
     executor.block_on(manager.disconnect_all());
 }
+
+#[test]
+fn code_mode_finish_concludes_in_one_turn_and_verifies_goal_assurance() {
+    let root = TempRoot::new("codemode-finish");
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn before() {}\n").unwrap();
+
+    let (client, provider) = provider(
+        vec![(
+            "codemode",
+            json!({
+                "code": r#"
+                    await slim.write({
+                        path: 'src/lib.rs',
+                        expected: "pub fn before() {}\n",
+                        content: "pub fn after() -> usize {\n    1\n}\n"
+                    });
+                    await slim.shell({ command: 'cargo', args: ['fmt', '--check'] });
+                    finish('All green');
+                    return { ok: true };
+                "#
+            }),
+        )],
+        false,
+    );
+    let mut runtime = Runtime::new();
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let result = executor
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "implement after",
+            OperatingMode::Code,
+            root.path(),
+            0,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    let requests = provider.join().unwrap();
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(result.turns, 1);
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let assistant_text: String = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            slim_core::EventKind::AssistantTextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_text, "All green");
+    assert_eq!(
+        runtime.conversation().last().map(|m| m.content.as_str()),
+        Some("All green")
+    );
+    assert_eq!(
+        runtime
+            .app
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind {
+                slim_core::EventKind::GoalAssurance { verified } => Some(verified),
+                _ => None,
+            })
+            .next_back(),
+        Some(true)
+    );
+}
+
+#[test]
+fn code_mode_governor_stops_stagnant_read_loops_and_read_plus_error_streaks() {
+    let root = TempRoot::new("codemode-guards");
+    std::fs::write(root.path().join("a.txt"), "hello\n").unwrap();
+
+    // Part A: repeated identical read-only cells stop via CausalGovernor (NoProgress).
+    let (client, provider_a) = provider(
+        vec![
+            ("codemode", json!({"code": "return await slim.read({ path: 'a.txt' });"})),
+            ("codemode", json!({"code": "return await slim.read({ path: 'a.txt' });"})),
+            ("codemode", json!({"code": "return await slim.read({ path: 'a.txt' });"})),
+            ("codemode", json!({"code": "return await slim.read({ path: 'a.txt' });"})),
+        ],
+        true,
+    );
+    let mut runtime = Runtime::new();
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let result_a = executor
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "read repeatedly",
+            OperatingMode::Code,
+            root.path(),
+            0,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    let requests_a = provider_a.join().unwrap();
+    assert_eq!(result_a.stop, AgentLoopStop::NoProgress);
+    assert_eq!(result_a.turns, 4);
+    assert_eq!(requests_a.len(), 5);
+
+    // Part B: 3 zero-effect cells that read then throw the same error stop via LoopGuard.
+    let (client, provider_b) = provider(
+        vec![
+            (
+                "codemode",
+                json!({"code": "const step = 1;\nawait slim.read({ path: 'a.txt' });\nthrow new TypeError('boom');"}),
+            ),
+            (
+                "codemode",
+                json!({"code": "const step = 2;\nawait slim.read({ path: 'a.txt' });\nthrow new TypeError('boom');"}),
+            ),
+            (
+                "codemode",
+                json!({"code": "const step = 3;\nawait slim.read({ path: 'a.txt' });\nthrow new TypeError('boom');"}),
+            ),
+        ],
+        true,
+    );
+    let mut runtime = Runtime::new();
+    let result_b = executor
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "fail repeatedly after read",
+            OperatingMode::Code,
+            root.path(),
+            0,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    let requests_b = provider_b.join().unwrap();
+    assert_eq!(result_b.stop, AgentLoopStop::RepeatedFailedTool);
+    assert_eq!(result_b.turns, 3);
+    assert_eq!(requests_b.len(), 4);
+}
+
+#[test]
+fn code_mode_finish_yields_when_user_steer_is_pending() {
+    let root = TempRoot::new("codemode-finish-steer");
+    std::fs::write(root.path().join("a.txt"), "hello\n").unwrap();
+    let inbox = slim_core::runtime::SteerInbox::default();
+    let inbox_for_server = inbox.clone();
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let mut stream = accept_within(&listener, Duration::from_secs(8));
+            let request = read_http_request(&mut stream);
+            requests.push(serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1).unwrap());
+            if index == 0 {
+                // Simulate user sending a steer after turn 0 began.
+                inbox_for_server.push("Wait, also check b.txt".into());
+                let args = json!({
+                    "code": r#"
+                        await slim.read({ path: 'a.txt' });
+                        finish('premature finish');
+                        return { ok: true };
+                    "#
+                });
+                let chunk = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-0","function":{"name":"codemode","arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+                write_sse(&mut stream, &format!("data: {chunk}\n\ndata: [DONE]\n\n"));
+            } else {
+                write_sse(&mut stream, SSE_FINAL_ANSWER);
+            }
+        }
+        requests
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(5)).unwrap();
+    let mut runtime = Runtime::new();
+    runtime.set_steer_inbox(inbox);
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let result = executor
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "check a.txt",
+            OperatingMode::Code,
+            root.path(),
+            0,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    let requests = server.join().unwrap();
+    // Because a steer arrived during turn 0, finish() must NOT close early;
+    // turn 1 must receive the steer message.
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(requests.len(), 2, "expected second turn to handle pending steer");
+    assert!(
+        requests[1].to_string().contains("Wait, also check b.txt"),
+        "second turn request must include delivered steer: {}",
+        requests[1]
+    );
+}
+
+#[test]
+fn multiple_codemode_calls_in_same_turn_keep_isolated_effect_summaries() {
+    let root = TempRoot::new("codemode-multi-cell-turn");
+    std::fs::write(root.path().join("a.txt"), "before\n").unwrap();
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        for index in 0..2 {
+            let mut stream = accept_within(&listener, Duration::from_secs(8));
+            let _ = read_http_request(&mut stream);
+            if index == 0 {
+                // First cell mutates a.txt and calls finish('all done'); second cell
+                // in the same turn is read-only. Cell 1's mutation & finish must not
+                // be clobbered by cell 2.
+                let args0 = json!({
+                    "code": "await slim.write({ path: 'a.txt', expected: 'before\\n', content: 'after\\n' }); finish('all done'); return 'w';"
+                });
+                let args1 = json!({
+                    "code": "return await slim.read({ path: 'a.txt' });"
+                });
+                let chunk = json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call-mut","function":{"name":"codemode","arguments":args0.to_string()}},
+                    {"index":1,"id":"call-ro","function":{"name":"codemode","arguments":args1.to_string()}}
+                ]},"finish_reason":"tool_calls"}]});
+                write_sse(&mut stream, &format!("data: {chunk}\n\ndata: [DONE]\n\n"));
+                break;
+            }
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(5)).unwrap();
+    let mut runtime = Runtime::new();
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let result = executor
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "edit and read",
+            OperatingMode::Code,
+            root.path(),
+            0,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 1, "finish() from first cell should survive second read-only cell");
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+        "after\n"
+    );
+    assert_eq!(
+        runtime.conversation().last().map(|m| m.content.as_str()),
+        Some("all done")
+    );
+}

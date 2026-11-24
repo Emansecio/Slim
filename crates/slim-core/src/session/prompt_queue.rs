@@ -67,3 +67,87 @@ impl PromptQueueJournal {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "slim-prompt-queue-{label}-{}-{stamp}-{seq}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn open_save_open_roundtrip() {
+        let root = TempDir::new("roundtrip");
+        let mut journal = PromptQueueJournal::open(&root.0, "session-1").expect("open fresh");
+        assert_eq!(journal.snapshot(), &PromptQueueSnapshot::default());
+
+        let saved = PromptQueueSnapshot {
+            pending: vec!["queued-1".into(), "queued-2".into()],
+            in_flight: Some("active".into()),
+            recovery_draft: Some("draft".into()),
+        };
+        journal.save(saved.clone()).expect("save snapshot");
+        assert_eq!(journal.snapshot(), &saved);
+        drop(journal);
+
+        let reopened = PromptQueueJournal::open(&root.0, "session-1").expect("reopen");
+        assert_eq!(reopened.snapshot(), &saved);
+    }
+
+    #[test]
+    fn save_unchanged_snapshot_is_noop() {
+        let root = TempDir::new("noop");
+        let mut journal = PromptQueueJournal::open(&root.0, "session-noop").expect("open fresh");
+        journal
+            .save(PromptQueueSnapshot::default())
+            .expect("default save is no-op");
+        assert_eq!(journal.repo.records().len(), 0);
+
+        let snapshot = PromptQueueSnapshot {
+            pending: vec!["one".into()],
+            in_flight: None,
+            recovery_draft: None,
+        };
+        journal.save(snapshot.clone()).expect("first save");
+        assert_eq!(journal.repo.records().len(), 1);
+        let len_after_first = std::fs::metadata(journal.repo.path())
+            .expect("metadata")
+            .len();
+
+        journal.save(snapshot.clone()).expect("duplicate save");
+        assert_eq!(journal.repo.records().len(), 1);
+        let len_after_duplicate = std::fs::metadata(journal.repo.path())
+            .expect("metadata")
+            .len();
+        assert_eq!(len_after_first, len_after_duplicate);
+        drop(journal);
+
+        let reopened = PromptQueueJournal::open(&root.0, "session-noop").expect("reopen");
+        assert_eq!(reopened.snapshot(), &snapshot);
+    }
+}

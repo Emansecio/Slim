@@ -108,10 +108,14 @@ pub(super) struct CallIds {
 
 impl CallIds {
     pub(super) fn new(prepared: &PreparedToolInvocation, batch_id: &str, call_id: &str) -> Self {
+        Self::named(batch_id, call_id, &prepared.name)
+    }
+
+    pub(super) fn named(batch_id: &str, call_id: &str, tool_name: &str) -> Self {
         Self {
             batch_id: bounded_identifier(batch_id),
             call_id: bounded_identifier(call_id),
-            tool_name: bounded_identifier(&prepared.name),
+            tool_name: bounded_identifier(tool_name),
         }
     }
 }

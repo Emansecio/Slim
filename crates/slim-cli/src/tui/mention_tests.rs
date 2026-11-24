@@ -199,3 +199,24 @@ fn unreadable_workspace_still_answers_so_the_popup_does_not_wait() {
     }
     assert!(answered);
 }
+
+#[test]
+fn line_range_and_symbol_mentions_attach_only_selected_slices() {
+    let root = workspace("surgical");
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn one() {\n    println!(\"1\");\n}\n\npub fn two() -> usize {\n    99\n}\n",
+    )
+    .unwrap();
+    let attachments = load_prompt_mentions(
+        &root,
+        "compare @src/lib.rs#L1-L3 with @src/lib.rs::two",
+    )
+    .expect("surgical mentions");
+    assert_eq!(attachments.blocks.len(), 2);
+    assert!(block_text(&attachments.blocks[0]).contains("src/lib.rs#L1-L3"));
+    assert!(!block_text(&attachments.blocks[0]).contains("99"));
+    assert!(block_text(&attachments.blocks[1]).contains("src/lib.rs::two (L5-L7)"));
+    assert!(block_text(&attachments.blocks[1]).contains("99"));
+    let _ = fs::remove_dir_all(root);
+}

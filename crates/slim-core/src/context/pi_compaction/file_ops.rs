@@ -96,6 +96,133 @@ impl FileOperations {
         }
     }
 
+    /// Extracts file operations across a full conversation span, verifying
+    /// tool outcomes so failed writes/patches do not pollute `<modified-files>`,
+    /// and also capturing file mutations reported inside `codemode` runs.
+    pub fn extract_from_history(&mut self, messages: &[ProviderMessage]) {
+        let mut tool_outputs: HashMap<&str, &str> = HashMap::new();
+        for message in messages {
+            if message.role == "tool" {
+                if let Some(id) = message.tool_call_id.as_deref() {
+                    let body = message
+                        .recorded_content
+                        .as_deref()
+                        .unwrap_or(&message.content);
+                    tool_outputs.insert(id, body);
+                }
+            }
+        }
+        for message in messages {
+            if message.role != "assistant" {
+                continue;
+            }
+            for call in &message.tool_calls {
+                let output = tool_outputs.get(call.id.as_str()).copied();
+                if matches!(call.name.as_str(), "codemode" | "batch_code") {
+                    let failed = output.is_some_and(|out| {
+                        out.starts_with("codemode failed after ")
+                            || out.starts_with("batch_code failed after ")
+                            || out.starts_with("codemode is not available ")
+                    });
+                    if !failed {
+                        if let Some(out) = output {
+                            self.extract_codemode_output(out);
+                        }
+                        if let Ok(serde_json::Value::Object(args)) =
+                            serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        {
+                            if let Some(code) = args.get("code").and_then(serde_json::Value::as_str) {
+                                self.extract_codemode_code_ops(code);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let Ok(serde_json::Value::Object(arguments)) =
+                    serde_json::from_str::<serde_json::Value>(&call.arguments)
+                else {
+                    continue;
+                };
+                let Some(path) = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|path| !path.is_empty())
+                else {
+                    continue;
+                };
+                let failed = output.is_some_and(tool_output_looks_failed);
+                match call.name.as_str() {
+                    "read" if !failed => self.add_read(path),
+                    "write" if !failed => self.add_written(path),
+                    "patch" if !failed => self.add_edited(path),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn extract_codemode_output(&mut self, output: &str) {
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("written ") {
+                let path = rest.split(';').next().unwrap_or("").trim();
+                if !path.is_empty() && !path.contains(' ') {
+                    self.add_written(path);
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("patched ") {
+                let path = rest.split(';').next().unwrap_or("").trim();
+                if !path.is_empty() && !path.contains(' ') {
+                    self.add_edited(path);
+                }
+            }
+        }
+    }
+
+    fn extract_codemode_code_ops(&mut self, code: &str) {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Read,
+            ReadMany,
+            Write,
+            Edit,
+        }
+        let needles = [
+            ("slim.read(", Kind::Read),
+            ("slim.readMany(", Kind::ReadMany),
+            ("slim.write(", Kind::Write),
+            ("slim.patch(", Kind::Edit),
+            ("slim.patchMany(", Kind::Edit),
+        ];
+        for (needle, kind) in needles {
+            let mut idx = 0;
+            while let Some(pos) = code[idx..].find(needle) {
+                let after = &code[idx + pos + needle.len()..];
+                let window = &after[..after.floor_char_boundary(512)];
+                match kind {
+                    Kind::ReadMany => {
+                        let scan = window.find(']').map_or(window, |end| &window[..end]);
+                        for lit in scan_quoted_literals(scan) {
+                            if looks_like_file_path(lit) {
+                                self.add_read(lit);
+                            }
+                        }
+                    }
+                    Kind::Read | Kind::Write | Kind::Edit => {
+                        for lit in scan_path_field_literals(window) {
+                            match kind {
+                                Kind::Read => self.add_read(lit),
+                                Kind::Write => self.add_written(lit),
+                                Kind::Edit => self.add_edited(lit),
+                                Kind::ReadMany => {}
+                            }
+                        }
+                    }
+                }
+                idx += pos + needle.len();
+            }
+        }
+    }
+
     /// Files read only and files modified, each with its last-touch stamp.
     /// Modified wins over read.
     fn classified(&self) -> (HashMap<&str, u64>, HashMap<&str, u64>) {
@@ -112,6 +239,80 @@ impl FileOperations {
             .collect();
         (read_only, modified)
     }
+}
+
+fn looks_like_file_path(cand: &str) -> bool {
+    !cand.is_empty()
+        && cand.len() <= 240
+        && !cand.contains(['\n', '\r', ' '])
+        && (cand.contains('/') || cand.contains('.'))
+}
+
+fn take_quoted_literal(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' || bytes[i] == b'\n' {
+            return None;
+        }
+        if bytes[i] == quote {
+            return Some((&s[1..i], &s[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn scan_quoted_literals(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some((lit, rest)) = take_quoted_literal(&s[i..]) {
+            out.push(lit);
+            i = s.len() - rest.len();
+        } else {
+            i += s[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
+}
+
+fn scan_path_field_literals(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut idx = 0usize;
+    while let Some(pos) = s[idx..].find("path") {
+        let key_start = idx + pos;
+        let prev_ok = key_start == 0
+            || !bytes[key_start - 1].is_ascii_alphanumeric() && bytes[key_start - 1] != b'_';
+        let mut p = key_start + 4;
+        if bytes.get(p).is_some_and(|b| matches!(b, b'\'' | b'"')) {
+            p += 1;
+        }
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if prev_ok && bytes.get(p) == Some(&b':') {
+            p += 1;
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if let Some((lit, rest)) = take_quoted_literal(&s[p..]) {
+                if looks_like_file_path(lit) {
+                    out.push(lit);
+                }
+                idx = s.len() - rest.len();
+                continue;
+            }
+        }
+        idx = key_start + 4;
+    }
+    out
 }
 
 /// Final file lists: read files that were not modified, and modified files,
@@ -152,6 +353,37 @@ pub fn format_file_operations(read_files: &[String], modified_files: &[String]) 
         return String::new();
     }
     format!("\n\n{}", sections.join("\n\n"))
+}
+
+fn tool_output_looks_failed(output: &str) -> bool {
+    output.starts_with("error:")
+        || output.starts_with("Error:")
+        || output.contains("Current file is below")
+        || output.contains("Current file edges are below")
+        || output.contains("Suggested unique expected:")
+        || output.contains("Closest text is at line")
+        || output.contains("Nearest text is around line")
+        || output.contains("Example context only for the first match at line ")
+}
+
+/// Strips trailing/embedded `<read-files>` and `<modified-files>` XML blocks
+/// from a prior summary before feeding it back as `<previous-summary>`, so the
+/// summarizer does not echo duplicated file blocks.
+pub fn strip_file_operation_blocks(summary: &str) -> String {
+    let mut out = summary.to_owned();
+    for (open, close) in [
+        ("<read-files>", "</read-files>"),
+        ("<modified-files>", "</modified-files>"),
+    ] {
+        while let Some(start) = out.find(open) {
+            let Some(rel_end) = out[start..].find(close) else {
+                break;
+            };
+            let end = start + rel_end + close.len();
+            out.replace_range(start..end, "");
+        }
+    }
+    out.trim().to_owned()
 }
 
 /// Recovers the file lists a previous summary carries in the trailing blocks
@@ -529,5 +761,32 @@ mod tests {
             fitted.files.read_files.len(),
             MAX_COMPACTION_FILES_BYTES / MAX_COMPACTION_PATH_BYTES
         );
+    }
+
+    #[test]
+    fn extract_from_history_captures_codemode_code_paths_even_with_json_summary_output() {
+        let mut ops = FileOperations::new();
+        let code = r#"
+            const [a, b] = await Promise.all([
+                slim.read({ path: 'src/lib.rs' }),
+                slim.readMany(['src/alpha.rs', 'src/beta.rs']),
+            ]);
+            await slim.write({ path: 'src/new.rs', content: 'x', expected: null });
+            await slim.patch({ path: 'src/lib.rs', edits: [] });
+            return { ok: true };
+        "#;
+        let call = ProviderToolCall {
+            id: "cm-1".into(),
+            name: "codemode".into(),
+            arguments: serde_json::json!({ "code": code }).to_string(),
+        };
+        let messages = vec![
+            ProviderMessage::assistant("", vec![call]),
+            ProviderMessage::tool("codemode", "cm-1", r#"{"ok":true}"#),
+        ];
+        ops.extract_from_history(&messages);
+        let lists = compute_file_lists(&ops);
+        assert_eq!(lists.read_files, vec!["src/alpha.rs", "src/beta.rs"]);
+        assert_eq!(lists.modified_files, vec!["src/lib.rs", "src/new.rs"]);
     }
 }

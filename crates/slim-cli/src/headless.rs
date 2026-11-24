@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use slim_core::context::{CompactionHandle, CompactionPolicy};
 use slim_core::provider::{
     claude_context_window, claude_max_output_tokens, clinepass_model, codex_model,
-    command_code_model, devin_model, history_response_cache_scope, open_code_model,
+    command_code_model, devin_model, history_response_cache_scope_for_adapter,
     open_design_model,
     xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter, DevinAdapter,
     DevinCatalogEntry,
@@ -75,14 +75,14 @@ pub(crate) const MAX_SLASH_SKILL_BODY_BYTES: usize = 8 * 1024;
 const MAX_SLASH_SKILL_SYSTEM_PROMPT_BYTES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ExecutableIdentity {
+pub(crate) struct ExecutableIdentity {
     sha256: Option<String>,
     error: Option<String>,
 }
 
 static EXECUTABLE_IDENTITY: OnceLock<ExecutableIdentity> = OnceLock::new();
 
-fn executable_identity() -> &'static ExecutableIdentity {
+pub(crate) fn executable_identity() -> &'static ExecutableIdentity {
     EXECUTABLE_IDENTITY.get_or_init(|| {
         let path = match std::env::current_exe() {
             Ok(path) => path,
@@ -137,6 +137,13 @@ impl CodeIntelligenceHandle {
     pub(crate) async fn shutdown(&self) {
         self.0.shutdown().await;
     }
+
+    /// Shuts down all managed LSP servers synchronously on the shared runtime.
+    pub fn shutdown_blocking(&self) {
+        if let Ok(rt) = crate::tui::shared_tui_runtime() {
+            rt.block_on(self.0.shutdown());
+        }
+    }
 }
 
 impl std::fmt::Debug for CodeIntelligenceHandle {
@@ -168,6 +175,13 @@ impl McpHandle {
 
     pub fn manager(&self) -> &Arc<slim_core::mcp::McpManager> {
         &self.0
+    }
+
+    /// Disconnects all managed MCP servers synchronously on the shared runtime.
+    pub fn disconnect_all_blocking(&self) {
+        if let Ok(rt) = crate::tui::shared_tui_runtime() {
+            rt.block_on(self.0.disconnect_all());
+        }
     }
 }
 
@@ -219,6 +233,206 @@ impl PartialEq for SharedToolRegistry {
 
 impl Eq for SharedToolRegistry {}
 
+/// An in-process MCP server registered directly into [`McpManager`] without
+/// spawning a child process or writing temporary TOML config files.
+#[derive(Clone)]
+pub struct InProcessMcpServer {
+    pub spec: slim_core::mcp::McpServerSpec,
+    pub connection: Arc<dyn slim_core::mcp::McpConnection>,
+    pub tools: Vec<slim_core::mcp::McpToolSummary>,
+}
+
+impl std::fmt::Debug for InProcessMcpServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InProcessMcpServer")
+            .field("name", &self.spec.name)
+            .field("tools", &self.tools.len())
+            .finish()
+    }
+}
+
+impl PartialEq for InProcessMcpServer {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec && Arc::ptr_eq(&self.connection, &other.connection)
+    }
+}
+
+impl Eq for InProcessMcpServer {}
+
+pub struct InProcessMcpToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub read_only_hint: bool,
+}
+
+pub trait InProcessMcpToolHandler: Send + Sync {
+    fn instructions(&self) -> String {
+        String::new()
+    }
+
+    fn call(
+        &self,
+        name: String,
+        arguments: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+}
+
+struct HandlerMcpConnection {
+    handler: Arc<dyn InProcessMcpToolHandler>,
+    tool_list: Vec<serde_json::Value>,
+}
+
+impl slim_core::mcp::McpConnection for HandlerMcpConnection {
+    fn request<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        method: &'life1 str,
+        params: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<serde_json::Value, slim_core::mcp::McpError>,
+                > + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        match method {
+            "ping" => Box::pin(async { Ok(serde_json::json!({})) }),
+            "initialize" => {
+                let version = params
+                    .get("protocolVersion")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(slim_core::mcp::MCP_PROTOCOL_VERSION)
+                    .to_owned();
+                let instructions = self.handler.instructions();
+                Box::pin(async move {
+                    Ok(serde_json::json!({
+                        "protocolVersion": version,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": {"name": "slim-inprocess", "version": env!("CARGO_PKG_VERSION")},
+                        "instructions": instructions,
+                    }))
+                })
+            }
+            "tools/list" => {
+                let tools = self.tool_list.clone();
+                Box::pin(async move { Ok(serde_json::json!({ "tools": tools })) })
+            }
+            "tools/call" => {
+                let Some(name) = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    return Box::pin(async {
+                        Err(slim_core::mcp::McpError::Protocol(
+                            "tools/call needs a tool name".into(),
+                        ))
+                    });
+                };
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let fut = self.handler.call(name, args);
+                Box::pin(async move {
+                    Ok(match fut.await {
+                        Ok(text) => serde_json::json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": false
+                        }),
+                        Err(text) => serde_json::json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": true
+                        }),
+                    })
+                })
+            }
+            other => {
+                let msg = format!("method not found: {other}");
+                Box::pin(async move { Err(slim_core::mcp::McpError::Protocol(msg)) })
+            }
+        }
+    }
+
+    fn notify<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _method: &'life1 str,
+        _params: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async {})
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
+pub fn build_in_process_mcp_server(
+    name: impl Into<String>,
+    description: impl Into<String>,
+    direct: bool,
+    tools: Vec<InProcessMcpToolSpec>,
+    handler: Arc<dyn InProcessMcpToolHandler>,
+) -> InProcessMcpServer {
+    let name = name.into();
+    let description = description.into();
+    let mut spec = slim_core::mcp::McpServerSpec::new(
+        name.clone(),
+        slim_core::mcp::McpTransport::Stdio {
+            command: format!("in-process://{name}"),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        },
+    );
+    spec.options.description = Some(description);
+    spec.options.exposure = if direct {
+        slim_core::mcp::McpExposure::Direct
+    } else {
+        slim_core::mcp::McpExposure::Gateway
+    };
+    let tool_list: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
+            })
+        })
+        .collect();
+    let summaries = tools
+        .into_iter()
+        .map(|t| slim_core::mcp::McpToolSummary {
+            name: t.name,
+            description: Some(t.description),
+            schema: t.input_schema,
+            output_schema: None,
+            read_only_hint: t.read_only_hint,
+            destructive_hint: false,
+            idempotent_hint: false,
+        })
+        .collect();
+    let connection: Arc<dyn slim_core::mcp::McpConnection> =
+        Arc::new(HandlerMcpConnection { handler, tool_list });
+    InProcessMcpServer {
+        spec,
+        connection,
+        tools: summaries,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProviderRunOptions {
     /// Stable conversation identity for provider routing, shared across turns.
@@ -233,8 +447,12 @@ pub struct ProviderRunOptions {
     pub history: Vec<ProviderMessage>,
     pub task_facts: Vec<slim_core::session::DurableFact>,
     pub artifact_ids: Vec<String>,
+    /// Path to the durable session JSONL when compacted history exists, enabling
+    /// on-demand `history_recall` without inflating the prompt prefix.
+    pub session_history_archive: Option<PathBuf>,
     pub shell_jobs: Option<slim_core::runtime::ShellJobs>,
     pub shell_job_limits: slim_core::runtime::ShellJobLimits,
+    pub subagents: Option<slim_core::runtime::SubagentRegistry>,
     pub workspace_root: Option<PathBuf>,
     pub artifact_root: Option<PathBuf>,
     pub context_window_tokens: Option<u64>,
@@ -243,6 +461,9 @@ pub struct ProviderRunOptions {
     /// How Anthropic returns the thinking text; `None` keeps the adapter's
     /// default (summarized only when an effort is set).
     pub thinking_display: Option<slim_core::provider::ThinkingDisplay>,
+    /// Lowers reasoning effort automatically after a clean verification check
+    /// without mutating prompt-cached prefix (`None` checks `SLIM_ADAPTIVE_REASONING`).
+    pub adaptive_reasoning: Option<bool>,
     pub codex_fast: bool,
     pub max_turns: Option<usize>,
     /// Wall-clock budget of one run, in seconds.
@@ -280,6 +501,27 @@ pub struct ProviderRunOptions {
     /// after global and project config. Trusted as the host's own choice;
     /// never persisted.
     pub host_mcp_config: Option<PathBuf>,
+    /// Preserves the canonical Auto tool schema envelope across ReadOnly/Plan/Auto
+    /// mode switches (`None` checks `SLIM_STABLE_TOOL_ENVELOPE`).
+    pub stable_tool_envelope: Option<bool>,
+    /// MCP server names explicitly permitted even in `ReadOnly`/`Plan` modes
+    /// (e.g. `slim_swarm`).
+    pub mcp_readonly_allowlist: Vec<String>,
+    /// Host-owned in-process MCP servers injected directly into [`McpManager`].
+    pub extra_mcp_connections: Vec<InProcessMcpServer>,
+    /// Opt-in predictive KV-cache TTL keep-alive (`None` uses default `false`).
+    pub cache_keep_alive: Option<bool>,
+    /// Maximum idle seconds covered by keep-alive pings (capped at 900).
+    pub cache_keep_alive_max_secs: Option<u64>,
+    /// True when `mcp` is owned by an outer shared hub (do not `disconnect_all`
+    /// the parent on session exit).
+    pub shared_mcp_external: bool,
+    /// True when `code_intelligence` is owned by an outer shared hub (do not
+    /// `shutdown()` on session exit).
+    pub shared_code_intelligence_external: bool,
+    /// The embedder draws the conversation itself: a restored session is
+    /// validated but its transcript is not rebuilt.
+    pub skip_restored_transcript: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,6 +579,11 @@ impl ProviderRunOptions {
 
     pub fn with_thinking_display(mut self, display: slim_core::provider::ThinkingDisplay) -> Self {
         self.thinking_display = Some(display);
+        self
+    }
+
+    pub fn with_adaptive_reasoning(mut self, enabled: bool) -> Self {
+        self.adaptive_reasoning = Some(enabled);
         self
     }
 
@@ -663,10 +910,10 @@ async fn run_provider_resume_with_preflight_events_inner(
     .await
     .map_err(|error| resume_error(format!("session replay worker failed: {error}")))??;
     let DurableProviderHistory {
-        messages: history,
+        messages: mut history,
         parent_entry_id,
         entry_ids: _,
-        applied_checkpoint_id: _,
+        applied_checkpoint_id,
         skipped_checkpoints: mut warnings,
     } = history;
     let workspace = PathBuf::from(
@@ -735,17 +982,65 @@ async fn run_provider_resume_with_preflight_events_inner(
     spec.input_content_blocks = input_message.content_blocks;
     // Same-process TUI continuation keeps the live conversation when it is
     // the durable prefix plus adapter-scoped reasoning. Cold resume leaves
-    // options.history empty and uses the JSONL reconstruction.
+    // options.history empty and uses the JSONL reconstruction, restoring
+    // `prefix.anchors.v1` so the cached wire prefix stays byte-identical
+    // across restarts within the provider's TTL.
     if !keep_live_history(&options.history, &history) {
+        restore_prefix_anchors(
+            &preflight,
+            &mut history,
+            applied_checkpoint_id.is_some(),
+            options.compaction.as_ref(),
+        );
+        restore_speculative_compaction(&preflight, options.compaction.as_ref());
+        let last_write = std::fs::metadata(&preflight.path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok());
+        if let (Some(handle), Some(last_write)) = (options.compaction.as_ref(), last_write) {
+            handle.record_cold_cache(
+                slim_core::provider::provider_kind_name(request.kind),
+                &request.model,
+                last_write.as_secs(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |now| now.as_secs()),
+            );
+        }
         options.history = history;
     }
     options.task_facts = session_task_facts(&preflight);
     options.artifact_ids = session_artifact_ids(&preflight);
+    if applied_checkpoint_id.is_some() {
+        options.session_history_archive = Some(preflight.path.clone());
+    }
     spec = spec.with_run_telemetry(durable_run_telemetry_context(&request, &options)?);
     let compaction_handle = options.compaction.clone();
+    let session_id_for_checkpoint = preflight
+        .session_id
+        .as_deref()
+        .unwrap_or("session")
+        .to_owned();
     let journal = std::sync::Arc::new(std::sync::Mutex::new(
         ManualRunJournal::start(repo, spec).map_err(|error| resume_error(error.to_string()))?,
     ));
+    if let Some(workspace_dir) = options.workspace_root.as_deref().filter(|p| p.is_dir()) {
+        if let Ok(cp) = slim_core::checkpoint::capture_turn_checkpoint(
+            workspace_dir,
+            &session_id_for_checkpoint,
+            first_seq,
+        ) {
+            if let Ok(value) = serde_json::to_value(&cp) {
+                if let Ok(mut guard) = journal.lock() {
+                    let _ = guard.record_fact(slim_core::session::DurableFact {
+                        namespace: slim_core::checkpoint::TURN_CHECKPOINT_NAMESPACE.to_owned(),
+                        key: first_seq.to_string(),
+                        value,
+                    });
+                }
+            }
+        }
+    }
     let mut executor = DurableProviderExecutor::new(
         request,
         options,
@@ -786,6 +1081,8 @@ async fn run_provider_resume_with_preflight_events_inner(
                 .lock()
                 .map_err(|_| resume_error("durable run lock poisoned"))?;
             let repo = journal_guard.repo_mut();
+            persist_prefix_anchors(repo, compaction_handle.as_ref(), &preflight)?;
+            persist_speculative_compaction(repo, compaction_handle.as_ref(), &preflight)?;
             let mut execution = executor
                 .execution
                 .ok_or_else(|| resume_error("durable provider execution produced no result"))?;
@@ -897,9 +1194,12 @@ fn persist_compaction_commits(
     repo: &mut JsonlRepo,
     commits: Vec<slim_core::context::CompactionCommit>,
 ) -> Result<Vec<String>, ProviderError> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut warnings = Vec::new();
+    let mut persisted = durable_provider_history(&SessionPreflight::from_open_repo(repo))?;
     for commit in commits {
-        let persisted = durable_provider_history(&SessionPreflight::from_open_repo(repo))?;
         let Some(first_kept_entry_id) = durable_checkpoint_anchor(
             &persisted.messages,
             &persisted.entry_ids,
@@ -915,17 +1215,19 @@ fn persist_compaction_commits(
         let seq = repo
             .next_seq()
             .map_err(|error| resume_error(error.to_string()))?;
+        let checkpoint_id = format!("compact-{}-{seq}", repo.header().id);
+        let summary_text = commit.summary.clone();
+        let prefix_fingerprint = slim_core::context::compaction_prefix_fingerprint(
+            &persisted.messages[..commit.first_kept_index],
+        );
         repo.append(slim_core::session::DurableRecord::Compaction {
             seq,
             checkpoint: slim_core::session::CompactionCheckpoint {
-                checkpoint_id: format!("compact-{}-{seq}", repo.header().id),
+                checkpoint_id: checkpoint_id.clone(),
                 summary: commit.summary,
                 first_kept_entry_id,
-                // The journal's own order: what the rebuild checks.
-                prefix_fingerprint: slim_core::context::compaction_prefix_fingerprint(
-                    &persisted.messages[..commit.first_kept_index],
-                ),
-                previous_checkpoint_id: persisted.applied_checkpoint_id,
+                prefix_fingerprint,
+                previous_checkpoint_id: persisted.applied_checkpoint_id.clone(),
                 tokens_before: commit.tokens_before,
                 tokens_after: commit.tokens_after,
                 input_tokens: Some(commit.input_tokens),
@@ -937,6 +1239,29 @@ fn persist_compaction_commits(
             },
         })
         .map_err(|error| resume_error(error.to_string()))?;
+
+        // Advance the in-memory view identically to `rebuild_provider_history`
+        // so chaining multiple commits does not re-parse the whole JSONL each step.
+        let mut next_messages: Vec<ProviderMessage> = persisted.messages[..commit.first_kept_index]
+            .iter()
+            .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
+            .cloned()
+            .collect();
+        let mut next_entry_ids: Vec<Option<String>> = persisted.messages[..commit.first_kept_index]
+            .iter()
+            .zip(persisted.entry_ids[..commit.first_kept_index].iter())
+            .filter(|(message, _)| matches!(message.role.as_str(), "system" | "developer"))
+            .map(|(_, entry_id)| entry_id.clone())
+            .collect();
+        next_messages.push(slim_core::context::compaction_summary_message(&summary_text));
+        next_entry_ids.push(None);
+        let kept_start = next_messages.len();
+        next_messages.extend(persisted.messages[commit.first_kept_index..].iter().cloned());
+        next_entry_ids.extend(persisted.entry_ids[commit.first_kept_index..].iter().cloned());
+        slim_core::context::rewrite_stale_duplicate_pointers(&mut next_messages[kept_start..]);
+        persisted.messages = next_messages;
+        persisted.entry_ids = next_entry_ids;
+        persisted.applied_checkpoint_id = Some(checkpoint_id);
     }
     Ok(warnings)
 }
@@ -1032,6 +1357,155 @@ pub(crate) fn session_artifact_ids(preflight: &SessionPreflight) -> Vec<String> 
             _ => None,
         })
         .collect()
+}
+
+const SPECULATIVE_COMPACTION_MAX_AGE_SECS: u64 = 6 * 3600;
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn session_speculative_compaction(
+    preflight: &SessionPreflight,
+) -> Option<slim_core::context::SpeculativeCompaction> {
+    let now = current_unix_secs();
+    for record in preflight.records.iter().rev() {
+        match record {
+            slim_core::session::DurableRecord::Compaction { .. } => return None,
+            slim_core::session::DurableRecord::Fact { fact, .. }
+                if fact.namespace == "compaction.speculative.v1" && fact.key == "latest" =>
+            {
+                let spec: slim_core::context::SpeculativeCompaction =
+                    serde_json::from_value(fact.value.clone()).ok()?;
+                return (now.saturating_sub(spec.created_at_unix_secs)
+                    <= SPECULATIVE_COMPACTION_MAX_AGE_SECS)
+                    .then_some(spec);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn restore_speculative_compaction(
+    preflight: &SessionPreflight,
+    compaction: Option<&CompactionHandle>,
+) {
+    let Some(handle) = compaction else {
+        return;
+    };
+    if let Some(spec) = session_speculative_compaction(preflight) {
+        handle.store_speculative(spec);
+    }
+}
+
+fn persist_speculative_compaction(
+    repo: &mut JsonlRepo,
+    compaction: Option<&CompactionHandle>,
+    preflight: &SessionPreflight,
+) -> Result<(), ProviderError> {
+    let Some(spec) = compaction.and_then(CompactionHandle::export_speculative) else {
+        return Ok(());
+    };
+    if let Some(existing) = session_speculative_compaction(preflight) {
+        if existing.canonical_prefix_fingerprint == spec.canonical_prefix_fingerprint
+            && existing.first_kept_index == spec.first_kept_index
+            && existing.created_at_unix_secs == spec.created_at_unix_secs
+        {
+            return Ok(());
+        }
+    }
+    let value = serde_json::to_value(&spec).map_err(|error| resume_error(error.to_string()))?;
+    let seq = repo
+        .next_seq()
+        .map_err(|error| resume_error(error.to_string()))?;
+    repo.append(slim_core::session::DurableRecord::Fact {
+        seq,
+        fact: slim_core::session::DurableFact {
+            namespace: "compaction.speculative.v1".into(),
+            key: "latest".into(),
+            value,
+        },
+    })
+    .map_err(|error| resume_error(error.to_string()))?;
+    Ok(())
+}
+
+fn session_prefix_anchors(
+    preflight: &SessionPreflight,
+) -> Option<slim_core::context::PersistedPrefixAnchors> {
+    preflight
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            slim_core::session::DurableRecord::Fact { fact, .. }
+                if fact.namespace == "prefix.anchors.v1" && fact.key == "latest" =>
+            {
+                serde_json::from_value(fact.value.clone()).ok()
+            }
+            _ => None,
+        })
+}
+
+fn restore_prefix_anchors(
+    preflight: &SessionPreflight,
+    history: &mut [ProviderMessage],
+    compacted: bool,
+    compaction: Option<&CompactionHandle>,
+) {
+    let Some(anchors) = session_prefix_anchors(preflight) else {
+        return;
+    };
+    if !compacted {
+        if let Some(snapshot) = anchors.workspace_snapshot.as_deref() {
+            if let Some(first) = history.first_mut() {
+                if first.role == "user" && !first.content.contains(snapshot) {
+                    let original = first.content.clone();
+                    *first = std::mem::replace(first, ProviderMessage::user(""))
+                        .with_recorded_content(original);
+                    first.content.push_str(snapshot);
+                }
+            }
+        }
+    }
+    if let Some(handle) = compaction {
+        handle.restore_prefix_anchors(anchors);
+    }
+}
+
+fn persist_prefix_anchors(
+    repo: &mut JsonlRepo,
+    compaction: Option<&CompactionHandle>,
+    preflight: &SessionPreflight,
+) -> Result<(), ProviderError> {
+    let Some(handle) = compaction else {
+        return Ok(());
+    };
+    let current = handle.export_prefix_anchors();
+    if current.workspace_snapshot.is_none() && current.channel_anchors.is_empty() {
+        return Ok(());
+    }
+    if session_prefix_anchors(preflight).as_ref() == Some(&current) {
+        return Ok(());
+    }
+    let value = serde_json::to_value(&current).map_err(|error| resume_error(error.to_string()))?;
+    let seq = repo
+        .next_seq()
+        .map_err(|error| resume_error(error.to_string()))?;
+    repo.append(slim_core::session::DurableRecord::Fact {
+        seq,
+        fact: slim_core::session::DurableFact {
+            namespace: "prefix.anchors.v1".into(),
+            key: "latest".into(),
+            value,
+        },
+    })
+    .map_err(|error| resume_error(error.to_string()))?;
+    Ok(())
 }
 
 struct DurableProviderHistory {
@@ -1132,6 +1606,13 @@ fn keep_live_history(live: &[ProviderMessage], durable: &[ProviderMessage]) -> b
 /// The loop future is boxed: it is large, and the nine provider arms of
 /// `execute_provider_turn_async` (one `run_loop!` expansion each) would
 /// otherwise each reserve a copy on the caller's (main-thread) stack.
+#[derive(Clone, Copy)]
+enum BoundExecMode {
+    Loop { compact_only: bool },
+    Speculative,
+    KeepAlive,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_bound_agent_loop<A: ProviderAdapter + Send + Sync + 'static>(
     runtime: &mut Runtime,
@@ -1142,35 +1623,71 @@ async fn run_bound_agent_loop<A: ProviderAdapter + Send + Sync + 'static>(
     cwd: &Path,
     config: AgentLoopConfig,
     timeouts: ProviderTimeouts,
-    compact_only: bool,
+    exec_mode: BoundExecMode,
+    speculative_out: &mut Option<slim_core::context::SpeculativeCompaction>,
 ) -> Result<Result<AgentLoopResult, ProviderError>, ProviderError> {
-    let model = adapter.model().to_owned();
-    let adapter = bind_history_scope(adapter, &model, initial_messages, bind);
-    let client = HttpProviderClient::with_shared_transport(adapter, timeouts)?;
+    let adapter = bind_history_scope(adapter, initial_messages, bind);
+    let cache = match exec_mode {
+        BoundExecMode::KeepAlive => None,
+        BoundExecMode::Loop { .. } | BoundExecMode::Speculative => {
+            slim_core::provider::ProviderCache::default_persistent()
+        }
+    };
+    let client = HttpProviderClient::with_shared_transport_and_cache(adapter, timeouts, cache)?;
     let first_seq = 1;
-    Ok(if compact_only {
-        Box::pin(runtime.compact_messages(&client, initial_messages, mode, cwd, first_seq, config))
+    Ok(match exec_mode {
+        BoundExecMode::Loop { compact_only: true } => {
+            Box::pin(runtime.compact_messages(&client, initial_messages, mode, cwd, first_seq, config))
+                .await
+        }
+        BoundExecMode::Loop { compact_only: false } => {
+            Box::pin(runtime.run_agent_loop_with_messages(
+                &client,
+                initial_messages,
+                mode,
+                cwd,
+                first_seq,
+                config,
+            ))
             .await
-    } else {
-        Box::pin(runtime.run_agent_loop_with_messages(
-            &client,
-            initial_messages,
-            mode,
-            cwd,
-            first_seq,
-            config,
-        ))
-        .await
+        }
+        BoundExecMode::Speculative => {
+            match Box::pin(runtime.run_speculative_compaction(
+                &client,
+                initial_messages,
+                mode,
+                cwd,
+                config,
+            ))
+            .await
+            {
+                Ok(spec) => {
+                    *speculative_out = spec;
+                    Ok(AgentLoopResult::empty(first_seq, AgentLoopStop::ProviderCompleted))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        BoundExecMode::KeepAlive => {
+            Box::pin(runtime.run_keep_alive_ping(&client, initial_messages, mode, cwd, config))
+                .await
+                .map(|(read, write)| {
+                    let mut result =
+                        AgentLoopResult::empty(first_seq, AgentLoopStop::ProviderCompleted);
+                    result.usage.cache_read_tokens = read;
+                    result.usage.cache_write_tokens = write;
+                    result
+                })
+        }
     })
 }
 
-fn bind_history_scope<A>(
+fn bind_history_scope<A: ProviderAdapter>(
     adapter: A,
-    model: &str,
     history: &[ProviderMessage],
     bind: impl FnOnce(A, u64) -> A,
 ) -> A {
-    match history_response_cache_scope(history, model) {
+    match history_response_cache_scope_for_adapter(history, &adapter) {
         Some(scope) => bind(adapter, scope),
         None => adapter,
     }
@@ -1810,7 +2327,14 @@ fn attach_local_code_intelligence(
 fn attach_local_mcp(
     options: &mut ProviderRunOptions,
 ) -> (Option<Arc<slim_core::mcp::McpManager>>, Vec<String>) {
-    if options.mcp.is_some() {
+    if let Some(existing) = options.mcp.as_ref() {
+        for extra in &options.extra_mcp_connections {
+            existing.manager().insert_connection(
+                extra.spec.clone(),
+                Arc::clone(&extra.connection),
+                extra.tools.clone(),
+            );
+        }
         return (None, Vec::new());
     }
     let Some(cwd) = options
@@ -1835,8 +2359,18 @@ fn attach_local_mcp(
     };
     let warnings =
         crate::mcp::load_diagnostics(&load, "Pass --trust-project to start them for this run.");
-    let manager = crate::mcp::build_mcp_manager(&load, &cwd);
+    let manager = crate::mcp::build_mcp_manager(&load, &cwd).or_else(|| {
+        (!options.extra_mcp_connections.is_empty())
+            .then(|| crate::mcp::build_empty_mcp_manager(&cwd))
+    });
     if let Some(manager) = &manager {
+        for extra in &options.extra_mcp_connections {
+            manager.insert_connection(
+                extra.spec.clone(),
+                Arc::clone(&extra.connection),
+                extra.tools.clone(),
+            );
+        }
         // Per run: enabled, trusted, non-lazy servers connect in the
         // background while the run is prepared.
         manager.start_background_connect();
@@ -1888,22 +2422,23 @@ pub(crate) async fn execute_provider_turn_async(
         &request.endpoint,
         ProviderTimeouts::production(request.timeout).connect,
     );
-    let open_code_spec =
-        match request.kind {
-            ProviderKind::OpenCodeGo => Some(open_code_model(&request.model).ok_or_else(|| {
+    let open_code_spec = match request.kind {
+        ProviderKind::OpenCodeGo => Some(
+            crate::opencode_go_catalog::resolve_model(&request.model).ok_or_else(|| {
                 ProviderError::InvalidResponse {
                     message: format!("unsupported OpenCode Go model: {}", request.model),
                 }
-            })?),
-            ProviderKind::OpenCodeZen => {
-                Some(
-                    zen_model(&request.model).ok_or_else(|| ProviderError::InvalidResponse {
-                        message: format!("unsupported OpenCode Zen model: {}", request.model),
-                    })?,
-                )
-            }
-            _ => None,
-        };
+            })?,
+        ),
+        ProviderKind::OpenCodeZen => Some(
+            zen_model(&request.model)
+                .map(slim_core::provider::OpenCodeModelSpec::from)
+                .ok_or_else(|| ProviderError::InvalidResponse {
+                    message: format!("unsupported OpenCode Zen model: {}", request.model),
+                })?,
+        ),
+        _ => None,
+    };
     let catalog_override_absent = options.context_window_tokens.is_none()
         && std::env::var_os("SLIM_CONTEXT_WINDOW_TOKENS").is_none();
     let live_codex = if request.kind == ProviderKind::OpenAiCodex
@@ -1966,7 +2501,7 @@ pub(crate) async fn execute_provider_turn_async(
         }
     }
     let context_window_tokens = if catalog_override_absent {
-        if let Some(model) = open_code_spec {
+        if let Some(ref model) = open_code_spec {
             require_model_context_window(model.context_window)?
         } else {
             require_model_context_window(known_model_context_window(
@@ -2031,6 +2566,9 @@ pub(crate) async fn execute_provider_turn_async(
             .set_shell_job_limits(options.shell_job_limits.clone())
             .map_err(|message| ProviderError::InvalidResponse { message })?;
     }
+    if let Some(subagents) = options.subagents.clone() {
+        runtime.set_subagents(subagents);
+    }
     if let Some(bytes) = parse_positive_env_usize("SLIM_READ_PRESENTATION_BYTES")
         .map_err(|message| ProviderError::InvalidResponse { message })?
     {
@@ -2048,6 +2586,9 @@ pub(crate) async fn execute_provider_turn_async(
     }
     if let Some(tools) = options.tool_registry.as_ref() {
         runtime.set_tool_registry(tools.registry());
+    }
+    if let Some(archive) = options.session_history_archive.clone() {
+        runtime.set_session_history_archive(Some(archive));
     }
     if let Some(sender) = event_sender {
         runtime.app.set_event_sender(sender);
@@ -2080,6 +2621,9 @@ pub(crate) async fn execute_provider_turn_async(
         }
         runtime.set_mcp_manager(Some(mcp.manager().clone()));
     }
+    for server in &options.mcp_readonly_allowlist {
+        runtime.allow_readonly_mcp_server(server.clone());
+    }
     let provider_timeouts = ProviderTimeouts::production(request.timeout);
     let compaction_reserve_tokens = options
         .compaction
@@ -2109,6 +2653,12 @@ pub(crate) async fn execute_provider_turn_async(
     loop_config.max_read_tool_calls = max_read_tool_calls;
     loop_config.max_total_tool_calls = max_total_tool_calls;
     loop_config.max_result_bytes = max_result_bytes;
+    loop_config.adaptive_reasoning = resolve_adaptive_reasoning(options.adaptive_reasoning);
+    loop_config.stable_tool_envelope = resolve_stable_tool_envelope(options.stable_tool_envelope);
+    loop_config.cache_keep_alive = options.cache_keep_alive.unwrap_or(false);
+    if let Some(secs) = options.cache_keep_alive_max_secs {
+        loop_config.cache_keep_alive_max_secs = secs.min(900);
+    }
     let tool_limits = ToolLoopLimits {
         max_mutating_tool_calls: loop_config.max_mutating_tool_calls,
         max_read_tool_calls: loop_config.max_read_tool_calls,
@@ -2134,171 +2684,29 @@ pub(crate) async fn execute_provider_turn_async(
         }
         initial_messages.push(message);
     }
-    // Every arm ends in the same bound-loop call; only the adapter and its
-    // cache-scope binder differ. Macros keep the large loop future out of a
-    // per-arm copy of the nine-argument call.
-    macro_rules! run_loop {
-        ($adapter:expr, $adapter_type:ident) => {
-            run_bound_agent_loop(
-                &mut runtime,
-                $adapter,
-                $adapter_type::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
-        };
-    }
-    // OpenCode Go and Zen share the provider session id and the up-front
-    // message validation.
-    macro_rules! session_bound {
-        ($adapter:expr) => {{
-            let adapter = $adapter;
-            let adapter = match options.provider_session_id.as_deref() {
-                Some(id) => adapter.with_session_id(id),
-                None => adapter,
-            };
-            adapter.validate_messages(&initial_messages)?;
-            adapter
-        }};
-    }
-    let loop_result = match provider {
-        ProviderKind::OpenAiCompatible => {
-            let mut config =
-                ProviderConfig::openai(request.endpoint, request.model, api_key.clone())
-                    .with_max_output_tokens(max_output_tokens);
-            if let Some(effort) = reasoning_effort.as_deref() {
-                config = config.with_reasoning_effort(effort);
-            }
-            let adapter = OpenAiCompatibleAdapter::new(config)?;
-            run_loop!(adapter, OpenAiCompatibleAdapter)
-        }
-        ProviderKind::OpenAiCodex => {
-            let account_id =
-                request
-                    .account_id
-                    .clone()
-                    .ok_or_else(|| ProviderError::InvalidResponse {
-                        message: "Codex OAuth account id is required".into(),
-                    })?;
-            let mut config = ProviderConfig::openai_codex(
-                request.endpoint,
-                request.model,
-                api_key.clone(),
-                account_id,
-            )
-            .with_max_output_tokens(max_output_tokens);
-            if let Some(effort) = reasoning_effort.as_deref() {
-                config = config.with_reasoning_effort(effort);
-            }
-            let adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(options.codex_fast);
-            run_loop!(adapter, OpenAiCodexAdapter)
-        }
-        ProviderKind::Anthropic => {
-            let mut config = if request.account_id.is_some() {
-                ProviderConfig::anthropic_oauth(request.endpoint, request.model, api_key.clone())
-            } else {
-                ProviderConfig::anthropic(request.endpoint, request.model, api_key.clone())
-            };
-            if let Some(effort) = reasoning_effort.as_deref() {
-                config = config.with_reasoning_effort(effort);
-            }
-            if let Some(display) = options.thinking_display {
-                config = config.with_thinking_display(display);
-            }
-            let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
-            run_loop!(adapter, AnthropicAdapter)
-        }
-        ProviderKind::OpenCodeGo => {
-            let adapter = OpenCodeGoAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens);
-            let adapter = session_bound!(adapter);
-            run_loop!(adapter, OpenCodeGoAdapter)
-        }
-        ProviderKind::OpenCodeZen => {
-            let adapter = OpenCodeZenAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens);
-            let adapter = session_bound!(adapter);
-            run_loop!(adapter, OpenCodeZenAdapter)
-        }
-        ProviderKind::ClinePass => {
-            let adapter = ClinePassAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens);
-            run_loop!(adapter, ClinePassAdapter)
-        }
-        ProviderKind::CommandCode => {
-            let adapter = CommandCodeAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens)
-            .with_zero_data_retention(command_code_zero_data_retention());
-            run_loop!(adapter, CommandCodeAdapter)
-        }
-        ProviderKind::Xai => {
-            let adapter = XaiAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens);
-            let adapter = match options.provider_session_id.as_deref() {
-                Some(id) => adapter.with_session_id(id),
-                None => adapter,
-            };
-            run_loop!(adapter, XaiAdapter)
-        }
-        ProviderKind::OpenDesign => {
-            let adapter = OpenDesignAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens);
-            run_loop!(adapter, OpenDesignAdapter)
-        }
-        ProviderKind::Devin => {
-            let adapter = DevinAdapter::new(
-                &request.endpoint,
-                &request.model,
-                &api_key,
-                reasoning_effort.as_deref(),
-            )?
-            .with_max_output_tokens(max_output_tokens);
-            let adapter = match devin_entry(&request.model) {
-                Some(entry) => adapter.with_catalog_entry(&entry),
-                None => adapter,
-            };
-            let adapter = match options.provider_session_id.as_deref() {
-                Some(id) => adapter.with_session_id(id),
-                None => adapter,
-            };
-            run_loop!(adapter, DevinAdapter)
-        }
-    }
+    let exec_mode = BoundExecMode::Loop { compact_only };
+    let mut unused_spec = None;
+    let loop_result = dispatch_bound_adapter(
+        &mut runtime,
+        provider,
+        request.endpoint,
+        request.model,
+        api_key.clone(),
+        request.account_id,
+        options.codex_fast,
+        reasoning_effort.as_deref(),
+        options.thinking_display,
+        options.provider_session_id.as_deref(),
+        &initial_messages,
+        request.mode,
+        &cwd,
+        loop_config,
+        provider_timeouts,
+        max_output_tokens,
+        exec_mode,
+        &mut unused_spec,
+    )
+    .await
     .map_err(|error| redact_provider_error(error, &api_key));
 
     let events = runtime.app.drain_events();
@@ -2432,6 +2840,386 @@ pub(crate) async fn execute_provider_turn_async(
         resume_preflight: None,
         warnings,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_bound_adapter(
+    runtime: &mut Runtime,
+    provider: ProviderKind,
+    endpoint: String,
+    model: String,
+    api_key: String,
+    account_id: Option<String>,
+    codex_fast: bool,
+    reasoning_effort: Option<&str>,
+    thinking_display: Option<slim_core::provider::ThinkingDisplay>,
+    provider_session_id: Option<&str>,
+    initial_messages: &[ProviderMessage],
+    mode: OperatingMode,
+    cwd: &Path,
+    loop_config: AgentLoopConfig,
+    provider_timeouts: ProviderTimeouts,
+    max_output_tokens: u32,
+    exec_mode: BoundExecMode,
+    speculative_out: &mut Option<slim_core::context::SpeculativeCompaction>,
+) -> Result<AgentLoopResult, ProviderError> {
+    macro_rules! run_loop {
+        ($adapter:expr, $adapter_type:ident) => {
+            run_bound_agent_loop(
+                runtime,
+                $adapter,
+                $adapter_type::with_response_cache_scope_id,
+                initial_messages,
+                mode,
+                cwd,
+                loop_config,
+                provider_timeouts,
+                exec_mode,
+                speculative_out,
+            )
+            .await?
+        };
+    }
+    macro_rules! session_bound {
+        ($adapter:expr) => {{
+            let adapter = $adapter;
+            let adapter = match provider_session_id {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            adapter.validate_messages(initial_messages)?;
+            adapter
+        }};
+    }
+    match provider {
+        ProviderKind::OpenAiCompatible => {
+            let mut config =
+                ProviderConfig::openai(endpoint, model, api_key).with_max_output_tokens(max_output_tokens);
+            if let Some(effort) = reasoning_effort {
+                config = config.with_reasoning_effort(effort);
+            }
+            let mut adapter = OpenAiCompatibleAdapter::new(config)?;
+            if let Some(id) = provider_session_id {
+                adapter = adapter.with_session_id(id);
+            }
+            run_loop!(adapter, OpenAiCompatibleAdapter)
+        }
+        ProviderKind::OpenAiCodex => {
+            let account_id = account_id.ok_or_else(|| ProviderError::InvalidResponse {
+                message: "Codex OAuth account id is required".into(),
+            })?;
+            let mut config =
+                ProviderConfig::openai_codex(endpoint, model, api_key, account_id)
+                    .with_max_output_tokens(max_output_tokens);
+            if let Some(effort) = reasoning_effort {
+                config = config.with_reasoning_effort(effort);
+            }
+            let mut adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(codex_fast);
+            if let Some(id) = provider_session_id {
+                adapter = adapter.with_session_id(id);
+            }
+            run_loop!(adapter, OpenAiCodexAdapter)
+        }
+        ProviderKind::Anthropic => {
+            let mut config = if account_id.is_some() {
+                ProviderConfig::anthropic_oauth(endpoint, model, api_key)
+            } else {
+                ProviderConfig::anthropic(endpoint, model, api_key)
+            };
+            if let Some(effort) = reasoning_effort {
+                config = config.with_reasoning_effort(effort);
+            }
+            if let Some(display) = thinking_display {
+                config = config.with_thinking_display(display);
+            }
+            let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
+            run_loop!(adapter, AnthropicAdapter)
+        }
+        ProviderKind::OpenCodeGo => {
+            let adapter = OpenCodeGoAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens);
+            let adapter = session_bound!(adapter);
+            run_loop!(adapter, OpenCodeGoAdapter)
+        }
+        ProviderKind::OpenCodeZen => {
+            let adapter = OpenCodeZenAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens);
+            let adapter = session_bound!(adapter);
+            run_loop!(adapter, OpenCodeZenAdapter)
+        }
+        ProviderKind::ClinePass => {
+            let adapter = ClinePassAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens);
+            run_loop!(adapter, ClinePassAdapter)
+        }
+        ProviderKind::CommandCode => {
+            let adapter = CommandCodeAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens)
+                .with_zero_data_retention(command_code_zero_data_retention());
+            run_loop!(adapter, CommandCodeAdapter)
+        }
+        ProviderKind::Xai => {
+            let adapter = XaiAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens);
+            let adapter = match provider_session_id {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            run_loop!(adapter, XaiAdapter)
+        }
+        ProviderKind::OpenDesign => {
+            let adapter = OpenDesignAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens);
+            run_loop!(adapter, OpenDesignAdapter)
+        }
+        ProviderKind::Devin => {
+            let adapter = DevinAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
+                .with_max_output_tokens(max_output_tokens);
+            let adapter = match devin_entry(&model) {
+                Some(entry) => adapter.with_catalog_entry(&entry),
+                None => adapter,
+            };
+            let adapter = match provider_session_id {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            run_loop!(adapter, DevinAdapter)
+        }
+    }
+}
+
+/// Resolves the known context window of a TUI/Desktop request without doing
+/// network refreshes so `/compact` guards and speculative triggers scale to the model.
+pub(crate) fn context_window_for_request(
+    request: &ProviderRequest,
+    explicit: Option<u64>,
+) -> Option<u64> {
+    if explicit.is_some() || std::env::var_os("SLIM_CONTEXT_WINDOW_TOKENS").is_some() {
+        return resolve_context_window_tokens(explicit).ok();
+    }
+    match request.kind {
+        ProviderKind::OpenCodeGo => {
+            crate::opencode_go_catalog::resolve_model(&request.model).and_then(|m| m.context_window)
+        }
+        ProviderKind::OpenCodeZen => zen_model(&request.model).and_then(|m| m.context_window),
+        ProviderKind::OpenAiCodex => {
+            let live = if should_fetch_live_codex_catalog(&request.endpoint) {
+                request.account_id.as_deref().and_then(|id| {
+                    CodexCatalog::production()
+                        .ok()?
+                        .load_cached(&request.endpoint, id)
+                        .ok()
+                        .flatten()
+                        .map(|snapshot| snapshot.entries)
+                })
+            } else {
+                None
+            };
+            known_model_context_window(request.kind, &request.model, live.as_deref())
+        }
+        _ => known_model_context_window(request.kind, &request.model, None),
+    }
+}
+
+/// Runs a non-mutating, event-free background compaction using `request`'s
+/// exact tools/MCP/skill context so a subsequent threshold or `/compact` hits <5 ms.
+pub(crate) async fn execute_speculative_compaction(
+    request: ProviderRequest,
+    options: ProviderRunOptions,
+    cancellation: CancellationToken,
+) -> Result<Option<slim_core::context::SpeculativeCompaction>, ProviderError> {
+    let context_window_tokens =
+        match context_window_for_request(&request, options.context_window_tokens) {
+            Some(window) => window,
+            None => return Ok(None),
+        };
+    let max_output_tokens =
+        resolve_max_output_tokens(options.max_output_tokens, request.kind, &request.model)?;
+    let cwd = match options.workspace_root.clone() {
+        Some(root) => root,
+        None => std::env::current_dir().map_err(|error| ProviderError::InvalidResponse {
+            message: format!("current directory: {error}"),
+        })?,
+    };
+    let mut runtime = Runtime::new();
+    runtime.set_cancellation_token(cancellation);
+    if let Some(tools) = options.tool_registry.as_ref() {
+        runtime.set_tool_registry(tools.registry());
+    }
+    if let Some(archive) = options.session_history_archive.clone() {
+        runtime.set_session_history_archive(Some(archive));
+    }
+    if let Some(handle) = options.compaction.clone() {
+        runtime.set_compaction_handle(handle);
+    }
+    runtime.register_sensitive_value(&request.api_key);
+    runtime.restore_task_facts(&options.task_facts, &cwd)?;
+    runtime.restore_artifact_ids(&options.artifact_ids);
+    if let Some(code_intelligence) = options.code_intelligence.as_ref() {
+        runtime.set_code_intelligence(code_intelligence.manager().clone());
+    }
+    if let Some(mcp) = options.mcp.as_ref() {
+        for value in mcp.manager().sensitive_values() {
+            runtime.register_sensitive_value(value);
+        }
+        runtime.set_mcp_manager(Some(mcp.manager().clone()));
+    }
+    for server in &options.mcp_readonly_allowlist {
+        runtime.allow_readonly_mcp_server(server.clone());
+    }
+    let compaction_reserve_tokens = options
+        .compaction
+        .as_ref()
+        .map_or(CompactionPolicy::default().reserve_tokens, |handle| {
+            handle.policy().reserve_tokens
+        });
+    let output_limit_is_explicit = max_output_tokens_is_explicit(options.max_output_tokens);
+    let mut loop_config = AgentLoopConfig {
+        context_window_tokens,
+        context_reserve_tokens: context_reserve_tokens(
+            request.kind,
+            max_output_tokens,
+            output_limit_is_explicit,
+            compaction_reserve_tokens,
+        ),
+        context_reserve_floor_tokens: context_reserve_floor_tokens(
+            request.kind,
+            output_limit_is_explicit,
+            compaction_reserve_tokens,
+        ),
+        ..AgentLoopConfig::default()
+    };
+    loop_config.max_result_bytes = resolve_max_result_bytes(options.max_result_bytes)?;
+    loop_config.adaptive_reasoning = resolve_adaptive_reasoning(options.adaptive_reasoning);
+    loop_config.stable_tool_envelope = resolve_stable_tool_envelope(options.stable_tool_envelope);
+    loop_config.cache_keep_alive = options.cache_keep_alive.unwrap_or(false);
+    if let Some(secs) = options.cache_keep_alive_max_secs {
+        loop_config.cache_keep_alive_max_secs = secs.min(900);
+    }
+    let timeouts = ProviderTimeouts::production(request.timeout);
+    let mut speculative_out = None;
+    dispatch_bound_adapter(
+        &mut runtime,
+        request.kind,
+        request.endpoint,
+        request.model,
+        request.api_key,
+        request.account_id,
+        options.codex_fast,
+        options.reasoning_effort.as_deref(),
+        options.thinking_display,
+        options.provider_session_id.as_deref(),
+        &options.history,
+        request.mode,
+        &cwd,
+        loop_config,
+        timeouts,
+        max_output_tokens,
+        BoundExecMode::Speculative,
+        &mut speculative_out,
+    )
+    .await?;
+    Ok(speculative_out)
+}
+
+pub(crate) async fn run_keep_alive_ping_with_options(
+    request: ProviderRequest,
+    mut options: ProviderRunOptions,
+) -> Result<(u64, u64), ProviderError> {
+    if options.history.is_empty() {
+        return Ok((0, 0));
+    }
+    let cwd = match options.workspace_root.clone() {
+        Some(root) => root,
+        None => std::env::current_dir().map_err(|error| ProviderError::InvalidResponse {
+            message: format!("current directory: {error}"),
+        })?,
+    };
+    options.workspace_root = Some(cwd.clone());
+    attach_local_mcp(&mut options);
+    let max_output_tokens =
+        resolve_max_output_tokens(options.max_output_tokens, request.kind, &request.model)?;
+    let context_window_tokens =
+        context_window_for_request(&request, options.context_window_tokens)
+            .unwrap_or_else(|| AgentLoopConfig::default().context_window_tokens);
+    let mut runtime = Runtime::new();
+    if let Some(tools) = options.tool_registry.as_ref() {
+        runtime.set_tool_registry(tools.registry());
+    }
+    if let Some(archive) = options.session_history_archive.clone() {
+        runtime.set_session_history_archive(Some(archive));
+    }
+    if let Some(handle) = options.compaction.clone() {
+        runtime.set_compaction_handle(handle);
+    }
+    runtime.register_sensitive_value(&request.api_key);
+    runtime.restore_task_facts(&options.task_facts, &cwd)?;
+    runtime.restore_artifact_ids(&options.artifact_ids);
+    if let Some(code_intelligence) = options.code_intelligence.as_ref() {
+        runtime.set_code_intelligence(code_intelligence.manager().clone());
+    }
+    if let Some(mcp) = options.mcp.as_ref() {
+        for value in mcp.manager().sensitive_values() {
+            runtime.register_sensitive_value(value);
+        }
+        runtime.set_mcp_manager(Some(mcp.manager().clone()));
+    }
+    for server in &options.mcp_readonly_allowlist {
+        runtime.allow_readonly_mcp_server(server.clone());
+    }
+    let compaction_reserve_tokens = options
+        .compaction
+        .as_ref()
+        .map_or(CompactionPolicy::default().reserve_tokens, |handle| {
+            handle.policy().reserve_tokens
+        });
+    let output_limit_is_explicit = max_output_tokens_is_explicit(options.max_output_tokens);
+    let mut loop_config = AgentLoopConfig {
+        context_window_tokens,
+        context_reserve_tokens: context_reserve_tokens(
+            request.kind,
+            max_output_tokens,
+            output_limit_is_explicit,
+            compaction_reserve_tokens,
+        ),
+        context_reserve_floor_tokens: context_reserve_floor_tokens(
+            request.kind,
+            output_limit_is_explicit,
+            compaction_reserve_tokens,
+        ),
+        ..AgentLoopConfig::default()
+    };
+    loop_config.max_result_bytes = resolve_max_result_bytes(options.max_result_bytes)?;
+    loop_config.adaptive_reasoning = resolve_adaptive_reasoning(options.adaptive_reasoning);
+    loop_config.stable_tool_envelope = resolve_stable_tool_envelope(options.stable_tool_envelope);
+    loop_config.cache_keep_alive = true;
+    if let Some(secs) = options.cache_keep_alive_max_secs {
+        loop_config.cache_keep_alive_max_secs = secs.min(900);
+    }
+    let timeouts = ProviderTimeouts::production(request.timeout);
+    let mut speculative_out = None;
+    let result = dispatch_bound_adapter(
+        &mut runtime,
+        request.kind,
+        request.endpoint,
+        request.model,
+        request.api_key,
+        request.account_id,
+        options.codex_fast,
+        options.reasoning_effort.as_deref(),
+        options.thinking_display,
+        options.provider_session_id.as_deref(),
+        &options.history,
+        request.mode,
+        &cwd,
+        loop_config,
+        timeouts,
+        max_output_tokens,
+        BoundExecMode::KeepAlive,
+        &mut speculative_out,
+    )
+    .await?;
+    Ok((result.usage.cache_read_tokens, result.usage.cache_write_tokens))
 }
 
 fn skill_user_message_prefix(skill: &SkillInstructions) -> String {
@@ -2584,11 +3372,33 @@ fn collect_tool_job_outputs(events: &[SessionEvent]) -> Vec<ToolJobOutputFact> {
 
 struct FinishedToolSummary {
     batch_id: String,
+    call_id: String,
     name: String,
     success: bool,
     duration_ms: u64,
     reason: String,
     process: Option<slim_core::process::ProcessExecutionFacts>,
+}
+
+struct FinishedStepSummary {
+    name: String,
+    success: bool,
+    duration_ms: u64,
+    reason: String,
+}
+
+fn format_step_summary_line(step: &FinishedStepSummary) -> String {
+    let status = if step.success { "✓" } else { "✕" };
+    let failure = if step.success { "" } else { " · failed" };
+    let reason = if step.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", step.reason)
+    };
+    format!(
+        "  {status} {}{failure}{reason} · {}ms",
+        step.name, step.duration_ms
+    )
 }
 
 fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
@@ -2599,6 +3409,8 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
     let mut processes =
         std::collections::HashMap::<(&str, &str), &slim_core::process::ProcessExecutionFacts>::new(
         );
+    let mut steps =
+        std::collections::HashMap::<(&str, &str), Vec<FinishedStepSummary>>::new();
     for event in events {
         match &event.kind {
             EventKind::ToolOutput {
@@ -2621,6 +3433,30 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
                 ..
             } if !batch_id.is_empty() && !call_id.is_empty() => {
                 processes.insert((batch_id.as_str(), call_id.as_str()), process);
+            }
+            EventKind::ToolStepFinished {
+                batch_id,
+                call_id,
+                name,
+                success,
+                duration_ms,
+                output,
+                ..
+            } if !batch_id.is_empty() && !call_id.is_empty() => {
+                let reason = if *success {
+                    String::new()
+                } else {
+                    short_failure_reason(output)
+                };
+                steps
+                    .entry((batch_id.as_str(), call_id.as_str()))
+                    .or_default()
+                    .push(FinishedStepSummary {
+                        name: sanitize_timeline_name(slim_tui::api::codemode_step_tool(name)),
+                        success: *success,
+                        duration_ms: *duration_ms,
+                        reason,
+                    });
             }
             _ => {}
         }
@@ -2647,6 +3483,7 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
                 };
                 Some(FinishedToolSummary {
                     batch_id: batch_id.clone(),
+                    call_id: call_id.clone(),
                     name: sanitize_timeline_name(name),
                     success: *success,
                     duration_ms: *duration_ms,
@@ -2682,6 +3519,15 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
                     summarize_timeline_names(members.iter().map(|member| member.name.as_str())),
                     process_timeline_suffix(members),
                 ));
+                for member in members {
+                    if let Some(member_steps) =
+                        steps.get(&(member.batch_id.as_str(), member.call_id.as_str()))
+                    {
+                        for step in member_steps {
+                            lines.push(format_step_summary_line(step));
+                        }
+                    }
+                }
                 index = end;
                 continue;
             }
@@ -2699,6 +3545,11 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
             process_timeline_suffix(std::slice::from_ref(tool)),
             tool.duration_ms,
         ));
+        if let Some(member_steps) = steps.get(&(tool.batch_id.as_str(), tool.call_id.as_str())) {
+            for step in member_steps {
+                lines.push(format_step_summary_line(step));
+            }
+        }
         index += 1;
     }
     lines
@@ -3252,7 +4103,7 @@ fn open_design_max_output_tokens(model: &str) -> Option<u32> {
 }
 /// Looks a Devin model up in the catalog's disk cache, falling back to the
 /// static seed table. Never performs network I/O.
-fn devin_entry(model: &str) -> Option<DevinCatalogEntry> {
+pub(crate) fn devin_entry(model: &str) -> Option<DevinCatalogEntry> {
     DevinCatalog::production()
         .ok()
         .and_then(|catalog| catalog.load_or_fallback().find(model).cloned())
@@ -3386,7 +4237,7 @@ fn catalog_default_max_output_tokens(kind: ProviderKind, model: &str) -> u32 {
         return DEFAULT_MAX_OUTPUT_TOKENS;
     };
     let window = match kind {
-        ProviderKind::OpenCodeGo => open_code_model(model)
+        ProviderKind::OpenCodeGo => crate::opencode_go_catalog::resolve_model(model)
             .and_then(|model| model.context_window)
             .unwrap_or(AgentLoopConfig::default().context_window_tokens),
         ProviderKind::OpenCodeZen => zen_model(model)
@@ -3407,9 +4258,8 @@ fn known_model_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32>
     match kind {
         ProviderKind::OpenAiCodex => codex_model(model).map(|model| model.max_output_tokens),
         ProviderKind::ClinePass => clinepass_model(model).map(|model| model.max_output_tokens),
-        ProviderKind::OpenCodeGo => {
-            open_code_model(model).and_then(|model| model.max_output_tokens)
-        }
+        ProviderKind::OpenCodeGo => crate::opencode_go_catalog::resolve_model(model)
+            .and_then(|model| model.max_output_tokens),
         ProviderKind::OpenCodeZen => zen_model(model).and_then(|model| model.max_output_tokens),
         ProviderKind::Xai => xai_model(model).map(|model| model.max_output_tokens),
         ProviderKind::OpenDesign => open_design_max_output_tokens(model),
@@ -3483,12 +4333,6 @@ fn parse_positive_env_usize(name: &str) -> Result<Option<usize>, String> {
     parse_positive_env_u64(name).map(|value| value.map(|value| value as usize))
 }
 
-const MAX_TURNS_HARD_CAP: usize = 1024;
-
-fn clamp_max_turns(value: usize) -> usize {
-    value.min(MAX_TURNS_HARD_CAP)
-}
-
 pub(crate) fn resolve_max_mutating_tool_calls(
     options: &ProviderRunOptions,
 ) -> Result<usize, ProviderError> {
@@ -3524,15 +4368,11 @@ pub(crate) fn resolve_max_total_tool_calls(
 
 pub(crate) fn resolve_max_turns(options: &ProviderRunOptions) -> Result<usize, ProviderError> {
     if let Some(value) = options.max_turns {
-        return Ok(clamp_max_turns(value));
+        return Ok(value);
     }
     parse_positive_env_usize("SLIM_MAX_TURNS")
         .map_err(|message| ProviderError::InvalidResponse { message })
-        .map(|value| {
-            value
-                .map(clamp_max_turns)
-                .unwrap_or(AgentLoopConfig::DEFAULT_MAX_TURNS)
-        })
+        .map(|value| value.unwrap_or(AgentLoopConfig::DEFAULT_MAX_TURNS))
 }
 
 /// Off unless set; zero from the options or the environment is refused.
@@ -3569,7 +4409,35 @@ fn parse_positive_env_u64(name: &str) -> Result<Option<u64>, String> {
 /// (`x-cmd-zdr: 1`). Accepts 1/true/yes/on; anything else counts as unset so
 /// a typo cannot silently widen retention — the header is only sent when the
 /// value is explicitly affirmative.
-fn command_code_zero_data_retention() -> bool {
+pub(crate) fn resolve_adaptive_reasoning(explicit: Option<bool>) -> bool {
+    if let Some(enabled) = explicit {
+        return enabled;
+    }
+    std::env::var("SLIM_ADAPTIVE_REASONING")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn resolve_stable_tool_envelope(explicit: Option<bool>) -> bool {
+    if let Some(enabled) = explicit {
+        return enabled;
+    }
+    std::env::var("SLIM_STABLE_TOOL_ENVELOPE")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn command_code_zero_data_retention() -> bool {
     ["SLIM_CMD_ZDR", "CMD_ZDR"]
         .iter()
         .filter_map(std::env::var_os)
@@ -3765,7 +4633,7 @@ pub(crate) fn format_run_stop_message(
             limits.max_output_tokens
         ),
         "repeated_failed_tool" => "Repeated failed tool blocked.".into(),
-        "provider_filtered" => "Provider response was filtered before completion.".into(),
+        "provider_filtered" => "Provider safety filter refused to respond to this conversation context. Switch to another model or compact/start a fresh session instead of retrying the same prompt.".into(),
         "no_progress" => {
             "Stopped: no progress in recent turns. Send a follow-up to continue.".into()
         }
@@ -3819,6 +4687,7 @@ fn stop_name(stop: AgentLoopStop) -> &'static str {
         AgentLoopStop::ProviderFiltered => "provider_filtered",
         AgentLoopStop::TurnLimit => "turn_limit",
         AgentLoopStop::TimeLimit => "time_limit",
+        AgentLoopStop::TokenLimit => "token_limit",
         AgentLoopStop::ToolLimit => "tool_limit",
         AgentLoopStop::RepeatedFailedTool => "repeated_failed_tool",
         AgentLoopStop::NoProgress => "no_progress",
@@ -3832,6 +4701,7 @@ fn exit_code_for_stop(stop: AgentLoopStop) -> ExitCode {
         AgentLoopStop::ProviderTruncated | AgentLoopStop::ProviderFiltered => ExitCode::Provider,
         AgentLoopStop::TurnLimit
         | AgentLoopStop::TimeLimit
+        | AgentLoopStop::TokenLimit
         | AgentLoopStop::RepeatedFailedTool
         | AgentLoopStop::NoProgress => ExitCode::Blocked,
         AgentLoopStop::ToolLimit => ExitCode::Tool,
@@ -3960,9 +4830,6 @@ mod run_telemetry_tests;
 
 #[cfg(test)]
 mod resolve_budget_tests;
-
-#[cfg(test)]
-mod plan_loop_tests;
 
 #[cfg(test)]
 mod compaction_resume_tests;

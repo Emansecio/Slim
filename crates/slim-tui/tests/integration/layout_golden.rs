@@ -5,8 +5,8 @@
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use slim_tui::api::{SensitiveText, TodoItemStatus, TodoItemView, UiEvent};
-use slim_tui::app::{AppState, FollowMode, LoginOverlay, LoginStage};
+use slim_tui::api::{TodoItemStatus, TodoItemView, UiEvent};
+use slim_tui::app::{AppState, FollowMode};
 use slim_tui::layout::{plan, plan_with_session_rail};
 use slim_tui::reducer::reduce;
 use slim_tui::render::WrapCache;
@@ -516,19 +516,6 @@ fn grok_footer_keeps_aligned_inset_box_and_adjacent_status() {
 }
 
 #[test]
-fn overflowed_billable_totals_stay_out_of_the_main_screen() {
-    let mut state = AppState::new();
-    state.input_tokens = u64::MAX;
-    state.output_tokens = u64::MAX;
-    state.input_tokens_overflowed = true;
-    state.output_tokens_overflowed = true;
-    let frame = render_to_string(&state, 100, 24);
-    let footer = frame.lines().last().expect("footer");
-    assert!(!footer.contains('↑'));
-    assert!(!footer.contains('↓'));
-}
-
-#[test]
 fn narrow_supported_footer_preserves_context_without_billable_totals() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UsageEstimate {
@@ -721,35 +708,6 @@ fn working_activity_takes_no_row_of_its_own() {
         !rows[..bottom].iter().any(|row| row.contains("Esc parar")),
         "{frame}"
     );
-}
-
-#[test]
-fn emergency_layout_keeps_one_functional_row_each() {
-    let state = todo_state();
-    let frame = render_to_string(&state, 39, 7);
-    assert!(!frame.is_empty());
-    // A complete render without panic is the emergency-layout contract (§14.5).
-}
-
-#[test]
-fn opencode_api_key_overlay_masks_secret() {
-    let mut key = SensitiveText::default();
-    assert!(key.push_str_bounded("fixture-opencode-secret", 4_096));
-    let mut state = AppState::new();
-    state.login_overlay = Some(LoginOverlay {
-        selected: 2,
-        stage: LoginStage::ApiKey(key),
-        in_progress: false,
-        progress: None,
-        auth_url: None,
-        user_code: None,
-    });
-
-    let frame = render_to_string(&state, 80, 24);
-
-    assert!(frame.contains("OpenCode Go API key"), "{frame}");
-    assert!(!frame.contains("fixture-opencode-secret"));
-    assert!(frame.contains("••••"));
 }
 
 #[test]

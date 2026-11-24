@@ -82,6 +82,7 @@ pub(crate) struct ParsedArgs {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub thinking_display: Option<ThinkingDisplay>,
+    pub adaptive_reasoning: Option<bool>,
     pub codex_fast: Option<bool>,
     pub endpoint: Option<String>,
     pub session_path: Option<String>,
@@ -110,6 +111,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         model: None,
         effort: None,
         thinking_display: None,
+        adaptive_reasoning: None,
         codex_fast: None,
         endpoint: None,
         session_path: None,
@@ -142,6 +144,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             "--abandon-pending" => parsed.abandon_pending = true,
             "--fast" => parsed.codex_fast = Some(true),
             "--normal" => parsed.codex_fast = Some(false),
+            "--adaptive-reasoning" => parsed.adaptive_reasoning = Some(true),
             "--verbose" => parsed.verbose = true,
             "--trust-project" => parsed.trust_project = true,
             "--plan" => {
@@ -250,6 +253,7 @@ where
         model,
         effort,
         thinking_display,
+        adaptive_reasoning,
         codex_fast,
         endpoint,
         session_path,
@@ -493,6 +497,9 @@ where
         }
         if let Some(display) = thinking_display {
             options = options.with_thinking_display(display);
+        }
+        if let Some(adaptive) = adaptive_reasoning {
+            options = options.with_adaptive_reasoning(adaptive);
         }
         options.codex_fast = codex_fast;
         options.trust_project = trust_project;

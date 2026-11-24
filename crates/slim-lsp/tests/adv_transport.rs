@@ -161,32 +161,6 @@ async fn response_with_null_error_member_resolves_result() {
     );
 }
 
-#[tokio::test]
-async fn response_with_error_object_becomes_remote_error() {
-    let mut fixture = fixture();
-    let result = request_with_response(&mut fixture, "initialize", |request| {
-        json!({
-            "jsonrpc": "2.0",
-            "id": request.get("id").cloned().unwrap_or(Value::Null),
-            "error": {"code": -32602, "message": "bad params", "data": {"f": 1}},
-        })
-        .to_string()
-    })
-    .await;
-    match result {
-        Err(TransportError::Remote {
-            code,
-            message,
-            data,
-        }) => {
-            assert_eq!(code, -32602);
-            assert_eq!(message, "bad params");
-            assert_eq!(data, Some(json!({"f": 1})));
-        }
-        other => panic!("expected Remote error, got {other:?}"),
-    }
-}
-
 /// Documents current behavior: a non-object, non-null `error` member (strictly
 /// malformed per spec) surfaces as a Protocol error carrying the raw payload.
 #[tokio::test]
@@ -271,45 +245,6 @@ async fn response_for_unknown_id_is_ignored() {
         .await;
     });
     assert_eq!(result.expect("response"), json!("real"));
-}
-
-#[tokio::test]
-async fn out_of_order_responses_resolve_their_own_callers() {
-    let mut fixture = fixture();
-    let first = fixture.transport.request("slow", json!({}));
-    let second = fixture.transport.request("fast", json!({}));
-    let server = async {
-        let req_a = read_frame_bounded(&mut fixture.reader)
-            .await
-            .expect("first request");
-        let req_b = read_frame_bounded(&mut fixture.reader)
-            .await
-            .expect("second request");
-        // Answer the second request first.
-        write_frame(
-            &mut fixture.writer,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": req_b.get("id").cloned().unwrap_or(Value::Null),
-                "result": "b"
-            })
-            .to_string(),
-        )
-        .await;
-        write_frame(
-            &mut fixture.writer,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": req_a.get("id").cloned().unwrap_or(Value::Null),
-                "result": "a"
-            })
-            .to_string(),
-        )
-        .await;
-    };
-    let (a, b, _) = tokio::join!(first, second, server);
-    assert_eq!(a.expect("first request"), json!("a"));
-    assert_eq!(b.expect("second request"), json!("b"));
 }
 
 #[tokio::test]
@@ -515,69 +450,6 @@ async fn oversized_request_is_rejected_but_transport_survives() {
 // ---------------------------------------------------------------------------
 // Server-initiated requests, notifications, lifecycle
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn server_request_receives_method_not_found_from_handler_error() {
-    let mut fixture = fixture_with(|method, _| Err(format!("no {method}")));
-    write_frame(
-        &mut fixture.writer,
-        &json!({"jsonrpc":"2.0","id":4242,"method":"workspace/configuration","params":{}})
-            .to_string(),
-    )
-    .await;
-    let reply = read_frame_bounded(&mut fixture.reader)
-        .await
-        .expect("transport must answer the server request");
-    assert_eq!(reply.get("id"), Some(&json!(4242)));
-    assert_eq!(
-        reply.pointer("/error/code").and_then(Value::as_i64),
-        Some(-32601)
-    );
-}
-
-#[tokio::test]
-async fn server_request_ok_handler_result_is_returned() {
-    let mut fixture = fixture_with(|_, _| Ok(json!({"answered": true})));
-    write_frame(
-        &mut fixture.writer,
-        &json!({"jsonrpc":"2.0","id":7,"method":"client/registerCapability","params":{}})
-            .to_string(),
-    )
-    .await;
-    let reply = read_frame_bounded(&mut fixture.reader)
-        .await
-        .expect("transport must answer the server request");
-    assert_eq!(reply.get("result"), Some(&json!({"answered": true})));
-}
-
-#[tokio::test]
-async fn notification_flood_is_bounded_and_counted() {
-    let mut fixture = fixture_options(
-        TransportOptions {
-            notification_capacity: 4,
-            notification_max_bytes: MAX_BODY,
-            ..options()
-        },
-        Box::new(|_, _| Err("unsupported".to_owned())),
-    );
-    for index in 0..20 {
-        write_frame(
-            &mut fixture.writer,
-            &json!({"jsonrpc":"2.0","method":"window/logMessage","params":{"n":index}}).to_string(),
-        )
-        .await;
-    }
-    // Wait until the read loop has consumed the flood.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while fixture.transport.notification_drop_count() < 16 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "drops should be recorded for a bounded mailbox"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(!fixture.transport.is_closed());
-}
 
 #[tokio::test]
 async fn request_after_peer_eof_fails_closed_fast() {

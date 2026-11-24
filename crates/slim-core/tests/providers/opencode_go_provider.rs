@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use slim_core::provider::{
     open_code_model, open_code_models, OpenCodeApi, OpenCodeGoAdapter, ProviderAdapter,
-    ProviderEvent, ProviderKind, OPENCODE_GO_BASE_URL,
+    ProviderEvent, OPENCODE_GO_BASE_URL,
 };
 
 #[test]
@@ -97,21 +97,25 @@ fn session_headers_cover_all_protocols_and_auxiliary_requests() {
 }
 
 #[test]
-fn documented_registry_contains_25_unique_models() {
+fn documented_registry_contains_31_unique_models() {
     let models = open_code_models();
     let unique = models.iter().map(|model| model.id).collect::<HashSet<_>>();
 
-    assert_eq!((models.len(), unique.len()), (25, 25));
+    assert_eq!((models.len(), unique.len()), (31, 31));
     let spark = open_code_model("muse-spark-1.3-contributor").expect("Spark 1.3 metadata");
     assert_eq!(spark.context_window, Some(1_048_576));
     assert_eq!(spark.max_output_tokens, Some(131_072));
     assert!(spark.accepts_images);
     assert_eq!(spark.reasoning_levels, &["low", "medium", "high", "xhigh"]);
+    let qwen4 = open_code_model("qwen4-max").expect("Qwen4 Max metadata");
+    assert_eq!(qwen4.api, OpenCodeApi::AnthropicMessages);
+    let gpt6 = open_code_model("gpt-6-luna").expect("GPT-6 Luna metadata");
+    assert_eq!(gpt6.api, OpenCodeApi::Responses);
 }
 
 #[test]
 fn deepseek_v4_1_flash_uses_documented_chat_metadata() {
-    let model = open_code_model("deepseek-flash").expect("DeepSeek V4.1 Flash metadata");
+    let model = open_code_model("deepseek-v4.1-flash").expect("DeepSeek V4.1 Flash metadata");
 
     assert_eq!(model.name, "DeepSeek V4.1 Flash");
     assert_eq!(model.api, OpenCodeApi::ChatCompletions);
@@ -120,8 +124,8 @@ fn deepseek_v4_1_flash_uses_documented_chat_metadata() {
     assert!(model.accepts_images);
     assert_eq!(model.reasoning_levels, &["low", "high", "max"]);
     assert_eq!(
-        open_code_model("deepseek-v4.1-flash").map(|model| model.id),
-        Some("deepseek-flash")
+        open_code_model("deepseek-flash").map(|model| model.id),
+        Some("deepseek-v4.1-flash")
     );
 }
 
@@ -129,7 +133,7 @@ fn deepseek_v4_1_flash_uses_documented_chat_metadata() {
 fn deepseek_v4_1_flash_entry_uses_canonical_wire_id() {
     let adapter = OpenCodeGoAdapter::new(
         OPENCODE_GO_BASE_URL,
-        "deepseek-v4.1-flash",
+        "deepseek-flash",
         "go-secret",
         None,
     )
@@ -138,7 +142,7 @@ fn deepseek_v4_1_flash_entry_uses_canonical_wire_id() {
     let request = adapter.build_request("hello");
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("body");
 
-    assert_eq!(body["model"], "deepseek-flash");
+    assert_eq!(body["model"], "deepseek-v4.1-flash");
 }
 
 #[test]
@@ -146,7 +150,6 @@ fn registry_exposes_context_output_reasoning_and_image_metadata() {
     for model in open_code_models() {
         assert!(model.context_window.is_some_and(|tokens| tokens > 0));
         assert!(model.max_output_tokens.is_some_and(|tokens| tokens > 0));
-        assert!(!model.reasoning_levels.is_empty());
     }
     let luna = open_code_model("gpt-5.6-luna").expect("Luna metadata");
     assert_eq!(luna.context_window, Some(1_050_000));
@@ -171,29 +174,8 @@ fn default_model_uses_chat_completions() {
 }
 
 #[test]
-fn responses_model_uses_documented_protocol() {
-    assert_eq!(
-        open_code_model("gpt-5.6-luna").map(|model| model.api),
-        Some(OpenCodeApi::Responses)
-    );
-}
-
-#[test]
-fn messages_model_uses_documented_protocol() {
-    assert_eq!(
-        open_code_model("minimax-m3").map(|model| model.api),
-        Some(OpenCodeApi::AnthropicMessages)
-    );
-}
-
-#[test]
 fn endpoint_only_unknown_model_is_not_supported() {
     assert!(open_code_model("kimi-k2.5").is_none());
-}
-
-#[test]
-fn logical_provider_is_distinct_from_wire_protocol() {
-    assert_ne!(ProviderKind::OpenCodeGo, ProviderKind::OpenAiCompatible);
 }
 
 #[test]

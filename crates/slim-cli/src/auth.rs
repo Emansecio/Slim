@@ -247,6 +247,17 @@ pub fn resolve_api_key(kind: ProviderKind) -> Result<Option<String>, AuthError> 
 pub fn resolve_provider_credential(
     kind: ProviderKind,
 ) -> Result<Option<ProviderCredential>, AuthError> {
+    if let Some(credential) = resolve_env_credential(kind) {
+        return Ok(Some(credential));
+    }
+
+    let Some(path) = auth_file_path()? else {
+        return Ok(None);
+    };
+    load_auth_credential(&path, kind)
+}
+
+pub(crate) fn resolve_env_credential(kind: ProviderKind) -> Option<ProviderCredential> {
     let provider_variable = match kind {
         ProviderKind::OpenAiCompatible => "OPENAI_API_KEY",
         ProviderKind::OpenAiCodex => "CODEX_ACCESS_TOKEN",
@@ -261,21 +272,17 @@ pub fn resolve_provider_credential(
         ProviderKind::Devin => "DEVIN_API_KEY",
     };
     if let Some(value) = non_empty_environment_value("SLIM_API_KEY") {
-        return Ok(Some(env_credential(value)));
+        return Some(env_credential(value));
     }
     if let Some(value) = non_empty_environment_value(provider_variable) {
-        return Ok(Some(env_credential(value)));
+        return Some(env_credential(value));
     }
     if kind == ProviderKind::CommandCode {
         if let Some(value) = non_empty_environment_value("CMD_API_KEY") {
-            return Ok(Some(env_credential(value)));
+            return Some(env_credential(value));
         }
     }
-
-    let Some(path) = auth_file_path()? else {
-        return Ok(None);
-    };
-    load_auth_credential(&path, kind)
+    None
 }
 
 fn env_credential(access: String) -> ProviderCredential {
@@ -284,6 +291,81 @@ fn env_credential(access: String) -> ProviderCredential {
         account_id: None,
         oauth: false,
     }
+}
+
+pub(crate) struct AuthSnapshot(Option<AuthDocument>);
+
+impl AuthSnapshot {
+    pub(crate) fn active_provider_key(&self) -> Option<&str> {
+        self.0
+            .as_ref()
+            .and_then(|document| document.active_provider.as_deref())
+    }
+
+    pub(crate) fn provider_credential(
+        &self,
+        kind: ProviderKind,
+    ) -> Result<Option<ProviderCredential>, AuthError> {
+        let Some(document) = self.0.as_ref() else {
+            return Ok(None);
+        };
+        let Some(provider) = provider_slot(&document.providers, kind) else {
+            return Ok(None);
+        };
+        provider_credential_from_entry(provider)
+    }
+
+    pub(crate) fn oauth_credential(
+        &self,
+        provider: crate::oauth::OAuthProvider,
+    ) -> Result<Option<crate::oauth::OAuthCredential>, AuthError> {
+        let Some(document) = self.0.as_ref() else {
+            return Ok(None);
+        };
+        let kind = match provider {
+            crate::oauth::OAuthProvider::Anthropic => ProviderKind::Anthropic,
+            crate::oauth::OAuthProvider::OpenAiCodex => ProviderKind::OpenAiCodex,
+            crate::oauth::OAuthProvider::Xai => ProviderKind::Xai,
+        };
+        let Some(entry) = provider_slot(&document.providers, kind) else {
+            return Ok(None);
+        };
+        if entry.preferred_method.as_option() == Some(PreferredAuthMethod::ApiKey) {
+            return Ok(None);
+        }
+        entry
+            .oauth
+            .as_ref()
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|_| AuthError::InvalidSchema)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn active_oauth(
+        &self,
+    ) -> Result<Option<(crate::oauth::OAuthProvider, crate::oauth::OAuthCredential)>, AuthError> {
+        let provider = match self.active_provider_key() {
+            Some("anthropic") => crate::oauth::OAuthProvider::Anthropic,
+            Some("openai-codex") => crate::oauth::OAuthProvider::OpenAiCodex,
+            Some("xai") => crate::oauth::OAuthProvider::Xai,
+            _ => return Ok(None),
+        };
+        Ok(self
+            .oauth_credential(provider)?
+            .map(|credential| (provider, credential)))
+    }
+}
+
+pub(crate) fn load_auth_snapshot_at(path: &Path) -> Result<AuthSnapshot, AuthError> {
+    read_auth_document(path).map(AuthSnapshot)
+}
+
+pub(crate) fn load_auth_snapshot() -> Result<AuthSnapshot, AuthError> {
+    let Some(path) = auth_file_path()? else {
+        return Ok(AuthSnapshot(None));
+    };
+    load_auth_snapshot_at(&path)
 }
 
 /// Load one provider key from an existing auth file. This is public so the
@@ -300,27 +382,21 @@ pub fn load_auth_credential(
     let Some(document) = read_auth_document(path)? else {
         return Ok(None);
     };
-    let provider = match kind {
-        ProviderKind::OpenAiCompatible => document.providers.openai_compatible,
-        ProviderKind::OpenAiCodex => document.providers.openai_codex,
-        ProviderKind::Anthropic => document.providers.anthropic,
-        ProviderKind::OpenCodeGo => document.providers.opencode_go,
-        ProviderKind::OpenCodeZen => document.providers.opencode_zen,
-        ProviderKind::ClinePass => document.providers.clinepass,
-        ProviderKind::CommandCode => document.providers.command_code,
-        ProviderKind::Xai => document.providers.xai,
-        ProviderKind::OpenDesign => document.providers.open_design,
-        ProviderKind::Devin => document.providers.devin,
-    };
-    let Some(provider) = provider else {
+    let Some(provider) = provider_slot(&document.providers, kind) else {
         return Ok(None);
     };
+    provider_credential_from_entry(provider)
+}
+
+fn provider_credential_from_entry(
+    provider: &AuthProvider,
+) -> Result<Option<ProviderCredential>, AuthError> {
     match provider.preferred_method.as_option() {
-        Some(PreferredAuthMethod::OAuth) => auth_oauth_credential(provider.oauth),
-        Some(PreferredAuthMethod::ApiKey) => auth_api_key_credential(provider.api_key),
-        None => auth_oauth_credential(provider.oauth).and_then(|credential| match credential {
+        Some(PreferredAuthMethod::OAuth) => auth_oauth_credential(provider.oauth.clone()),
+        Some(PreferredAuthMethod::ApiKey) => auth_api_key_credential(provider.api_key.clone()),
+        None => auth_oauth_credential(provider.oauth.clone()).and_then(|credential| match credential {
             Some(credential) => Ok(Some(credential)),
-            None => auth_api_key_credential(provider.api_key),
+            None => auth_api_key_credential(provider.api_key.clone()),
         }),
     }
 }
@@ -468,6 +544,21 @@ fn provider_name(kind: ProviderKind) -> &'static str {
         ProviderKind::Xai => "xai",
         ProviderKind::OpenDesign => "open-design",
         ProviderKind::Devin => "devin",
+    }
+}
+
+fn provider_slot(providers: &AuthProviders, kind: ProviderKind) -> Option<&AuthProvider> {
+    match kind {
+        ProviderKind::OpenAiCompatible => providers.openai_compatible.as_ref(),
+        ProviderKind::OpenAiCodex => providers.openai_codex.as_ref(),
+        ProviderKind::Anthropic => providers.anthropic.as_ref(),
+        ProviderKind::OpenCodeGo => providers.opencode_go.as_ref(),
+        ProviderKind::OpenCodeZen => providers.opencode_zen.as_ref(),
+        ProviderKind::ClinePass => providers.clinepass.as_ref(),
+        ProviderKind::CommandCode => providers.command_code.as_ref(),
+        ProviderKind::Xai => providers.xai.as_ref(),
+        ProviderKind::OpenDesign => providers.open_design.as_ref(),
+        ProviderKind::Devin => providers.devin.as_ref(),
     }
 }
 
@@ -817,7 +908,7 @@ pub(crate) fn user_home_var() -> Option<std::ffi::OsString> {
 
 #[cfg(windows)]
 pub(crate) fn secure_auth_file(path: &Path) -> Result<Vec<u8>, AuthError> {
-    NativeAuthFile::open(path)?.secure_and_read()
+    NativeAuthFile::open(path)?.secure_and_read(path)
 }
 
 #[cfg(not(windows))]
@@ -1118,12 +1209,12 @@ mod native_acl {
             Ok(unsafe { File::from_raw_handle(handle) })
         }
 
-        pub(super) fn open(path: &Path) -> Result<Self, AuthError> {
+        fn open_with_access(path: &Path, desired_access: u32) -> Result<Self, AuthError> {
             let path_wide = wide_path(path)?;
             let handle = unsafe {
                 CreateFileW(
                     path_wide.as_ptr(),
-                    GENERIC_READ | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+                    desired_access,
                     FILE_SHARE_READ,
                     null(),
                     OPEN_EXISTING,
@@ -1141,12 +1232,27 @@ mod native_acl {
             Ok(file)
         }
 
-        pub(super) fn secure_and_read(self) -> Result<Vec<u8>, AuthError> {
-            let allowed = allowed_sids(self.handle.0)?;
+        pub(super) fn open(path: &Path) -> Result<Self, AuthError> {
+            Self::open_with_access(
+                path,
+                GENERIC_READ | windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+            )
+        }
 
-            install_dacl(self.handle.0, &allowed)?;
-            verify_dacl(self.handle.0, &allowed)?;
-            read_contents(self.handle.0)
+        pub(super) fn secure_and_read(self, path: &Path) -> Result<Vec<u8>, AuthError> {
+            let allowed = allowed_sids(self.handle.0)?;
+            if verify_dacl(self.handle.0, &allowed).is_ok() {
+                return read_contents(self.handle.0);
+            }
+            drop(self);
+            let reopened = Self::open_with_access(
+                path,
+                GENERIC_READ | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+            )?;
+            let allowed = allowed_sids(reopened.handle.0)?;
+            install_dacl(reopened.handle.0, &allowed)?;
+            verify_dacl(reopened.handle.0, &allowed)?;
+            read_contents(reopened.handle.0)
         }
 
         fn ensure_regular_non_reparse_file(&self) -> Result<(), AuthError> {

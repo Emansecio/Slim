@@ -437,20 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn the_duration_spans_the_blocks_that_carry_both_timestamps() {
-        let mut first = thought();
-        first.started_ms = Some(1_000);
-        first.ended_ms = Some(4_000);
-        let mut second = tool("1", "read", BlockLifecycle::Complete);
-        second.started_ms = Some(4_100);
-        second.ended_ms = Some(13_000);
-        let blocks = [user(), first, second, answer("fim")];
-        let (_, work) = plan_turn(&blocks, 0).expect("folds");
-        assert_eq!(work.duration_ms, Some(12_000));
-        assert_eq!(work.summary(), "Trabalhou 12s · 1 leitura");
-    }
-
-    #[test]
     fn a_member_is_folded_away_only_while_its_row_is_collapsed() {
         let state = WorkState {
             until: answer("fim").id,

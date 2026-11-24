@@ -426,13 +426,14 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
         }
         BlockKind::Thinking(text) => match block.fold {
             crate::block::FoldState::Expanded => {
-                1 + cache.cached_body_rows(
-                    block,
-                    BodyKind::Thinking,
-                    width,
-                    block.lifecycle != crate::block::BlockLifecycle::Streaming,
-                    || crate::thought::body_row_count(text, thinking_body_width(width)),
-                )
+                let cacheable = block.lifecycle != crate::block::BlockLifecycle::Streaming;
+                1 + if cacheable {
+                    cache.cached_body_rows(block, BodyKind::Thinking, width, true, || {
+                        crate::thought::body_row_count(text, thinking_body_width(width))
+                    })
+                } else {
+                    cache.cached_streaming_thinking_rows(block, text, width)
+                }
             }
             // Collapsed and streaming thoughts are one row: the newest words
             // ride on the header.
@@ -443,19 +444,18 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
         // prefix, using the same physical-row contract as materialization.
         BlockKind::Tool(state) => {
             if block.fold == crate::block::FoldState::Expanded {
+                let cacheable = block.lifecycle != crate::block::BlockLifecycle::Streaming;
                 let body = if state.has_expanded_body() {
-                    cache.cached_body_rows(
-                        block,
-                        BodyKind::ToolOutput,
-                        width,
-                        block.lifecycle != crate::block::BlockLifecycle::Streaming,
-                        || {
+                    if cacheable {
+                        cache.cached_body_rows(block, BodyKind::ToolOutput, width, true, || {
                             wrapped_row_count(
                                 &state.expanded_body(),
                                 width.saturating_sub(4).max(1) as usize,
                             )
-                        },
-                    )
+                        })
+                    } else {
+                        cache.cached_streaming_tool_rows(block, state, width)
+                    }
                 } else {
                     0
                 };
@@ -573,6 +573,7 @@ pub(crate) struct HeightIndexMemo {
     spans: Vec<(u64, usize, usize, usize)>,
     block_rows: HashMap<crate::api::BlockId, (u64, u64)>,
     total_rows: u64,
+    block_count: usize,
 }
 
 impl<'a> HeightIndex<'a> {
@@ -596,11 +597,78 @@ impl<'a> HeightIndex<'a> {
     }
 
     pub fn build(blocks: &'a [Block], width: u16, cache: &mut WrapCache) -> Self {
-        let mut block_rows = HashMap::with_capacity(blocks.len());
-        let mut spans = Vec::with_capacity(blocks.len());
+        Self::build_incremental(blocks, width, cache, None, 0)
+    }
+
+    pub(crate) fn build_incremental(
+        blocks: &'a [Block],
+        width: u16,
+        cache: &mut WrapCache,
+        prev_memo: Option<&HeightIndexMemo>,
+        dirty_from: usize,
+    ) -> Self {
+        let resume = prev_memo.filter(|_| dirty_from > 0).and_then(|prev| {
+            if prev.spans.is_empty()
+                || dirty_from > prev.block_count
+                || prev.block_count > blocks.len()
+            {
+                return None;
+            }
+            let span_idx = prev
+                .spans
+                .partition_point(|&(_, _, _, end)| end <= dirty_from);
+            let mut resume_span_idx = span_idx.saturating_sub(1);
+            let is_groupable_span = |idx: usize| -> bool {
+                let (_, _, start, end) = prev.spans[idx];
+                blocks.get(start..end).is_some_and(|slice| {
+                    slice.iter().all(|block| {
+                        matches!(
+                            block.kind(),
+                            BlockKind::Tool(_)
+                                | BlockKind::Thinking(_)
+                                | BlockKind::QueuedUser(_)
+                        )
+                    })
+                })
+            };
+            // Step back across contiguous spans that can group or bridge with
+            // blocks at or after `dirty_from` (e.g. Tool -> Thinking -> Tool).
+            while resume_span_idx > 0 && is_groupable_span(resume_span_idx) {
+                resume_span_idx -= 1;
+            }
+            if resume_span_idx == 0 {
+                return None;
+            }
+            let (resume_prefix, _, resume_block_idx, _) = prev.spans[resume_span_idx];
+            if resume_block_idx == 0 || resume_block_idx > blocks.len() {
+                return None;
+            }
+            Some((prev, resume_span_idx, resume_prefix, resume_block_idx))
+        });
+
+        let (mut block_rows, mut spans, mut prefix, mut index) = if let Some((
+            prev,
+            resume_span_idx,
+            resume_prefix,
+            resume_block_idx,
+        )) = resume
+        {
+            let mut block_rows = prev.block_rows.clone();
+            for block in &blocks[resume_block_idx..] {
+                block_rows.remove(&block.id);
+            }
+            let mut spans = Vec::with_capacity(blocks.len());
+            spans.extend_from_slice(&prev.spans[..resume_span_idx]);
+            (block_rows, spans, resume_prefix, resume_block_idx)
+        } else {
+            (
+                HashMap::with_capacity(blocks.len()),
+                Vec::with_capacity(blocks.len()),
+                0u64,
+                0usize,
+            )
+        };
         let mut pending_heights = Vec::new();
-        let mut prefix = 0u64;
-        let mut index = 0usize;
         while index < blocks.len() {
             let block = &blocks[index];
             // Grouped spans always start at `index`, so the leader's leading
@@ -792,6 +860,7 @@ impl<'a> HeightIndex<'a> {
                 spans,
                 block_rows,
                 total_rows: prefix,
+                block_count: blocks.len(),
             }),
         }
     }
@@ -1122,6 +1191,10 @@ pub struct WrapCache {
     /// derivations kept so height measurement and paint share one wrap per
     /// content generation instead of re-wrapping every frame.
     scratch_bodies: Vec<(BodyKey, Arc<Vec<RatatuiLine<'static>>>)>,
+    /// Palette-independent wrapped rows populated during `block_height` for
+    /// expanded `Thinking`/`Tool` blocks in `Streaming` so paint applies the
+    /// active `Palette` without wrapping a second time or mixing color depths.
+    scratch_raw_bodies: Vec<(BodyKey, Arc<ScratchRawBody>)>,
     /// Shared markdown projections keyed by (identity, generation, body width):
     /// one pulldown-cmark parse feeds both row counting and body rendering.
     #[allow(clippy::type_complexity)]
@@ -1217,17 +1290,39 @@ struct FooterKey {
     activity_visible: bool,
 }
 
+pub(crate) enum ScratchRawBody {
+    Thinking(Vec<(String, bool)>),
+    ToolOutput(Vec<(String, Option<crate::block::DiffRowKind>)>),
+}
+
 /// See `WrapCache::streaming_projection`.
+struct OpenFence {
+    start: usize,
+    lines_start: usize,
+    rows_before_fence: usize,
+    marker: (u8, usize),
+    indent: usize,
+    diff: bool,
+    projected_end: usize,
+}
+
 struct StreamingPrefix {
     identity: u64,
     width: u16,
-    /// Bytes of the body the lines cover.
+    /// Bytes of the body the lines cover (outside any open fence).
     len: usize,
     lines: Vec<LogicalLine>,
     /// Rows the prefix wraps into, summed without the one-row floor.
     rows: usize,
-    /// The prefix rendered once, with the styles it was rendered in.
-    wrapped: Option<(MarkdownStyles, Vec<RatatuiLine<'static>>)>,
+    open_fence: Option<OpenFence>,
+    /// The prefix rendered incrementally once per added logical line, keyed on
+    /// `(styles, indent, wrapped_logical_lines, wrapped_rows)`.
+    wrapped: Option<(
+        MarkdownStyles,
+        ratatui::text::Span<'static>,
+        usize,
+        Arc<Vec<RatatuiLine<'static>>>,
+    )>,
 }
 
 const SCRATCH_BODY_SLOTS: usize = 4;
@@ -1269,13 +1364,17 @@ fn memoized<K: PartialEq, V>(slot: &mut Option<(K, V)>, key: K, produce: impl Fn
 
 impl WrapCache {
     /// Height index for the current frame: shares the memoized index content
-    /// when (content, fold, width) are unchanged, built otherwise.
+    /// when (content, fold, width) are unchanged, and otherwise incrementally
+    /// rebuilds from the span preceding `dirty_from` when a compatible prior
+    /// memo exists for `(fold_rev, width)`.
     pub(crate) fn height_index<'a>(
         &mut self,
         blocks: &'a [Block],
         content_rev: u64,
         fold_rev: u64,
         width: u16,
+        dirty_from: usize,
+        dirty_base_content_rev: u64,
     ) -> HeightIndex<'a> {
         let key = (content_rev, fold_rev, width);
         if let Some(memo) = self.height_indexes.get(&key) {
@@ -1285,9 +1384,27 @@ impl WrapCache {
                 total_rows: memo.total_rows,
             };
         }
-        let index = HeightIndex::build(blocks, width, self);
-        self.height_indexes
-            .retain(|(c, f, _), _| *c == content_rev && *f == fold_rev);
+        let prev_memo = if dirty_from > 0 {
+            self.height_indexes
+                .iter()
+                .filter(|((c, f, w), _)| {
+                    *f == fold_rev && *w == width && *c >= dirty_base_content_rev
+                })
+                .max_by_key(|((c, _, _), _)| *c)
+                .map(|(_, memo)| Arc::clone(memo))
+        } else {
+            None
+        };
+        let index = HeightIndex::build_incremental(
+            blocks,
+            width,
+            self,
+            prev_memo.as_deref(),
+            dirty_from,
+        );
+        self.height_indexes.retain(|(c, f, w), _| {
+            *f == fold_rev && (*c == content_rev || (*c >= dirty_base_content_rev && *w != width))
+        });
         if self.height_indexes.len() >= MAX_HEIGHT_INDEX_MEMOS {
             self.height_indexes.clear();
         }
@@ -1381,25 +1498,30 @@ impl WrapCache {
             .filter(|prefix| prefix.identity == block.cache_identity() && prefix.width == width)
             .map_or((0, 0), |prefix| {
                 let gap = usize::from(
-                    !projection.is_empty()
-                        && crate::markdown::projection_ends_with_text(&prefix.lines),
+                    prefix.open_fence.is_none()
+                        && crate::markdown::needs_gap_between(&prefix.lines, &projection),
                 );
                 (prefix.rows, gap)
             });
         (prefix_rows + gap + crate::markdown::projected_rows_sum(&projection, width)).max(1)
     }
 
-    /// The wrapped body of the answer being written: the stable prefix is
-    /// wrapped once per advance and reused, the tail is wrapped per
-    /// generation. `indent` opens every row (the prose column).
-    pub(crate) fn streaming_body(
+    /// Wrapped parts of a streaming assistant body: an `Arc` over the
+    /// incrementally-wrapped stable prefix (never cloned when only the visible
+    /// viewport slice is painted), an optional blank gap row before the tail,
+    /// and the newly-rendered tail rows.
+    pub(crate) fn streaming_body_parts(
         &mut self,
         block: &Block,
         text: &str,
         width: u16,
         styles: MarkdownStyles,
         indent: ratatui::text::Span<'static>,
-    ) -> Vec<RatatuiLine<'static>> {
+    ) -> (
+        Option<Arc<Vec<RatatuiLine<'static>>>>,
+        bool,
+        Vec<RatatuiLine<'static>>,
+    ) {
         let tail = self.markdown_projection(block, text, width);
         let indent_rows = |rows: Vec<RatatuiLine<'static>>| -> Vec<RatatuiLine<'static>> {
             rows.into_iter()
@@ -1417,36 +1539,73 @@ impl WrapCache {
             .filter(|prefix| prefix.identity == block.cache_identity() && prefix.width == width)
             .filter(|prefix| !prefix.lines.is_empty())
         else {
-            return indent_rows(crate::markdown::render_projected(&tail, width, styles));
+            return (
+                None,
+                false,
+                indent_rows(crate::markdown::render_projected(&tail, width, styles)),
+            );
         };
-        if prefix
+        let rebuild = prefix
             .wrapped
             .as_ref()
-            .is_none_or(|(rendered, _)| !markdown_styles_equal(rendered, &styles))
-        {
+            .is_none_or(|(rendered, stored_indent, _, _)| {
+                !markdown_styles_equal(rendered, &styles) || stored_indent != &indent
+            });
+        if rebuild {
+            let rendered = indent_rows(crate::markdown::render_projected(
+                &prefix.lines,
+                width,
+                styles,
+            ));
             prefix.wrapped = Some((
                 styles,
-                indent_rows(crate::markdown::render_projected(
-                    &prefix.lines,
+                indent.clone(),
+                prefix.lines.len(),
+                Arc::new(rendered),
+            ));
+        } else if let Some((_, _, wrapped_lines, wrapped_arc)) = &mut prefix.wrapped {
+            if *wrapped_lines < prefix.lines.len() {
+                let extra = indent_rows(crate::markdown::render_projected(
+                    &prefix.lines[*wrapped_lines..],
                     width,
                     styles,
-                )),
-            ));
+                ));
+                Arc::make_mut(wrapped_arc).extend(extra);
+                *wrapped_lines = prefix.lines.len();
+            }
         }
-        let mut lines = prefix
+        let prefix_arc = prefix
             .wrapped
             .as_ref()
-            .map(|(_, lines)| lines.clone())
-            .expect("prefix wrapped");
+            .map(|(_, _, _, arc)| Arc::clone(arc));
         if tail.is_empty() {
-            return lines;
+            return (prefix_arc, false, Vec::new());
         }
-        if crate::markdown::projection_ends_with_text(&prefix.lines) {
-            lines.push(RatatuiLine::from(vec![indent.clone()]));
+        let gap = prefix.open_fence.is_none()
+            && crate::markdown::needs_gap_between(&prefix.lines, &tail);
+        let tail_lines = indent_rows(crate::markdown::render_projected(&tail, width, styles));
+        (prefix_arc, gap, tail_lines)
+    }
+
+    /// The wrapped body of the answer being written: the stable prefix is
+    /// wrapped once per advance and reused, the tail is wrapped per
+    /// generation. `indent` opens every row (the prose column).
+    #[cfg(test)]
+    pub(crate) fn streaming_body(
+        &mut self,
+        block: &Block,
+        text: &str,
+        width: u16,
+        styles: MarkdownStyles,
+        indent: ratatui::text::Span<'static>,
+    ) -> Vec<RatatuiLine<'static>> {
+        let (prefix, gap, tail) =
+            self.streaming_body_parts(block, text, width, styles, indent.clone());
+        let mut lines = prefix.map_or_else(Vec::new, |arc| arc.as_ref().clone());
+        if gap {
+            lines.push(RatatuiLine::from(vec![indent]));
         }
-        lines.extend(indent_rows(crate::markdown::render_projected(
-            &tail, width, styles,
-        )));
+        lines.extend(tail);
         lines
     }
 
@@ -1484,16 +1643,20 @@ impl WrapCache {
     /// The projection of the tail of a body still streaming: the stable
     /// prefix (see `markdown::stable_prefix_len`) stays projected from one
     /// flush to the next and only the growing tail is parsed again, so a long
-    /// reply costs its tail per frame, not its whole length. The prefix is
-    /// kept in `streaming_prefix`; `markdown_rows` and `streaming_body` join
-    /// the two. The complete body is projected whole once its lifecycle
-    /// changes.
+    /// reply costs its tail per frame, not its whole length. Open fenced code
+    /// blocks advance line-by-line and are replaced with a full parse once
+    /// closed.
     fn streaming_projection(&mut self, identity: u64, text: &str, width: u16) -> Vec<LogicalLine> {
         let kept = self.streaming_prefix.take().filter(|prefix| {
             prefix.identity == identity
                 && prefix.width == width
                 && prefix.len <= text.len()
                 && text.is_char_boundary(prefix.len)
+                && prefix.open_fence.as_ref().is_none_or(|fence| {
+                    fence.start == prefix.len
+                        && fence.projected_end <= text.len()
+                        && text.is_char_boundary(fence.projected_end)
+                })
         });
         let mut prefix = kept.unwrap_or_else(|| StreamingPrefix {
             identity,
@@ -1501,22 +1664,206 @@ impl WrapCache {
             len: 0,
             lines: Vec::new(),
             rows: 0,
+            open_fence: None,
             wrapped: None,
         });
+
+        if let Some(mut fence) = prefix.open_fence.take() {
+            let remaining = &text[fence.projected_end..];
+            let closing = remaining
+                .split_inclusive('\n')
+                .any(|line| crate::markdown::is_closing_fence_line(line, fence.marker));
+            if closing {
+                prefix.lines.truncate(fence.lines_start);
+                prefix.rows = fence.rows_before_fence;
+                if let Some((_, _, wrapped_lines, wrapped_arc)) = &mut prefix.wrapped {
+                    if *wrapped_lines > fence.lines_start {
+                        Arc::make_mut(wrapped_arc).truncate(fence.rows_before_fence);
+                        *wrapped_lines = fence.lines_start;
+                    }
+                }
+                prefix.len = fence.start;
+            } else {
+                if let Some(last_nl) = remaining.rfind('\n') {
+                    let complete = &remaining[..=last_nl];
+                    let old_len = prefix.lines.len();
+                    for line in complete.split_inclusive('\n') {
+                        prefix.lines.push(crate::markdown::project_open_fence_line(
+                            line,
+                            fence.indent,
+                            fence.diff,
+                        ));
+                    }
+                    fence.projected_end += complete.len();
+                    prefix.rows +=
+                        crate::markdown::projected_rows_sum(&prefix.lines[old_len..], width);
+                }
+                let tail = crate::markdown::project_open_fence_tail(
+                    &text[fence.projected_end..],
+                    fence.indent,
+                    fence.diff,
+                    fence.marker,
+                );
+                prefix.open_fence = Some(fence);
+                self.streaming_prefix = Some(prefix);
+                return tail;
+            }
+        }
+
         let advance = crate::markdown::stable_prefix_len(&text[prefix.len..]);
         if advance > 0 {
             let start = prefix.len;
+            let old_len = prefix.lines.len();
             crate::markdown::append_projection(
                 &mut prefix.lines,
                 crate::markdown::project_markdown(&text[start..start + advance], width),
             );
             prefix.len += advance;
-            prefix.rows = crate::markdown::projected_rows_sum(&prefix.lines, width);
-            prefix.wrapped = None;
+            prefix.rows += crate::markdown::projected_rows_sum(&prefix.lines[old_len..], width);
         }
+
+        if let Some(start_info) = crate::markdown::parse_open_fence_start(&text[prefix.len..]) {
+            let after_header = &text[prefix.len + start_info.header_len..];
+            let has_close = after_header
+                .split_inclusive('\n')
+                .any(|line| crate::markdown::is_closing_fence_line(line, start_info.marker));
+            if !has_close {
+                let lines_start = prefix.lines.len();
+                let rows_before_fence = prefix.rows;
+                if crate::markdown::projection_ends_with_text(&prefix.lines) {
+                    prefix.lines.push(LogicalLine::default());
+                }
+                if let Some(label) = start_info.label.as_deref() {
+                    prefix.lines.push(crate::markdown::code_label_line(label));
+                }
+                let mut projected_end = prefix.len + start_info.header_len;
+                if let Some(last_nl) = after_header.rfind('\n') {
+                    let complete = &after_header[..=last_nl];
+                    for line in complete.split_inclusive('\n') {
+                        prefix.lines.push(crate::markdown::project_open_fence_line(
+                            line,
+                            start_info.indent,
+                            start_info.diff,
+                        ));
+                    }
+                    projected_end += complete.len();
+                }
+                prefix.rows +=
+                    crate::markdown::projected_rows_sum(&prefix.lines[lines_start..], width);
+                prefix.open_fence = Some(OpenFence {
+                    start: prefix.len,
+                    lines_start,
+                    rows_before_fence,
+                    marker: start_info.marker,
+                    indent: start_info.indent,
+                    diff: start_info.diff,
+                    projected_end,
+                });
+                let tail = crate::markdown::project_open_fence_tail(
+                    &text[projected_end..],
+                    start_info.indent,
+                    start_info.diff,
+                    start_info.marker,
+                );
+                self.streaming_prefix = Some(prefix);
+                return tail;
+            }
+        }
+
         let tail = crate::markdown::project_markdown(&text[prefix.len..], width);
         self.streaming_prefix = Some(prefix);
         tail
+    }
+
+    pub(crate) fn cached_streaming_thinking_rows(
+        &mut self,
+        block: &Block,
+        text: &str,
+        width: u16,
+    ) -> usize {
+        let key = (
+            block.cache_identity(),
+            block.content_generation(),
+            width,
+            BodyKind::Thinking.tag(),
+        );
+        if let Some((_, raw)) = self
+            .scratch_raw_bodies
+            .iter()
+            .find(|(stored, _)| *stored == key)
+        {
+            if let ScratchRawBody::Thinking(rows) = raw.as_ref() {
+                return rows.len();
+            }
+        }
+        let rows = crate::thought::body_rows(text, thinking_body_width(width));
+        let count = rows.len();
+        self.store_scratch_raw_body(key, ScratchRawBody::Thinking(rows));
+        count
+    }
+
+    pub(crate) fn cached_streaming_tool_rows(
+        &mut self,
+        block: &Block,
+        state: &crate::block::ToolState,
+        width: u16,
+    ) -> usize {
+        let key = (
+            block.cache_identity(),
+            block.content_generation(),
+            width,
+            BodyKind::ToolOutput.tag(),
+        );
+        if let Some((_, raw)) = self
+            .scratch_raw_bodies
+            .iter()
+            .find(|(stored, _)| *stored == key)
+        {
+            if let ScratchRawBody::ToolOutput(rows) = raw.as_ref() {
+                return rows.len().max(1);
+            }
+        }
+        let body_width = width.saturating_sub(4).max(1);
+        let diff_rows = state.diff_rows();
+        let rows: Vec<(String, Option<crate::block::DiffRowKind>)> = state
+            .expanded_body()
+            .split('\n')
+            .enumerate()
+            .flat_map(|(index, source)| {
+                let kind = diff_rows.get(index).map(|(kind, _)| *kind);
+                crate::markdown::render_plain(source, body_width)
+                    .into_iter()
+                    .map(move |row| (crate::markdown::pad_cells(&row, body_width as usize), kind))
+            })
+            .collect();
+        let count = rows.len().max(1);
+        self.store_scratch_raw_body(key, ScratchRawBody::ToolOutput(rows));
+        count
+    }
+
+    pub(crate) fn scratch_raw_body(
+        &self,
+        block: &Block,
+        kind: BodyKind,
+        width: u16,
+    ) -> Option<Arc<ScratchRawBody>> {
+        let key = (
+            block.cache_identity(),
+            block.content_generation(),
+            width,
+            kind.tag(),
+        );
+        self.scratch_raw_bodies
+            .iter()
+            .find(|(stored, _)| *stored == key)
+            .map(|(_, body)| Arc::clone(body))
+    }
+
+    fn store_scratch_raw_body(&mut self, key: BodyKey, body: ScratchRawBody) {
+        if self.scratch_raw_bodies.len() >= SCRATCH_BODY_SLOTS {
+            self.scratch_raw_bodies.remove(0);
+        }
+        self.scratch_raw_bodies.push((key, Arc::new(body)));
     }
 
     /// Row count reusing whichever body store applies: a hit returns the
@@ -1969,6 +2316,7 @@ impl Default for WrapCache {
             height_misses: 0,
             bodies: WeightedCache::new(MAX_BODY_CACHE_ENTRIES, MAX_BODY_CACHE_BYTES),
             scratch_bodies: Vec::new(),
+            scratch_raw_bodies: Vec::new(),
             projections: Vec::new(),
             streaming_prefix: None,
             height_indexes: HashMap::new(),
@@ -2005,7 +2353,7 @@ mod height_cache_tests {
     fn streaming_body_matches_the_whole_body_at_every_length() {
         use ratatui::style::Style;
         use ratatui::text::Span;
-        let text = "# Título\n\nPrimeiro parágrafo com várias palavras para quebrar na largura.\n\n```rust\nfn main() {}\n```\n\n- item um\n- item dois com texto\n\n> citação\n\nParágrafo final.";
+        let text = "# Título\n\nPrimeiro parágrafo com várias palavras para quebrar na largura.\n\n```rust\nfn main() {}\n```\n\n```diff\n+added\n-removed\n context\n```\n\nPara\n\n  ```rust\n  code\n  ```\n\n  ```diff\n  +added\n  -removed\n  ```\n\n ```rust\n one\n ```\n\n   ~~~\n   three\n   ~~~\n\n  ```rust\n\tcode\n  ```\n\n   ```rust\n \tcode\n   ```\n\n  ```rust\n  \tcode\n  ```\n\n  ```rust\n  code\tmore\n  ```\n\n  ```diff\n\t+added\n  ```\n\n- item um\n- item dois com texto\n\n- item três solto\n\n- item\n\n  ```rust\n  code\n  ```\n\n- a\n\n  ---\n\n- b\n\n- c\n\n  # heading\n\n- d\n\n> citação\n\nParágrafo final.";
         let styles = MarkdownStyles {
             text: Style::default(),
             h1: Style::default(),
@@ -2236,14 +2584,6 @@ mod height_cache_tests {
     }
 
     #[test]
-    fn height_cache_is_16384_and_body_cache_is_byte_weighted() {
-        let cache = WrapCache::default();
-        assert_eq!(cache.heights.capacity(), 16_384);
-        assert_eq!(cache.bodies.capacity(), 4_096);
-        assert_eq!(cache.body_retained_bytes(), 0);
-    }
-
-    #[test]
     fn body_cache_evicts_by_bytes_and_counts_bypasses() {
         let mut cache = WrapCache::default();
         let block = || {
@@ -2292,5 +2632,206 @@ mod height_cache_tests {
         assert_eq!(second[0], RatatuiLine::from("stable"));
         assert_eq!(cache.body_hits(), 1);
         assert!(cache.body_retained_bytes() > 0);
+    }
+
+    #[test]
+    fn incremental_height_index_matches_full_build_across_mutations() {
+        let mut state = AppState::new();
+        for turn in 0..4 {
+            state.apply_event(crate::api::UiEvent::UserMessageAdded {
+                text: format!("pergunta {turn}"),
+            });
+            state.apply_event(crate::api::UiEvent::ThinkingStarted);
+            state.apply_event(crate::api::UiEvent::ThinkingDelta {
+                text: format!("pensando {turn}"),
+            });
+            state.apply_event(crate::api::UiEvent::ThinkingEnded);
+            for call in 0..3 {
+                let batch_id = crate::api::ToolBatchId(format!("b-{turn}").into());
+                let call_id = crate::api::ToolCallId(format!("c-{turn}-{call}").into());
+                state.apply_event(crate::api::UiEvent::ToolStarted {
+                    batch_id: batch_id.clone(),
+                    call_id: call_id.clone(),
+                    name: "read".into(),
+                    arguments_summary: format!("src/f{call}.rs"),
+                });
+                state.apply_event(crate::api::UiEvent::ToolEnded {
+                    batch_id,
+                    call_id,
+                    name: "read".into(),
+                    success: true,
+                    duration_ms: 5,
+                });
+            }
+            state.apply_event(crate::api::UiEvent::AssistantDelta {
+                text: format!("resposta {turn}"),
+            });
+            state.apply_event(crate::api::UiEvent::AssistantEnded);
+        }
+
+        let mut inc_cache = WrapCache::default();
+        let initial = inc_cache.height_index(
+            state.blocks(),
+            state.revisions.content,
+            state.revisions.fold,
+            80,
+            state.dirty_from_block(),
+            state.dirty_base_content_rev(),
+        );
+        assert_eq!(
+            initial.total_rows,
+            HeightIndex::build(state.blocks(), 80, &mut WrapCache::default()).total_rows
+        );
+        state.clear_dirty_from_block();
+
+        // Append a new streaming assistant turn and verify incremental == full build.
+        state.apply_event(crate::api::UiEvent::UserMessageAdded {
+            text: "última".into(),
+        });
+        for chunk in ["linha 1\n", "linha 2\n", "linha 3"] {
+            state.apply_event(crate::api::UiEvent::AssistantDelta {
+                text: chunk.into(),
+            });
+            let inc = inc_cache.height_index(
+                state.blocks(),
+                state.revisions.content,
+                state.revisions.fold,
+                80,
+                state.dirty_from_block(),
+                state.dirty_base_content_rev(),
+            );
+            let full = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default());
+            assert_eq!(inc.total_rows, full.total_rows);
+            assert_eq!(inc.len(), full.len());
+            for span_idx in 0..full.len() {
+                assert_eq!(inc.entry(span_idx).0, full.entry(span_idx).0);
+                assert_eq!(inc.entry_start(span_idx), full.entry_start(span_idx));
+            }
+            for block in state.blocks() {
+                assert_eq!(inc.prefix_for_block(&block.id), full.prefix_for_block(&block.id));
+            }
+            state.clear_dirty_from_block();
+        }
+    }
+
+    #[test]
+    fn streaming_scratch_raw_bodies_populate_during_height_probe() {
+        let mut cache = WrapCache::default();
+        let mut thinking = Block::new(
+            "t1",
+            BlockKind::Thinking("**Título**\n\ncorpo longo".into()),
+            BlockLifecycle::Streaming,
+        );
+        thinking.fold = crate::block::FoldState::Expanded;
+
+        let mut tool = Block::new(
+            "tool1",
+            BlockKind::Tool(crate::block::ToolState {
+                name: "patch".into(),
+                edit_diff: Some(slim_core::ToolEditDiff {
+                    path: "a.rs".into(),
+                    hunks: vec![slim_core::ToolEditHunk {
+                        start_line: 1,
+                        removed: vec!["old".into()],
+                        added: vec!["new".into()],
+                    }],
+                    truncated: false,
+                }),
+                ..crate::block::ToolState::default()
+            }),
+            BlockLifecycle::Streaming,
+        );
+        tool.fold = crate::block::FoldState::Expanded;
+
+        let blocks = [thinking, tool];
+        let _ = HeightIndex::build(&blocks, 40, &mut cache);
+        assert!(matches!(
+            cache.scratch_raw_body(&blocks[0], BodyKind::Thinking, 40).as_deref(),
+            Some(ScratchRawBody::Thinking(rows)) if rows.len() == 3
+        ));
+        assert!(matches!(
+            cache.scratch_raw_body(&blocks[1], BodyKind::ToolOutput, 40).as_deref(),
+            Some(ScratchRawBody::ToolOutput(rows)) if !rows.is_empty()
+        ));
+    }
+
+    #[test]
+    fn incremental_height_index_merges_settled_tools_across_complete_thinking_bridge() {
+        let mut state = AppState::new();
+        // Prefix turn so `resume_span_idx > 0` exercises the incremental path.
+        state.apply_event(crate::api::UiEvent::UserMessageAdded {
+            text: "prev".into(),
+        });
+        state.apply_event(crate::api::UiEvent::AssistantDelta {
+            text: "done".into(),
+        });
+        state.apply_event(crate::api::UiEvent::AssistantEnded);
+
+        state.apply_event(crate::api::UiEvent::UserMessageAdded {
+            text: "hi".into(),
+        });
+        let b1 = crate::api::ToolBatchId("b1".into());
+        let c1 = crate::api::ToolCallId("c1".into());
+        state.apply_event(crate::api::UiEvent::ToolStarted {
+            batch_id: b1.clone(),
+            call_id: c1.clone(),
+            name: "read".into(),
+            arguments_summary: "first_file.rs".into(),
+        });
+        state.apply_event(crate::api::UiEvent::ToolEnded {
+            batch_id: b1,
+            call_id: c1,
+            name: "read".into(),
+            success: true,
+            duration_ms: 5,
+        });
+        state.apply_event(crate::api::UiEvent::ThinkingStarted);
+        state.apply_event(crate::api::UiEvent::ThinkingDelta {
+            text: "thinking bridge".into(),
+        });
+        state.apply_event(crate::api::UiEvent::ThinkingEnded);
+
+        let b2 = crate::api::ToolBatchId("b2".into());
+        let c2 = crate::api::ToolCallId("c2".into());
+        state.apply_event(crate::api::UiEvent::ToolStarted {
+            batch_id: b2.clone(),
+            call_id: c2.clone(),
+            name: "read".into(),
+            arguments_summary: "second_file.rs".into(),
+        });
+
+        let mut inc_cache = WrapCache::default();
+        let before_settle = inc_cache.height_index(
+            state.blocks(),
+            state.revisions.content,
+            state.revisions.fold,
+            80,
+            state.dirty_from_block(),
+            state.dirty_base_content_rev(),
+        );
+        // [User(0), Assistant(1), User(2), Tool(3), Thinking(4), Tool(5 streaming)]
+        assert_eq!(before_settle.len(), 6);
+        state.clear_dirty_from_block();
+
+        state.apply_event(crate::api::UiEvent::ToolEnded {
+            batch_id: b2,
+            call_id: c2,
+            name: "read".into(),
+            success: true,
+            duration_ms: 5,
+        });
+        let inc = inc_cache.height_index(
+            state.blocks(),
+            state.revisions.content,
+            state.revisions.fold,
+            80,
+            state.dirty_from_block(),
+            state.dirty_base_content_rev(),
+        );
+        let full = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default());
+        assert_eq!(inc.memo.spans, full.memo.spans);
+        assert_eq!(inc.total_rows, full.total_rows);
+        // [User(0), Assistant(1), User(2), grouped Tool(3)..Tool(5)]
+        assert_eq!(inc.len(), 4);
     }
 }

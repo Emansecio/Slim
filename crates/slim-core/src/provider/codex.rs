@@ -12,6 +12,7 @@ use super::{
 pub struct OpenAiCodexAdapter {
     config: ProviderConfig,
     fast_mode: bool,
+    session_id: Option<String>,
 }
 
 impl OpenAiCodexAdapter {
@@ -42,6 +43,7 @@ impl OpenAiCodexAdapter {
             } if !account_id.is_empty() => Ok(Self {
                 config,
                 fast_mode: false,
+                session_id: None,
             }),
             _ => Err(ProviderError::InvalidResponse {
                 message: "Codex OAuth requires a ChatGPT account id".into(),
@@ -62,6 +64,26 @@ impl OpenAiCodexAdapter {
     pub fn with_fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
         self
+    }
+
+    /// Scopes `prompt_cache_key` and `session-id` to one conversation so
+    /// concurrent sessions / swarm workers do not evict each other's cache.
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        let trimmed = session_id.trim();
+        if !trimmed.is_empty() {
+            self.session_id = Some(trimmed.to_owned());
+        }
+        self
+    }
+
+    fn scope_prompt_cache_key(&self, body: &mut Value) {
+        let Some(session_id) = self.session_id.as_deref() else {
+            return;
+        };
+        if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str) {
+            body["prompt_cache_key"] =
+                Value::String(super::scope_prompt_cache_key_bounded(key, session_id));
+        }
     }
 
     pub(crate) fn set_system_prompt(&mut self, prompt: impl Into<String>) {
@@ -126,15 +148,17 @@ impl OpenAiCodexAdapter {
                     .filter(|state| {
                         message.role == "assistant"
                             && state.binding.is_none()
-                            && state.scope_id == self.config.response_cache_scope_id()
-                            && state.model == self.config.model
+                            && state.belongs_to(self)
                     })
                     .map(|state| state.item.clone()),
             );
             if message.role == "tool" {
                 input.push(json!({
                     "type": "function_call_output",
-                    "call_id": message.tool_call_id,
+                    "call_id": message
+                        .tool_call_id
+                        .as_deref()
+                        .map(super::openai_responses_tool_call_id),
                     "output": if message.content_blocks.is_empty() {
                         Value::String(message.content.clone())
                     } else {
@@ -143,14 +167,20 @@ impl OpenAiCodexAdapter {
                 }));
                 continue;
             }
-            input.push(json!({
-                "role": message.role,
-                "content": codex_content(message),
-            }));
+            let omit_empty_assistant = message.role == "assistant"
+                && !message.tool_calls.is_empty()
+                && message.content.is_empty()
+                && message.content_blocks.is_empty();
+            if !omit_empty_assistant {
+                input.push(json!({
+                    "role": message.role,
+                    "content": codex_content(message),
+                }));
+            }
             for call in &message.tool_calls {
                 input.push(json!({
                     "type": "function_call",
-                    "call_id": call.id,
+                    "call_id": super::openai_responses_tool_call_id(&call.id),
                     "name": call.name,
                     "arguments": call.arguments,
                 }));
@@ -189,10 +219,14 @@ impl OpenAiCodexAdapter {
         if codex_model(&self.config.model).is_some() {
             body["text"] = json!({"verbosity": "low"});
         }
+        if super::is_official_openai_endpoint(&self.config.endpoint) {
+            body["prompt_cache_retention"] = json!("24h");
+        }
         if self.fast_mode {
             body["service_tier"] = json!("priority");
         }
         let stable_prefixes = materialize_native_prompt_cache_key(self, &mut body);
+        self.scope_prompt_cache_key(&mut body);
         (body, stable_prefixes)
     }
 }
@@ -262,14 +296,42 @@ impl ProviderAdapter for OpenAiCodexAdapter {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_prompt_cache_key: true,
+            supports_cache_ttl: super::is_official_openai_endpoint(&self.config.endpoint),
             reports_cache_read_tokens: true,
             reports_cache_write_tokens: true,
             ..ProviderCapabilities::default()
         }
     }
 
+    fn closing_tool_choice(&self) -> Option<Value> {
+        Some(json!("none"))
+    }
+
+    fn compaction_low_effort(&self) -> Option<&'static str> {
+        let supported = codex_model(&self.config.model)
+            .map_or_else(
+                || self.config.reasoning_effort.is_some(),
+                |model| model.reasoning_levels.contains(&"low"),
+            );
+        supported.then_some("low")
+    }
+
+    fn with_adaptive_reasoning_effort(
+        &self,
+        request: PreparedProviderRequest,
+        effort: &str,
+    ) -> PreparedProviderRequest {
+        super::lower_request_reasoning_effort(self, request, effort)
+    }
+
+    fn fast_compaction_model(&self) -> Option<(&'static str, u64)> {
+        matches!(self.config.model.as_str(), "gpt-5.6-sol" | "gpt-5.6-terra")
+            .then_some(("gpt-5.6-luna", CODEX_BUNDLED_CONTEXT_WINDOW))
+    }
+
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
         materialize_native_prompt_cache_key(self, body);
+        self.scope_prompt_cache_key(body);
     }
 
     /// The Codex backend pins a turn to the server that holds its cache with
@@ -280,6 +342,15 @@ impl ProviderAdapter for OpenAiCodexAdapter {
 
     fn response_cache_scope_id(&self) -> Option<u64> {
         Some(self.config.response_cache_scope_id())
+    }
+
+    fn reasoning_scope_fingerprint(&self) -> u64 {
+        super::provider_reasoning_scope_fingerprint(
+            ProviderKind::OpenAiCodex,
+            &self.config.endpoint,
+            &self.config.auth,
+            &self.config.model,
+        )
     }
 
     fn system_prompt_for_budget(&self) -> Option<&str> {
@@ -334,6 +405,7 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         let (mut body, _) = self.request_body_with_prefixes(messages, &[]);
         harden_compaction_body(&mut body, false)?;
         let stable_prefixes = materialize_native_prompt_cache_key(self, &mut body);
+        self.scope_prompt_cache_key(&mut body);
         PreparedProviderRequest::from_http_body_with_prefixes(
             codex_url(&self.config.endpoint),
             self.headers_for(&body),
@@ -451,7 +523,8 @@ impl ProviderAdapter for OpenAiCodexAdapter {
                                 self.config.response_cache_scope_id(),
                                 self.config.model.clone(),
                                 item.clone(),
-                            ),
+                            )
+                            .with_provenance(self.reasoning_scope_fingerprint()),
                         ));
                     }
                     events
@@ -542,6 +615,14 @@ impl ProviderAdapter for OpenAiCodexAdapter {
                         .and_then(Value::as_str)
                         .unwrap_or("incomplete")
                 } else {
+                    if let Some(id) = value
+                        .pointer("/response/id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    {
+                        events.push(ProviderEvent::ResponseId(id.to_owned()));
+                    }
                     "completed"
                 };
                 events.push(ProviderEvent::Stopped {

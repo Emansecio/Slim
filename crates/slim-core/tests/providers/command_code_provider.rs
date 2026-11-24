@@ -4,15 +4,6 @@ use slim_core::provider::{
 };
 
 #[test]
-fn default_model_uses_chat_completions() {
-    assert_eq!(
-        command_code_api(COMMANDCODE_DEFAULT_MODEL),
-        CommandCodeApi::ChatCompletions
-    );
-    assert_eq!(COMMANDCODE_DEFAULT_MODEL, "deepseek/deepseek-v4.1-flash");
-}
-
-#[test]
 fn claude_models_use_anthropic_messages() {
     assert_eq!(
         command_code_api("claude-sonnet-4-6"),

@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(store.totals(false), (Some(5), true));
         store.set(uri.clone(), Some(2), vec![]);
         assert_eq!(store.totals(false), (Some(0), false));
+        assert!(store.agent_view(&uri, false).is_empty());
     }
 
     #[test]
@@ -384,20 +385,6 @@ mod tests {
         let with_info = store.agent_view(&uri, true);
         assert_eq!(with_info.len(), 200);
         assert_eq!(with_info[0].message, "late error");
-    }
-
-    #[test]
-    fn empty_publish_clears_previous() {
-        let mut store = DiagnosticsStore::new(10, 4);
-        let uri = url("D:/demo/main.rs");
-        store.set(
-            uri.clone(),
-            Some(1),
-            vec![diag(0, DiagnosticSeverity::ERROR, "boom")],
-        );
-        assert_eq!(store.agent_view(&uri, false).len(), 1);
-        store.set(uri.clone(), Some(2), vec![]);
-        assert_eq!(store.agent_view(&uri, false).len(), 0);
     }
 
     #[test]

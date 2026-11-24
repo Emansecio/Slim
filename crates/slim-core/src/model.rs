@@ -432,10 +432,15 @@ impl AppHandle {
                     *text = String::new()
                 }
                 EventKind::ToolStarted { arguments, .. }
+                | EventKind::ToolStepStarted { arguments, .. }
                 | EventKind::ToolCall { arguments, .. }
                 | EventKind::ProviderToolCall { arguments, .. } => *arguments = String::new(),
                 EventKind::ToolOutput { output, .. } | EventKind::ToolJobOutput { output, .. } => {
                     *output = String::new()
+                }
+                EventKind::ToolStepFinished { output, diff, .. } => {
+                    *output = String::new();
+                    *diff = None;
                 }
                 EventKind::ToolProgress { preview, .. } => *preview = String::new(),
                 EventKind::QuestionRequired { question, .. } => *question = String::new(),
@@ -816,6 +821,39 @@ mod tests {
             },
         ))
         .expect("push output");
+        app.push_event(SessionEvent::new(
+            2,
+            EventKind::ToolStepStarted {
+                batch_id: "batch".into(),
+                call_id: "call".into(),
+                step_id: "batch:call:1".into(),
+                name: "slim.write".into(),
+                arguments: "y".repeat(16_384),
+            },
+        ))
+        .expect("push step started");
+        app.push_event(SessionEvent::new(
+            3,
+            EventKind::ToolStepFinished {
+                batch_id: "batch".into(),
+                call_id: "call".into(),
+                step_id: "batch:call:1".into(),
+                name: "slim.write".into(),
+                success: true,
+                duration_ms: 1,
+                output: "z".repeat(16_384),
+                diff: Some(crate::ToolEditDiff {
+                    path: "a.rs".into(),
+                    hunks: vec![crate::ToolEditHunk {
+                        start_line: 1,
+                        removed: vec!["old".into()],
+                        added: vec!["new".into()],
+                    }],
+                    truncated: false,
+                }),
+            },
+        ))
+        .expect("push step finished");
         app.discard_projected_payloads();
         let output = app
             .events()
@@ -830,6 +868,25 @@ mod tests {
             output.capacity() < 1024,
             "cleared payload must not retain a 16 KiB buffer"
         );
+        let step_args = app
+            .events()
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::ToolStepStarted { arguments, .. } => Some(arguments),
+                _ => None,
+            })
+            .expect("tool step started");
+        assert!(step_args.is_empty() && step_args.capacity() < 1024);
+        let (step_out, step_diff) = app
+            .events()
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::ToolStepFinished { output, diff, .. } => Some((output, diff)),
+                _ => None,
+            })
+            .expect("tool step finished");
+        assert!(step_out.is_empty() && step_out.capacity() < 1024);
+        assert!(step_diff.is_none());
     }
 
     #[test]

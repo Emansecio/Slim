@@ -1247,13 +1247,36 @@ fn failed_patch_differing_only_in_whitespace_returns_the_exact_lines_to_copy() {
     let filler = "// filler line\n".repeat(40);
     let body = format!("{filler}fn a() {{\n\tlet x = 1;  \n\treturn x;\n}}\n{filler}");
     fs::write(root.0.join("t.rs"), &body).unwrap();
+    fs::write(root.0.join("t_indent.rs"), &body).unwrap();
+    // Unique leading/trailing whitespace differences auto-normalize indentation via Stage B.
+    let indent_normalized = root.call(
+        "patch",
+        json!({
+            "path": "t_indent.rs",
+            "edits": [{
+                "expected": "    let x = 1;\n    return x;\n",
+                "replacement": "    let x = 2;\n    return x;\n"
+            }]
+        }),
+    );
+    assert!(indent_normalized.success, "{}", indent_normalized.output);
+    assert!(
+        indent_normalized.output.contains("indentation normalized"),
+        "{}",
+        indent_normalized.output
+    );
+    assert!(
+        fs::read_to_string(root.0.join("t_indent.rs"))
+            .unwrap()
+            .contains("\tlet x = 2;\n\treturn x;\n")
+    );
     let patch = |expected: &str| {
         root.call(
             "patch",
             json!({"path":"t.rs","edits":[{"expected":expected,"replacement":"y"}]}),
         )
     };
-    let near = patch("    let x = 1;\n    return x;\n");
+    let near = patch("\tlet  x = 1;\n\treturn x;\n");
     assert!(!near.success, "{}", near.output);
     assert!(
         near.output.ends_with(
@@ -1632,7 +1655,10 @@ fn recovery_guidance_is_bounded_without_duplicate_actions_or_evidence_loss() {
     assert!(
         batch
             .output
-            .contains("Edit 64 rejected in proposed content; no edits applied."),
+            .contains("63 of 64 edits applied")
+            && batch.output.contains(
+                "Edit 64 rejected. Line numbers below count the content as tried."
+            ),
         "{}",
         batch.output
     );
@@ -2093,8 +2119,8 @@ fn failed_patch_recovery_prefers_a_small_located_excerpt_to_the_whole_file() {
     assert!(!nearest.output.contains("Current file is below"));
     assert!(nearest.output.len() < 1024, "{}", nearest.output.len());
 
-    // Copied search markers are not file text.
-    let marked = patch("62: fn main() {\n63-     let value = compute(1, 2);");
+    // Copied search markers that do not uniquely match once stripped are still rejected with hint.
+    let marked = patch("62: fn main() {\n63-     let value = compute(1, 999);");
     assert!(!marked.success, "{}", marked.output);
     assert!(
         marked.output.contains("starts with a search marker"),
@@ -2102,6 +2128,25 @@ fn failed_patch_recovery_prefers_a_small_located_excerpt_to_the_whole_file() {
         marked.output
     );
     assert!(!marked.output.contains("Current file is below"));
+
+    // Copied search markers whose stripped text uniquely matches succeed via Stage A.
+    fs::write(root.0.join("t_marked.rs"), &body).unwrap();
+    let marked_ok = root.call(
+        "patch",
+        json!({
+            "path": "t_marked.rs",
+            "edits": [{
+                "expected": "62: fn main() {\n63-     let value = compute(1, 2);",
+                "replacement": "fn main() {\n    let value = compute(1, 3);"
+            }]
+        }),
+    );
+    assert!(marked_ok.success, "{}", marked_ok.output);
+    assert!(
+        marked_ok.output.contains("line-number prefixes stripped"),
+        "{}",
+        marked_ok.output
+    );
 
     // Nothing to anchor on: the whole-file recovery stays.
     let none = patch("nothing like it\nat all, anywhere");
@@ -2232,7 +2277,7 @@ fn multi_edit_recovery_says_its_line_numbers_count_the_proposed_content() {
     assert!(
         failed
             .output
-            .contains("Edit 2 rejected in proposed content; no edits applied. Line numbers below count the proposed content (edit 1 applied)."),
+            .contains("Edit 2 rejected. Line numbers below count the content as tried."),
         "{}",
         failed.output
     );
@@ -2241,6 +2286,12 @@ fn multi_edit_recovery_says_its_line_numbers_count_the_proposed_content() {
         "{}",
         failed.output
     );
+    // A single-file batch keeps the edits that matched.
+    assert_eq!(
+        fs::read_to_string(root.0.join("m.txt")).unwrap(),
+        "a\nnew1\nnew2\nb\nc\n  target( x )\nd\n"
+    );
+    fs::write(root.0.join("m.txt"), "a\nb\nc\n  target( x )\nd\n").unwrap();
     // The first edit's own failure counts the file on disk: no such sentence.
     let first = root.call(
         "patch",
@@ -2262,7 +2313,7 @@ fn multi_edit_recovery_says_its_line_numbers_count_the_proposed_content() {
     );
     assert_eq!(
         fs::read_to_string(root.0.join("m.txt")).unwrap(),
-        "a\nb\nc\n  target( x )\nd\n"
+        "z\nb\nc\n  target( x )\nd\n"
     );
 }
 

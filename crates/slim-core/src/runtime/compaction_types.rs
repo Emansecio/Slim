@@ -67,6 +67,7 @@ impl CompactionSummary {
             ProviderEvent::ToolCallStart { .. }
             | ProviderEvent::ToolCallDelta { .. }
             | ProviderEvent::ToolCallInputDelta { .. }
+            | ProviderEvent::ToolCallProgress { .. }
             | ProviderEvent::ToolCallComplete { .. }
             | ProviderEvent::ToolCall { .. } => self.saw_tool_call = true,
             ProviderEvent::UsageBreakdown { usage } => {
@@ -74,7 +75,7 @@ impl CompactionSummary {
                 self.usage.absorb(usage);
                 self.breakdown_events.push(usage);
             }
-            ProviderEvent::ResponseCacheHit => {}
+            ProviderEvent::ResponseCacheHit | ProviderEvent::ResponseId(_) => {}
             ProviderEvent::Phase {
                 phase: ProviderPhase::FirstByte,
                 elapsed_ms,
@@ -94,7 +95,6 @@ impl CompactionSummary {
             | ProviderEvent::ReasoningStarted
             | ProviderEvent::ReasoningEnded
             | ProviderEvent::Phase { .. }
-            | ProviderEvent::ToolCallProgress { .. }
             | ProviderEvent::ContentBlockStop { .. } => {}
         }
     }
@@ -166,11 +166,15 @@ pub(super) struct CompactionTrigger {
     /// the request is sent as it is.
     pub(super) required: bool,
     pub(super) usage: ContextUsage,
+    /// Whether `finalize_compaction` should build the next provider request
+    /// (`true` for live loop turns, `false` for lone `/compact` runs).
+    pub(super) build_next_request: bool,
 }
 
 pub(super) enum CompactionOutcome {
-    /// History was replaced; the request is already prepared from it.
-    Applied(Box<PreparedProviderRequest>),
+    /// History was replaced; `Some(request)` carries the pre-built turn request
+    /// when `build_next_request` was requested.
+    Applied(Option<Box<PreparedProviderRequest>>),
     Skipped,
     Cancelled,
 }

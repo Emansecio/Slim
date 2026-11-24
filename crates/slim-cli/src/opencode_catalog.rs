@@ -147,11 +147,7 @@ impl CatalogClient {
         url: impl Into<String>,
         cache_path: impl Into<PathBuf>,
     ) -> Result<Self, CatalogError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        let client = slim_core::provider::shared_http_client(Duration::from_secs(15))
             .map_err(|_| spec.error(Kind::Network))?;
         Ok(Self {
             spec,
@@ -181,6 +177,7 @@ impl CatalogClient {
         let mut response = self
             .client
             .get(&self.url)
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .map_err(|_| Kind::Network)?;

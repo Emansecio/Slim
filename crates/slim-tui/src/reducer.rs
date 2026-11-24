@@ -560,7 +560,14 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("account", &["/login", "/logout", "/mcp"]),
     (
         "inspect",
-        &["/diff", "/activity", "/session", "/diagnostics", "/jobs"],
+        &[
+            "/diff",
+            "/activity",
+            "/session",
+            "/diagnostics",
+            "/jobs",
+            "/memory",
+        ],
     ),
 ];
 
@@ -609,6 +616,7 @@ pub fn palette_description(command: &str) -> &'static str {
         "/session" => "árvore da sessão",
         "/diagnostics" => "tempos do provedor",
         "/retry" => "retomar conexão pausada",
+        "/memory" => "memória durável do projeto",
         _ => "",
     }
 }
@@ -1834,6 +1842,62 @@ fn split_command_words(input: &str) -> Result<Vec<String>, &'static str> {
 }
 
 /// `/mcp <args>` forms: `add <name> <command> [args…] [--global]`,
+fn parse_memory_args(
+    state: &mut AppState,
+    args: &str,
+    effects: &mut Vec<Effect>,
+    keep_draft: &mut bool,
+) {
+    const USAGE: &str =
+        "Uso: /memory [list] · /memory add [command|convention|architecture|gotcha] TEXTO · /memory rm ID · /memory clear";
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed == "list" {
+        effects.push(Effect::Send(UiCommand::MemoryList));
+        return;
+    }
+    if trimmed == "clear" {
+        effects.push(Effect::Send(UiCommand::MemoryClear));
+        return;
+    }
+    if let Some(rest) = trimmed.strip_prefix("add ") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            state.push_notification(USAGE.into());
+            *keep_draft = true;
+            return;
+        }
+        let mut split = rest.splitn(2, char::is_whitespace);
+        let first = split.next().unwrap_or_default();
+        let tail = split.next().unwrap_or_default().trim();
+        let (kind, text) = if slim_core::memory::MemoryKind::parse_str(first).is_some() {
+            if tail.is_empty() {
+                state.push_notification(USAGE.into());
+                *keep_draft = true;
+                return;
+            }
+            (first.to_ascii_lowercase(), tail.to_owned())
+        } else {
+            ("convention".to_owned(), rest.to_owned())
+        };
+        effects.push(Effect::Send(UiCommand::MemoryAdd { kind, text }));
+        return;
+    }
+    for prefix in ["rm ", "remove ", "del "] {
+        if let Some(id) = trimmed.strip_prefix(prefix) {
+            let id = id.trim();
+            if id.is_empty() {
+                state.push_notification(USAGE.into());
+                *keep_draft = true;
+            } else {
+                effects.push(Effect::Send(UiCommand::MemoryRemove { id: id.to_owned() }));
+            }
+            return;
+        }
+    }
+    state.push_notification(USAGE.into());
+    *keep_draft = true;
+}
+
 /// `add <name> --url <url> [--global]`, `remove|rm <name>`,
 /// `reconnect|disconnect <name>`, `enable|disable <name>`,
 /// `login <name> [redirect-url]`, `logout <name>`, `trust [name]`,
@@ -2030,7 +2094,9 @@ fn reduce_session_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect>
             picker.viewport_start = 0;
             picker.clamp_selection();
         }
-        KeyCode::Enter => return confirm_session_picker(state),
+        KeyCode::Enter => {
+            return confirm_session_picker(state, !key.modifiers.contains(KeyModifiers::SHIFT));
+        }
         _ => return vec![],
     }
     let (selected, total) = (picker.selected, picker.rows().len());
@@ -2044,7 +2110,7 @@ fn reduce_session_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect>
     vec![Effect::RequestRender]
 }
 
-fn confirm_session_picker(state: &mut AppState) -> Vec<Effect> {
+fn confirm_session_picker(state: &mut AppState, restore_if_available: bool) -> Vec<Effect> {
     let Some(picker) = state.session_picker.as_ref() else {
         return vec![];
     };
@@ -2064,6 +2130,7 @@ fn confirm_session_picker(state: &mut AppState) -> Vec<Effect> {
         },
         Some(PickerRow::Turn(turn)) => UiCommand::RewindSession {
             first_seq: turn.first_seq,
+            restore_files: restore_if_available && turn.has_checkpoint,
         },
         None => return vec![],
     };
@@ -2201,19 +2268,43 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             }
             state.revisions.status += 1;
         }
-        "/resume" | "/rewind" => {
+        "/resume" => {
             if session_management_busy(state) {
                 state.push_notification(
                     "Há uma execução ativa; aguarde ou cancele antes de mudar de sessão".into(),
                 );
                 keep_draft = true;
             } else {
-                let kind = if command == "/resume" {
-                    PickerKind::Resume
+                effects.extend(
+                    state
+                        .open_session_picker(PickerKind::Resume)
+                        .map(Effect::Send),
+                );
+            }
+            state.revisions.status += 1;
+        }
+        _ if command == "/rewind" || command.starts_with("/rewind ") => {
+            let arg = command.strip_prefix("/rewind").unwrap_or_default().trim();
+            if session_management_busy(state) {
+                state.push_notification(
+                    "Há uma execução ativa; aguarde ou cancele antes de mudar de sessão".into(),
+                );
+                keep_draft = true;
+            } else if arg.is_empty() {
+                effects.extend(
+                    state
+                        .open_session_picker(PickerKind::Rewind)
+                        .map(Effect::Send),
+                );
+            } else if arg == "--undo" {
+                if state.running_jobs() > 0 {
+                    state.job_exit_confirm = Some(UiCommand::UndoLastRewind);
                 } else {
-                    PickerKind::Rewind
-                };
-                effects.extend(state.open_session_picker(kind).map(Effect::Send));
+                    effects.push(Effect::Send(UiCommand::UndoLastRewind));
+                }
+            } else {
+                state.push_notification("Uso: /rewind · /rewind --undo".into());
+                keep_draft = true;
             }
             state.revisions.status += 1;
         }
@@ -2327,6 +2418,15 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             parse_mcp_args(
                 state,
                 command.trim_start_matches("/mcp "),
+                &mut effects,
+                &mut keep_draft,
+            );
+            state.revisions.status += 1;
+        }
+        _ if command == "/memory" || command.starts_with("/memory ") => {
+            parse_memory_args(
+                state,
+                command.strip_prefix("/memory").unwrap_or_default().trim(),
                 &mut effects,
                 &mut keep_draft,
             );
@@ -2481,9 +2581,22 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         keep_draft = true;
                     }
                 }
+                Some(LoginProvider::Anthropic) => {
+                    let levels = vec![
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                        ReasoningEffort::Max,
+                    ];
+                    state.effort_overlay = Some(EffortOverlay::for_catalog(
+                        EffortTarget::Anthropic(value.to_owned()),
+                        levels,
+                        state.effort,
+                    ));
+                }
                 _ => {
                     state.push_notification(
-                        "Conecte OpenAI Codex, OpenCode Go, ClinePass, Command Code, xAI ou Open Design antes de selecionar um modelo."
+                        "Conecte Anthropic, OpenAI Codex, OpenCode Go, ClinePass, Command Code, xAI ou Open Design antes de selecionar um modelo."
                             .into(),
                     );
                     keep_draft = true;
@@ -2880,6 +2993,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
                 EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
                 EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort },
+                EffortTarget::Anthropic(model) => UiCommand::SetAnthropicModel { model, effort },
             };
             state.model_overlay = None;
             return vec![Effect::Send(command), Effect::RequestRender];
@@ -3269,6 +3383,7 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
                 EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
                 EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort },
+                EffortTarget::Anthropic(model) => UiCommand::SetAnthropicModel { model, effort },
             };
             return vec![Effect::Send(command), Effect::RequestRender];
         }

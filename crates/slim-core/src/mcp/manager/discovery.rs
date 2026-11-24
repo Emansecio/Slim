@@ -6,7 +6,7 @@
 use super::*;
 use crate::mcp::canonical_name;
 use crate::mcp::exposure::{
-    first_line, one_line, render_awareness, truncate_chars, AwarenessServer, McpDirectTool,
+    first_line, one_line, render_awareness_for, truncate_chars, AwarenessServer, McpDirectTool,
     MAX_DIRECT_TOOLS,
 };
 use crate::mcp::search::{tool_search_document, Bm25Ranker, SearchServer};
@@ -79,7 +79,18 @@ pub(super) fn visible_tools<'a>(
 }
 
 impl McpManager {
-    fn entries_snapshot(&self) -> Vec<Arc<ServerEntry>> {
+    pub(super) fn entries_snapshot(&self) -> Vec<Arc<ServerEntry>> {
+        if let Some(parent) = &self.parent {
+            let mut merged: BTreeMap<String, Arc<ServerEntry>> = parent
+                .entries_snapshot()
+                .into_iter()
+                .map(|entry| (entry.spec.name.clone(), entry))
+                .collect();
+            for (name, entry) in read_lock(&self.servers).iter() {
+                merged.insert(name.clone(), Arc::clone(entry));
+            }
+            return merged.into_values().collect();
+        }
         read_lock(&self.servers).values().cloned().collect()
     }
 
@@ -231,15 +242,54 @@ impl McpManager {
             .then_some((server, tool))
     }
 
+    /// Whether a specific MCP tool explicitly advertised `annotations.readOnlyHint == true`.
+    /// Fail-closed (`false`) when absent or when no tool catalog is cached.
+    pub fn is_tool_read_only(&self, server: &str, tool_name: &str) -> bool {
+        let Ok(entry) = self.entry(server) else {
+            return false;
+        };
+        let tools = match read_lock(&entry.status).clone() {
+            McpServerStatus::Ready { tools } => Some(tools),
+            McpServerStatus::Disconnected | McpServerStatus::Connecting => {
+                read_lock(&entry.last_tools).clone()
+            }
+            _ => None,
+        };
+        tools.is_some_and(|list| {
+            list.iter()
+                .find(|summary| summary.name == tool_name)
+                .is_some_and(|summary| summary.read_only_hint)
+        })
+    }
+
+    /// Whether a direct MCP tool explicitly advertised `annotations.readOnlyHint == true`.
+    /// Fail-closed (`false`) when absent or when no tool catalog is cached.
+    pub fn is_direct_tool_read_only(&self, direct_name: &str) -> bool {
+        let resolved = self.resolve_direct_tool(direct_name).or_else(|| {
+            let _ = self.direct_tools();
+            self.resolve_direct_tool(direct_name)
+        });
+        let Some((server, tool_name)) = resolved else {
+            return false;
+        };
+        self.is_tool_read_only(&server, &tool_name)
+    }
+
     // ----- server awareness ----------------------------------------------
 
-    /// The block appended to the Auto channel stanza: one line per enabled,
+    /// The block appended to the channel stanza: one line per enabled,
     /// trusted, non-hidden server (status, tool count, first line of the
     /// description or the handshake instructions), bounded to 250 characters
     /// per line and 4096 bytes. `None` without such servers. Everything in it
     /// except the server name and status comes from the server or the
     /// project configuration and is labelled untrusted.
     pub fn awareness_block(&self) -> Option<String> {
+        self.awareness_block_for(false)
+    }
+
+    /// [`Self::awareness_block`] with guidance tailored to Auto (`mcp` tool)
+    /// or Code (`codemode` helpers).
+    pub fn awareness_block_for(&self, code_mode: bool) -> Option<String> {
         let mut servers = Vec::new();
         for entry in self.entries_snapshot() {
             let options = &entry.spec.options;
@@ -270,7 +320,8 @@ impl McpManager {
                 summary,
             });
         }
-        render_awareness(&servers)
+        servers.sort_by(|left, right| left.name.cmp(&right.name));
+        render_awareness_for(&servers, code_mode)
     }
 
     // ----- listings --------------------------------------------------------

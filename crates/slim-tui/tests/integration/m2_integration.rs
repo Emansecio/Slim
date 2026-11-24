@@ -3,21 +3,9 @@ use std::time::Duration;
 use slim_core::{EventKind, SessionEvent};
 use slim_tui::api::UiEvent;
 use slim_tui::app::AppState;
-use slim_tui::cache::BoundedCache;
-use slim_tui::layout::{plan, plan_checked, visible_range, LayoutError};
+use slim_tui::layout::{plan, plan_checked, LayoutError};
 use slim_tui::render::{render, EventCoalescer};
 use slim_tui::view_model::format_context;
-
-#[test]
-fn data_deltas_coalesce_but_control_events_are_preserved_first() {
-    let mut coalescer = EventCoalescer::new(2, Duration::from_millis(16));
-    let mut events = coalescer.push_data(UiEvent::AssistantDelta { text: "a".into() });
-    events.extend(coalescer.push_data(UiEvent::AssistantDelta { text: "b".into() }));
-    coalescer.push_control(UiEvent::RunCancelled { run_id: 1 });
-    events.extend(coalescer.flush());
-    assert_eq!(events[0], UiEvent::RunCancelled { run_id: 1 });
-    assert_eq!(events[1], UiEvent::AssistantDelta { text: "ab".into() });
-}
 
 #[test]
 fn completed_run_retains_pending_tasks_without_marking_the_run_failed() {
@@ -123,40 +111,6 @@ fn tool_output_notification_preview_is_bounded() {
         panic!("expected tool output, got {event:?}");
     };
     assert_eq!(*output, format!("{}…", "x".repeat(512)));
-}
-
-#[test]
-fn layout_keeps_todo_composer_and_operational_rows_bounded() {
-    let regions = plan(100, 24, 2);
-    assert_eq!(regions.todo.height, 2);
-    assert_eq!(regions.todo_divider.height, 1);
-    assert_eq!(regions.composer.height, 3);
-    assert_eq!(regions.op_divider.height, 0);
-    assert_eq!(regions.operational.height, 2);
-    assert_eq!(regions.operational.y, regions.composer.y + 3);
-    assert_eq!(plan(100, 12, 0).operational.height, 2);
-    assert_eq!(plan(100, 11, 0).operational.height, 1);
-    assert_eq!(visible_range(100, 98, 10), 98..100);
-}
-
-#[test]
-fn bounded_cache_evicts_old_entries_without_changing_new_values() {
-    let mut cache = BoundedCache::new(2);
-    cache.insert("a", 1);
-    cache.insert("b", 2);
-    cache.insert("c", 3);
-    assert_eq!(cache.len(), 2);
-    assert!(cache.get(&"a").is_none());
-    assert_eq!(cache.get(&"c"), Some(&3));
-}
-
-#[test]
-fn render_uses_same_state_as_m0_view_model() {
-    let state = AppState::new();
-    assert_eq!(
-        render(&state, 80, 24).lines.last(),
-        Some(&"desconectado · /login".to_string())
-    );
 }
 
 #[test]

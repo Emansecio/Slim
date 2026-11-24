@@ -26,30 +26,6 @@ pub const DEFAULT_MAX_OPEN_DOCUMENTS: usize = 64;
 /// is always kept — its own size is already bounded by the read cap.
 pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
-// Test-only source IO accounting. The current-thread measurement resets this
-// between operations; production builds carry no counters or observer hooks.
-#[cfg(test)]
-pub(crate) mod read_metrics {
-    thread_local! {
-        static COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
-    }
-    pub fn take() -> (usize, usize, usize) {
-        COUNTS.with(|counts| counts.replace((0, 0, 0)))
-    }
-    pub fn opened(bytes: usize) {
-        COUNTS.with(|counts| {
-            let (opens, total, hits) = counts.get();
-            counts.set((opens + 1, total + bytes, hits));
-        });
-    }
-    pub fn store_hit() {
-        COUNTS.with(|counts| {
-            let (opens, bytes, hits) = counts.get();
-            counts.set((opens, bytes, hits + 1));
-        });
-    }
-}
-
 /// Fast content-fingerprint for deduplication (not a cryptographic hash).
 fn content_hash(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -141,8 +117,6 @@ impl DocumentContent {
             return None;
         }
         let text = read_text_capped(std::fs::File::open(path).ok()?, max_bytes)?;
-        #[cfg(test)]
-        read_metrics::opened(text.len());
         let after = FileStamp::for_path(path)?;
         if before != after {
             return None;

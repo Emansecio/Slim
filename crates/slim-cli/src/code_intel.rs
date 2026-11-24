@@ -34,6 +34,46 @@ pub(crate) fn project_trust(
     project_trust_with(config, workspace, session_trust, TrustStore::default_store)
 }
 
+pub(crate) fn project_trust_with_cached(
+    config: &LspConfig,
+    workspace: &Path,
+    session_trust: bool,
+    cached_decision: &mut Option<Result<Option<TrustDecision>, String>>,
+) -> LspProjectTrust {
+    let overridden = config
+        .servers
+        .iter()
+        .filter(|(_, server)| server.has_project_overrides())
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    if overridden.is_empty() || session_trust {
+        return LspProjectTrust {
+            trusted: true,
+            notice: None,
+        };
+    }
+    let decision = cached_decision
+        .get_or_insert_with(|| TrustStore::default_store().and_then(|store| store.decision(workspace)));
+    let reason = match decision.as_ref() {
+        Ok(Some(TrustDecision::Trusted)) => {
+            return LspProjectTrust {
+                trusted: true,
+                notice: None,
+            }
+        }
+        Ok(Some(TrustDecision::Denied)) => "workspace trust denied".to_owned(),
+        Ok(None) => "workspace not trusted".to_owned(),
+        Err(error) => error.clone(),
+    };
+    LspProjectTrust {
+        trusted: false,
+        notice: Some(format!(
+            "project LSP overrides ignored ({reason}): {}",
+            overridden.join(", ")
+        )),
+    }
+}
+
 fn project_trust_with(
     config: &LspConfig,
     workspace: &Path,

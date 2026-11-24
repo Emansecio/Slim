@@ -75,11 +75,7 @@ impl OpenDesignCatalog {
         url: impl Into<String>,
         cache_path: impl Into<PathBuf>,
     ) -> Result<Self, slim_core::ProviderError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        let client = slim_core::provider::shared_http_client(Duration::from_secs(15))
             .map_err(|_| failure("request failed"))?;
         Ok(Self {
             url: url.into(),

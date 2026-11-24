@@ -12,8 +12,21 @@ use super::prompts::{
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
     UPDATE_SUMMARIZATION_PROMPT,
 };
-use super::serialize::serialize_conversation;
+use super::serialize::serialize_conversation_for_summary;
 use crate::provider::ProviderMessage;
+
+/// Caps the initial output reservation of serialized history summaries (Pi's 80%
+/// of default 16,384 reserve) so 400k-1M windows with enlarged `reserve_tokens`
+/// never ask for 160,000 output tokens.
+pub const INITIAL_HISTORY_SUMMARY_MAX_TOKENS: u64 = 13_107;
+
+/// Caps the initial output reservation of `in_place` summaries to keep high-fill
+/// 200k-1M sessions eligible for prompt-cached in-place summarization; rare
+/// oversized summaries double cleanly via `raised_summary_limit`.
+pub const INITIAL_IN_PLACE_SUMMARY_MAX_TOKENS: u64 = 8_192;
+
+/// Caps the initial output reservation of a split-turn prefix summary.
+pub const INITIAL_TURN_PREFIX_SUMMARY_MAX_TOKENS: u64 = 8_192;
 
 /// Stands in for the history summary of a split turn that has neither history
 /// nor a previous summary.
@@ -124,7 +137,9 @@ pub fn build_history_summary_request<'a>(
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
 ) -> SummaryRequest {
-    let previous_summary = previous_summary.filter(|summary| !summary.is_empty());
+    let previous_summary = previous_summary
+        .map(super::file_ops::strip_file_operation_blocks)
+        .filter(|summary| !summary.is_empty());
     let mut base_prompt = if previous_summary.is_some() {
         UPDATE_SUMMARIZATION_PROMPT.to_owned()
     } else {
@@ -134,11 +149,11 @@ pub fn build_history_summary_request<'a>(
         base_prompt = format!("{base_prompt}\n\nAdditional focus: {instructions}");
     }
 
-    let conversation = serialize_conversation(messages);
+    let conversation = serialize_conversation_for_summary(messages);
     let conversation_start = "<conversation>\n".len();
     let conversation_range = conversation_start..conversation_start + conversation.len();
     let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
-    if let Some(summary) = previous_summary {
+    if let Some(summary) = previous_summary.as_deref() {
         prompt.push_str(&format!(
             "<previous-summary>\n{summary}\n</previous-summary>\n\n"
         ));
@@ -148,7 +163,53 @@ pub fn build_history_summary_request<'a>(
     SummaryRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
         prompt,
-        max_output_tokens: max_output_tokens(reserve_tokens, 80),
+        max_output_tokens: max_output_tokens(reserve_tokens, 80)
+            .min(INITIAL_HISTORY_SUMMARY_MAX_TOKENS),
+        conversation: conversation_range,
+    }
+}
+
+/// Builds a fast Map-Reduce merge request that combines ordered chunk summaries
+/// (and any prior summary) into one canonical structured checkpoint.
+pub fn build_chunk_merge_summary_request(
+    chunk_summaries: &[String],
+    reserve_tokens: u64,
+    custom_instructions: Option<&str>,
+    previous_summary: Option<&str>,
+) -> SummaryRequest {
+    let previous_summary = previous_summary
+        .map(super::file_ops::strip_file_operation_blocks)
+        .filter(|summary| !summary.is_empty());
+    let mut base_prompt = if previous_summary.is_some() {
+        UPDATE_SUMMARIZATION_PROMPT.to_owned()
+    } else {
+        SUMMARIZATION_PROMPT.to_owned()
+    };
+    if let Some(instructions) = custom_instructions.filter(|text| !text.is_empty()) {
+        base_prompt = format!("{base_prompt}\n\nAdditional focus: {instructions}");
+    }
+    let total = chunk_summaries.len();
+    let combined = chunk_summaries
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| format!("### Chunk {}/{total}\n{summary}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let conversation_start = "<conversation>\n".len();
+    let conversation_range = conversation_start..conversation_start + combined.len();
+    let mut prompt = format!("<conversation>\n{combined}\n</conversation>\n\n");
+    if let Some(summary) = previous_summary.as_deref() {
+        prompt.push_str(&format!(
+            "<previous-summary>\n{summary}\n</previous-summary>\n\n"
+        ));
+    }
+    prompt.push_str(&base_prompt);
+
+    SummaryRequest {
+        system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
+        prompt,
+        max_output_tokens: max_output_tokens(reserve_tokens, 80)
+            .min(INITIAL_HISTORY_SUMMARY_MAX_TOKENS),
         conversation: conversation_range,
     }
 }
@@ -159,7 +220,7 @@ pub fn build_turn_prefix_summary_request<'a>(
     messages: impl IntoIterator<Item = &'a ProviderMessage>,
     reserve_tokens: u64,
 ) -> SummaryRequest {
-    let conversation = serialize_conversation(messages);
+    let conversation = serialize_conversation_for_summary(messages);
     let conversation_start = "# Conversation\n".len();
     SummaryRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
@@ -167,7 +228,8 @@ pub fn build_turn_prefix_summary_request<'a>(
         prompt: format!(
             "# Conversation\n{conversation}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
         ),
-        max_output_tokens: max_output_tokens(reserve_tokens, 50),
+        max_output_tokens: max_output_tokens(reserve_tokens, 50)
+            .min(INITIAL_TURN_PREFIX_SUMMARY_MAX_TOKENS),
     }
 }
 
@@ -182,26 +244,24 @@ impl CompactionPreparation {
         self.is_split_turn && !self.turn_prefix_messages.is_empty()
     }
 
-    /// The calls this compaction needs. A split turn also gets the turn-prefix
-    /// call, and skips the history call when it has no history of its own.
     /// The history summary asked for as the next message of the session's
     /// own conversation, cut before `first_kept_index`: the provider then
     /// reads that history from its prompt cache instead of a serialized copy.
-    /// The instruction and its output cap; `None` for a split turn, whose
-    /// prefix needs a call of its own.
+    /// Supports both complete turns and split turns in a single cached call.
     pub fn in_place_summary_prompt(
         &self,
         custom_instructions: Option<&str>,
     ) -> Option<(String, u64)> {
-        if self.summarizes_turn_prefix() || self.messages_to_summarize.is_empty() {
+        if self.messages_to_summarize.is_empty() && !self.summarizes_turn_prefix() {
             return None;
         }
         let previous_summary = self
             .previous_summary
             .as_deref()
+            .map(super::file_ops::strip_file_operation_blocks)
             .filter(|summary| !summary.is_empty());
         let mut prompt = IN_PLACE_SUMMARY_PREAMBLE.to_owned();
-        if let Some(summary) = previous_summary {
+        if let Some(summary) = previous_summary.as_deref() {
             prompt.push_str(&format!(
                 "<previous-summary>\n{summary}\n</previous-summary>\n\n"
             ));
@@ -209,10 +269,20 @@ impl CompactionPreparation {
         } else {
             prompt.push_str(SUMMARIZATION_PROMPT);
         }
+        if self.summarizes_turn_prefix() {
+            prompt.push_str(
+                "\n\n---\n\nThe latest turn in the conversation above is still in progress (later messages of that turn are kept verbatim after this checkpoint). Append a section titled `**Turn Context (split turn):**` covering:\n",
+            );
+            prompt.push_str(TURN_PREFIX_SUMMARIZATION_PROMPT);
+        }
         if let Some(instructions) = custom_instructions.filter(|text| !text.is_empty()) {
             prompt.push_str(&format!("\n\nAdditional focus: {instructions}"));
         }
-        Some((prompt, max_output_tokens(self.settings.reserve_tokens, 80)))
+        Some((
+            prompt,
+            max_output_tokens(self.settings.reserve_tokens, 80)
+                .min(INITIAL_IN_PLACE_SUMMARY_MAX_TOKENS),
+        ))
     }
 
     pub fn summary_requests(&self, custom_instructions: Option<&str>) -> SummaryRequests {
@@ -368,6 +438,54 @@ pub fn apply_compaction(
     compacted
 }
 
+/// Deterministically verifies that all `modified_files` and `open_todos` appear
+/// in `summary`. Any omitted items are appended in a compact state footer.
+pub fn validate_and_repair_summary(
+    summary: &str,
+    modified_files: &[String],
+    open_todos: &[String],
+) -> String {
+    let missing_files: Vec<&str> = modified_files
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            let basename = path.rsplit('/').next().unwrap_or(path);
+            !summary.contains(path) && (basename.is_empty() || !summary.contains(basename))
+        })
+        .collect();
+    let lower_summary = summary.to_ascii_lowercase();
+    let missing_todos: Vec<&str> = open_todos
+        .iter()
+        .map(String::as_str)
+        .filter(|todo| {
+            let trimmed = todo.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let needle = trimmed
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once("] "))
+                .map(|(_, body)| body.trim())
+                .unwrap_or(trimmed);
+            !needle.is_empty() && !lower_summary.contains(&needle.to_ascii_lowercase())
+        })
+        .collect();
+    if missing_files.is_empty() && missing_todos.is_empty() {
+        return summary.to_owned();
+    }
+    let mut repaired = summary.trim_end().to_owned();
+    repaired.push_str("\n\n### Preserved State (auto-verified)");
+    if !missing_files.is_empty() {
+        repaired.push_str("\n- Modified files: ");
+        repaired.push_str(&missing_files.join(", "));
+    }
+    if !missing_todos.is_empty() {
+        repaired.push_str("\n- Open tasks: ");
+        repaired.push_str(&missing_todos.join("; "));
+    }
+    repaired
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::estimate::ContextUsage;
@@ -437,7 +555,8 @@ mod tests {
                 "{IN_PLACE_SUMMARY_PREAMBLE}<previous-summary>\n## Goal\nold\n</previous-summary>\n\n{UPDATE_SUMMARIZATION_PROMPT}\n\nAdditional focus: tests"
             )
         );
-        // A split turn's prefix needs its own call; nothing to summarize, none.
+        // A split turn now also supports a single cache-friendly in-place summary;
+        // nothing to summarize still yields None.
         let split = preparation(
             messages,
             vec![ProviderMessage::user("prefix")],
@@ -445,7 +564,10 @@ mod tests {
             None,
             1_000,
         );
-        assert!(split.in_place_summary_prompt(None).is_none());
+        let (split_prompt, _) = split
+            .in_place_summary_prompt(None)
+            .expect("split turn supports cache-friendly in-place summary");
+        assert!(split_prompt.contains("Turn Context (split turn)"));
         let empty = preparation(Vec::new(), Vec::new(), false, None, 1_000);
         assert!(empty.in_place_summary_prompt(None).is_none());
     }
@@ -828,5 +950,58 @@ mod tests {
             .count();
         assert_eq!(summaries, 1);
         assert_eq!(compaction_summary_text(&recompacted[0]), Some("second"));
+    }
+
+    #[test]
+    fn large_reserve_tokens_clamp_initial_summary_output_caps() {
+        let messages = vec![ProviderMessage::user("old")];
+        assert_eq!(
+            build_history_summary_request(&messages, 200_000, None, None).max_output_tokens,
+            INITIAL_HISTORY_SUMMARY_MAX_TOKENS
+        );
+        assert_eq!(
+            build_turn_prefix_summary_request(&messages, 200_000).max_output_tokens,
+            INITIAL_TURN_PREFIX_SUMMARY_MAX_TOKENS
+        );
+        let prep = preparation(messages, vec![ProviderMessage::user("split")], true, None, 200_000);
+        let (_, in_place_cap) = prep.in_place_summary_prompt(None).expect("in-place prompt");
+        assert_eq!(in_place_cap, INITIAL_IN_PLACE_SUMMARY_MAX_TOKENS);
+    }
+
+    #[test]
+    fn chunk_merge_summary_request_formats_chunks_and_caps_output() {
+        let chunks = vec!["chunk one details".to_owned(), "chunk two details".to_owned()];
+        let request = build_chunk_merge_summary_request(
+            &chunks,
+            200_000,
+            Some("keep API decisions"),
+            Some("prior summary line"),
+        );
+        assert_eq!(request.max_output_tokens, INITIAL_HISTORY_SUMMARY_MAX_TOKENS);
+        assert!(request.prompt.contains("### Chunk 1/2\nchunk one details"));
+        assert!(request.prompt.contains("### Chunk 2/2\nchunk two details"));
+        assert!(request.prompt.contains("<previous-summary>\nprior summary line\n</previous-summary>"));
+        assert!(request.prompt.ends_with("Additional focus: keep API decisions"));
+    }
+
+    #[test]
+    fn validate_and_repair_summary_appends_only_missing_files_and_todos() {
+        let base = "Implemented API handler in src/api.rs.\nNext: deploy.";
+        let unchanged = validate_and_repair_summary(
+            base,
+            &["src/api.rs".into()],
+            &["[in_progress] deploy".into()],
+        );
+        assert_eq!(unchanged, base);
+
+        let repaired = validate_and_repair_summary(
+            base,
+            &["src/api.rs".into(), "src/config.rs".into()],
+            &["[pending] write integration test".into()],
+        );
+        assert!(repaired.contains("### Preserved State (auto-verified)"));
+        assert!(!repaired.contains("Modified files: src/api.rs,"));
+        assert!(repaired.contains("Modified files: src/config.rs"));
+        assert!(repaired.contains("Open tasks: [pending] write integration test"));
     }
 }

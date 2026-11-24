@@ -27,16 +27,6 @@ pub(crate) fn url_workspace_path(root: &Path, uri: &Url) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-pub(crate) fn relative_workspace_path(root: &Path, candidate: &Path) -> Option<String> {
-    let root = canonical_root(root)?;
-    let candidate = existing_workspace_path(&root, candidate)?;
-    candidate
-        .strip_prefix(root)
-        .ok()
-        .map(|relative| relative.to_string_lossy().into_owned())
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,12 +63,8 @@ mod tests {
         std::fs::write(&file, "fn main() {}\n").expect("write file");
         let resolved = existing_workspace_path(&root.0, &file).expect("inside path");
         assert_eq!(
-            relative_workspace_path(&root.0, &resolved).as_deref(),
-            Some(if cfg!(windows) {
-                "src\\main.rs"
-            } else {
-                "src/main.rs"
-            })
+            resolved,
+            std::fs::canonicalize(&file).expect("canonical file")
         );
     }
 

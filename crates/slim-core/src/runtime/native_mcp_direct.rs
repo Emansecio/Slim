@@ -107,10 +107,48 @@ async fn run_mcp_direct_dispatch(
 }
 
 impl Runtime {
+    /// Partitions snapshotted direct MCP tool definitions into `(exposed, deferred)`.
+    /// Up to `DEFERRED_DIRECT_TOOLS_THRESHOLD` sorted entries plus any append-only
+    /// `promoted_direct_mcp_tools` keep full JSON schemas; excess tools move to
+    /// compact awareness indexing until invoked or described.
+    pub(super) fn split_direct_mcp_definitions(&self) -> (Vec<Value>, Vec<Value>) {
+        let mut direct = if let Some(frozen) = self.frozen_direct_mcp_tools.as_ref() {
+            frozen.clone()
+        } else {
+            let Some(manager) = self.mcp.as_ref() else {
+                return (Vec::new(), Vec::new());
+            };
+            manager.direct_tool_definitions()
+        };
+        if direct.len() <= crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD {
+            return (direct, Vec::new());
+        }
+        direct.sort_by(|a, b| {
+            let na = a.get("name").and_then(Value::as_str).unwrap_or("");
+            let nb = b.get("name").and_then(Value::as_str).unwrap_or("");
+            na.cmp(nb)
+        });
+        let mut exposed = Vec::with_capacity(
+            crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD + self.promoted_direct_mcp_tools.len(),
+        );
+        let mut deferred = Vec::new();
+        for (idx, def) in direct.into_iter().enumerate() {
+            let name = def.get("name").and_then(Value::as_str).unwrap_or("");
+            if idx < crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD
+                || self.promoted_direct_mcp_tools.contains(name)
+            {
+                exposed.push(def);
+            } else {
+                deferred.push(def);
+            }
+        }
+        (exposed, deferred)
+    }
+
     /// Tool definitions advertised for a loop: the cached native set plus the
-    /// MCP tools declared directly. Direct tools are Auto-only like the
-    /// `mcp` gateway; the native set is returned untouched (same `Arc`) when
-    /// there are none.
+    /// exposed MCP direct tools. Direct tools are Auto-only like the
+    /// `mcp` gateway except for servers explicitly allowlisted for read-only/plan
+    /// host coordination (e.g. `slim_swarm`).
     pub(super) fn tool_definition_set(
         &self,
         mode: crate::OperatingMode,
@@ -118,13 +156,24 @@ impl Runtime {
     ) -> Arc<[Value]> {
         let base = self.base_tool_definition_set(mode, code_intel_enabled);
         // Code mode reaches MCP tools only through codemode discovery.
-        if !mode.allows_mutation() || mode == crate::OperatingMode::Code {
+        if mode == crate::OperatingMode::Code {
             return base;
         }
-        let Some(manager) = self.mcp.as_ref() else {
+        if !mode.allows_mutation() && self.mcp_readonly_allowlist.is_empty() {
             return base;
-        };
-        let direct = manager.direct_tool_definitions();
+        }
+        let (mut direct, _) = self.split_direct_mcp_definitions();
+        if !mode.allows_mutation() {
+            let Some(manager) = self.mcp.as_ref() else {
+                return base;
+            };
+            direct.retain(|def| {
+                def.get("name")
+                    .and_then(Value::as_str)
+                    .and_then(|tool_name| manager.resolve_direct_tool(tool_name))
+                    .is_some_and(|(server, _)| self.mcp_readonly_allowlist.contains(&server))
+            });
+        }
         if direct.is_empty() {
             return base;
         }
@@ -196,6 +245,9 @@ mod tests {
                 description: Some("Reads".into()),
                 schema: json!({"type": "object"}),
                 output_schema: None,
+                read_only_hint: false,
+                destructive_hint: false,
+                idempotent_hint: false,
             }],
         );
         manager
@@ -498,6 +550,9 @@ mod tests {
                 description: None,
                 schema: json!({"type": "object"}),
                 output_schema: None,
+                read_only_hint: false,
+                destructive_hint: false,
+                idempotent_hint: false,
             }],
         );
         let _ = manager.direct_tool_definitions();
@@ -550,5 +605,177 @@ mod tests {
             gateway.output.replace(&gateway_blobs[0].id, "ID")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_tools_above_threshold_are_deferred_and_append_only_promoted() {
+        let manager = Arc::new(McpManager::new(
+            Default::default(),
+            std::env::temp_dir(),
+            Default::default(),
+        ));
+        let mut spec = crate::mcp::McpServerSpec::new(
+            "big",
+            crate::mcp::McpTransport::Stdio {
+                command: "controlled-test-connection".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        );
+        spec.options.exposure = crate::mcp::McpExposure::Direct;
+        let summaries: Vec<crate::mcp::McpToolSummary> = (0..18)
+            .map(|i| crate::mcp::McpToolSummary {
+                name: format!("tool_{i:02}"),
+                description: Some(format!("Tool number {i}")),
+                schema: json!({"type": "object", "properties": {}}),
+                output_schema: None,
+                read_only_hint: false,
+                destructive_hint: false,
+                idempotent_hint: false,
+            })
+            .collect();
+        manager.insert_connection(spec, Arc::new(Rich), summaries);
+
+        let mut runtime = Runtime::new();
+        runtime.mcp = Some(manager);
+        let (exposed, deferred) = runtime.split_direct_mcp_definitions();
+        assert_eq!(exposed.len(), crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD);
+        assert_eq!(deferred.len(), 18 - crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD);
+
+        let awareness = runtime
+            .mcp_awareness(crate::OperatingMode::Auto)
+            .expect("awareness");
+        assert!(awareness.contains("Deferred direct MCP tools"));
+        assert!(awareness.contains("mcp__big__tool_17"));
+
+        runtime
+            .promoted_direct_mcp_tools
+            .insert("mcp__big__tool_17".into());
+        let (exposed2, deferred2) = runtime.split_direct_mcp_definitions();
+        assert_eq!(
+            exposed2.len(),
+            crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD + 1
+        );
+        assert_eq!(
+            deferred2.len(),
+            18 - crate::mcp::DEFERRED_DIRECT_TOOLS_THRESHOLD - 1
+        );
+        assert!(exposed2
+            .iter()
+            .any(|v| v["name"].as_str() == Some("mcp__big__tool_17")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readonly_hint_enables_parallel_direct_mcp_cluster() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BarrierConn {
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+            barrier: tokio::sync::Barrier,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::mcp::McpConnection for BarrierConn {
+            async fn request(
+                &self,
+                _method: &str,
+                _params: Value,
+            ) -> Result<Value, crate::mcp::McpError> {
+                let current = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                self.max_in_flight.fetch_max(current, Ordering::AcqRel);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.barrier.wait(),
+                )
+                .await
+                .map_err(|_| crate::mcp::McpError::Protocol("calls did not overlap".into()))?;
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
+            }
+
+            async fn notify(&self, _method: &str, _params: Value) {}
+
+            fn is_closed(&self) -> bool {
+                false
+            }
+        }
+
+        let conn = Arc::new(BarrierConn {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            barrier: tokio::sync::Barrier::new(2),
+        });
+        let manager = Arc::new(McpManager::new(
+            Default::default(),
+            std::env::temp_dir(),
+            Default::default(),
+        ));
+        let mut spec = crate::mcp::McpServerSpec::new(
+            "docs",
+            crate::mcp::McpTransport::Stdio {
+                command: "controlled-test-connection".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        );
+        spec.options.exposure = crate::mcp::McpExposure::Direct;
+        manager.insert_connection(
+            spec,
+            conn.clone(),
+            vec![
+                crate::mcp::McpToolSummary {
+                    name: "ro_get".into(),
+                    description: Some("Read-only lookup".into()),
+                    schema: json!({"type": "object"}),
+                    output_schema: None,
+                    read_only_hint: true,
+                    destructive_hint: false,
+                    idempotent_hint: false,
+                },
+                crate::mcp::McpToolSummary {
+                    name: "rw_put".into(),
+                    description: Some("Mutating call".into()),
+                    schema: json!({"type": "object"}),
+                    output_schema: None,
+                    read_only_hint: false,
+                    destructive_hint: false,
+                    idempotent_hint: false,
+                },
+            ],
+        );
+        assert!(manager.is_direct_tool_read_only("mcp__docs__ro_get"));
+        assert!(!manager.is_direct_tool_read_only("mcp__docs__rw_put"));
+        assert!(!manager.is_direct_tool_read_only("mcp__docs__unknown"));
+
+        let mut runtime = Runtime::new();
+        runtime.set_mcp_manager(Some(manager));
+        let mut governor = super::super::governor::CausalGovernor::default();
+        let calls = vec![
+            crate::provider::ProviderToolCall {
+                id: "c1".into(),
+                name: "mcp__docs__ro_get".into(),
+                arguments: "{}".into(),
+            },
+            crate::provider::ProviderToolCall {
+                id: "c2".into(),
+                name: "mcp__docs__ro_get".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let (results, _) = runtime
+            .execute_provider_tool_batch(
+                crate::OperatingMode::Auto,
+                &std::env::temp_dir(),
+                "batch-ro-mcp",
+                &calls,
+                1,
+                &mut governor,
+            )
+            .await
+            .expect("batch succeeds");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.success && r.output == "ok"));
+        assert_eq!(conn.max_in_flight.load(Ordering::Acquire), 2);
     }
 }

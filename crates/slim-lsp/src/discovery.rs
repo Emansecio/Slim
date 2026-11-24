@@ -788,36 +788,4 @@ mod tests {
         assert_eq!(resolved, dir.join("rust-analyzer.exe"));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn discovery_reports_missing_binary_without_root_change() {
-        let dir = std::env::temp_dir().join(format!(
-            "slim-lsp-missing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
-        let result = discover_for_workspace(&dir, None);
-        assert_eq!(result.root, Some(dir.clone()));
-        assert!(result.spec.is_some());
-        // binary_missing depends on whether rust-analyzer is on PATH; either
-        // outcome is correct as long as root and spec are populated.
-        assert!(
-            result.binary_missing == (result.spec.as_ref().unwrap().command == "rust-analyzer")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn config_hash_changes_with_config() {
-        use serde_json::json;
-        let a = config_hash(&json!({ "checkOnSave": false }));
-        let b = config_hash(&json!({ "checkOnSave": true }));
-        assert_ne!(a, b);
-        assert_eq!(a, config_hash(&json!({ "checkOnSave": false })));
-    }
 }

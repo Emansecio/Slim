@@ -10,6 +10,8 @@ const MAX_RETAINED: usize = 32;
 const JOB_PREFIX: &str = "shell-";
 /// Longest single `shell_job` wait; also the schema's `timeout_ms` maximum.
 const MAX_WAIT_MS: u64 = 10_000;
+/// How long a default-yield shell that ends its batch is awaited inline.
+const INLINE_WAIT_MS: u64 = 30_000;
 /// How long `shell_job input` waits for the job to take what was written.
 const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(30);
 /// One page of job output as the model reads it. The offsets stay raw byte
@@ -609,6 +611,9 @@ impl ShellJobs {
             self.record_metadata(job.info(*key));
         }
     }
+    pub fn is_dirty(&self) -> bool {
+        !crate::tools::lock_mutex(&self.0.metadata).is_empty()
+    }
     pub fn take_metadata(&self) -> Vec<ShellJobInfo> {
         std::mem::take(&mut *crate::tools::lock_mutex(&self.0.metadata))
             .into_values()
@@ -729,6 +734,9 @@ impl ShellJobs {
         while self.running() {
             self.wait().await;
         }
+    }
+    pub async fn changed(&self) {
+        self.0.changed.notified().await;
     }
     pub(super) async fn wait(&self) {
         let _ = tokio::time::timeout(Duration::from_millis(100), self.0.changed.notified()).await;
@@ -1029,6 +1037,7 @@ impl ShellJobs {
         if let Some(job) = self.jobs().get(&key) {
             self.record_metadata(job.info(key));
         }
+        self.0.changed.notify_waiters();
         self.spawn_worker(key, tools, prepared, parent, cancellation);
         Ok(job_name(key))
     }
@@ -1093,6 +1102,8 @@ impl ShellJobs {
                 lost: None,
             },
         );
+        drop(jobs);
+        self.0.changed.notify_waiters();
         Ok((key, cancellation))
     }
     fn spawn_worker(
@@ -1158,7 +1169,7 @@ impl ShellJobs {
                 }
                 state.record_metadata(job.info(key));
             }
-            state.0.changed.notify_one();
+            state.0.changed.notify_waiters();
         });
     }
     pub(super) fn control(&self, id: &str, cancel: bool) -> Result<ToolResult, String> {
@@ -1237,14 +1248,59 @@ impl Runtime {
                 arguments,
             },
         )?;
+        let speculative_shell = self.speculative_reads.remove(invocation.call_id);
         let managed = if !mode.allows_mutation() {
+            if let Some(s) = speculative_shell {
+                s.handle.abort();
+            }
             Managed::Immediate(Err("Managed shell jobs require Auto mode".into()))
         } else if let Some(error) = &prepared.error {
+            if let Some(s) = speculative_shell {
+                s.handle.abort();
+            }
             Managed::Immediate(Err(error.clone()))
         } else if invocation.name == "shell_job" {
+            if let Some(s) = speculative_shell {
+                s.handle.abort();
+            }
             Managed::Immediate(self.control_from_args(invocation.arguments).await)
         } else {
-            self.run_inline(invocation, prepared, &mut seq).await?
+            let mut spec_hit = None;
+            if let Some(entry) = speculative_shell {
+                let rev_now = self.tools.workspace_revision();
+                let daemon = crate::project_index::existing_for_path(
+                    prepared.target_paths.first().map_or(Path::new("."), PathBuf::as_path),
+                );
+                let (fs_now, git_now) =
+                    daemon.map_or((0, 0), |d| (d.fs_epoch(), d.git_dirty_epoch()));
+                if entry.revision_before == rev_now
+                    && (entry.fs_epoch_before == 0 || fs_now == 0 || entry.fs_epoch_before == fs_now)
+                    && (entry.git_dirty_epoch_before == 0 || git_now == 0 || entry.git_dirty_epoch_before == git_now)
+                    && (entry.fingerprint.is_empty() || entry.fingerprint == prepared.canonical_fingerprint)
+                {
+                    if let Ok(Some(SpeculativeOutcome::ReadOnlyShell {
+                        fingerprint,
+                        outcome,
+                    })) = entry.handle.await
+                    {
+                        if fingerprint == prepared.canonical_fingerprint
+                            && self.tools.workspace_revision() == rev_now
+                            && outcome.receipt.revision_before == rev_now
+                            && outcome.result.success
+                        {
+                            spec_hit = Some(outcome);
+                        }
+                    }
+                } else {
+                    entry.handle.abort();
+                }
+            }
+            if let Some(outcome) = spec_hit {
+                receipt = outcome.receipt;
+                Managed::Immediate(Ok(outcome.result))
+            } else {
+                self.run_inline(invocation, prepared, &mut seq).await?
+            }
         };
         let mut inline_job_id = None;
         let (result, yielded) = match managed {
@@ -1407,7 +1463,10 @@ impl Runtime {
             None => Ok(()),
         }
     }
-    /// Starts the job and waits for it up to its `yield_ms`.
+    /// Starts the job and waits for it up to its `yield_ms`. With the default
+    /// yield and nothing else pending in the batch, the model could only wait
+    /// for the job, at the cost of a whole turn: the wait happens here, up to
+    /// [`INLINE_WAIT_MS`], and still gives way to a steer.
     async fn run_inline(
         &mut self,
         invocation: ToolInvocation<'_>,
@@ -1424,9 +1483,21 @@ impl Runtime {
             Err(error) => return Ok(Managed::Immediate(Err(error))),
         };
         self.push_shell_job_changed(&id, seq)?;
-        let yield_ms = match prepared.arguments {
-            PreparedToolArguments::Shell { yield_ms, .. } => yield_ms,
-            _ => 0,
+        let ends_batch = std::mem::take(&mut self.shell_ends_batch);
+        let (yield_ms, alone) = match prepared.arguments {
+            PreparedToolArguments::Shell {
+                yield_ms,
+                timeout_ms,
+                stdin,
+                ..
+            } if ends_batch
+                && !stdin
+                && yield_ms == crate::tools::DEFAULT_SHELL_YIELD_MS =>
+            {
+                (INLINE_WAIT_MS.min(timeout_ms), true)
+            }
+            PreparedToolArguments::Shell { yield_ms, .. } => (yield_ms, false),
+            _ => (0, false),
         };
         let until = tokio::time::Instant::now() + Duration::from_millis(yield_ms);
         loop {
@@ -1443,7 +1514,7 @@ impl Runtime {
                 )?;
                 return Ok(Managed::Finished(Box::new(done)));
             }
-            if tokio::time::Instant::now() >= until {
+            if tokio::time::Instant::now() >= until || (alone && self.steer_pending()) {
                 return Ok(Managed::Yielded(self.shell_jobs.control(&id, false)));
             }
             let _ = tokio::time::timeout_at(until, self.shell_jobs.wait()).await;
@@ -1503,8 +1574,15 @@ impl Runtime {
                     },
                 )?;
             }
+            let folded_output = super::shell_fold::fold_shell_output(
+                &name,
+                &output,
+                result.success,
+            );
+            let presentation_input = folded_output.as_deref().unwrap_or(&output);
             let mut output =
-                present_unstructured("shell", &output, PresentationBudget { max_bytes }).text;
+                present_unstructured("shell", presentation_input, PresentationBudget { max_bytes })
+                    .text;
             if let Some(handle) = result.artifact.as_ref() {
                 let _ = write!(
                     output,
@@ -2102,6 +2180,47 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
+    async fn default_yield_waits_inline_only_when_the_shell_ends_the_batch() {
+        for (ends_batch, expected) in [(true, "completed"), (false, "running")] {
+            let mut runtime = Runtime::new();
+            runtime.shell_ends_batch = ends_batch;
+            let command = if cfg!(windows) {
+                "Start-Sleep -Milliseconds 1500"
+            } else {
+                "sleep 1.5"
+            };
+            let args = json!({ "command": command }).to_string();
+            let prepared = runtime.tools.prepare_invocation(
+                crate::OperatingMode::Auto,
+                std::env::temp_dir(),
+                "shell",
+                &args,
+            );
+            runtime
+                .execute_managed_shell(
+                    crate::OperatingMode::Auto,
+                    ToolInvocation {
+                        arguments: &args,
+                        ..invocation()
+                    },
+                    &prepared,
+                    1,
+                )
+                .await
+                .unwrap();
+            let states: Vec<_> = runtime
+                .app
+                .events()
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    crate::EventKind::ShellJobChanged { job } => Some(job.state.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(states.last(), Some(&expected), "ends_batch={ends_batch}");
+        }
+    }
+    #[tokio::test]
     async fn inline_completion_records_terminal_metadata() {
         let mut runtime = Runtime::new();
         let args=json!({"command":if cfg!(windows){"Write-Output done"}else{"printf done"},"yield_ms":10000}).to_string();
@@ -2541,5 +2660,54 @@ mod tests {
         for id in ["7", "shell-07", "shell-+7", "shell-8", "shell-", "shell-7 "] {
             assert!(jobs.control(id, false).is_err(), "{id} must be unknown");
         }
+    }
+    #[tokio::test]
+    async fn is_dirty_tracks_pending_metadata_and_changed_notifies_all_waiters() {
+        let jobs = ShellJobs::default();
+        assert!(!jobs.is_dirty());
+
+        let waiter_a = jobs.changed();
+        let waiter_b = jobs.changed();
+        tokio::pin!(waiter_a);
+        tokio::pin!(waiter_b);
+        // Poll once so both waiters register on Notify before registration fires.
+        assert!(tokio::time::timeout(Duration::ZERO, &mut waiter_a).await.is_err());
+        assert!(tokio::time::timeout(Duration::ZERO, &mut waiter_b).await.is_err());
+
+        let root = crate::runtime::temp_root::TempRoot::new("shell-job-dirty-notify");
+        let store = ArtifactStore::new(root.join("logs")).unwrap();
+        let cmd = if cfg!(windows) {
+            "Write-Output ok"
+        } else {
+            "printf ok"
+        };
+        jobs.start_user(Default::default(), &root, cmd, &[], store)
+            .unwrap();
+        assert!(jobs.is_dirty());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            waiter_a.await;
+            waiter_b.await;
+        })
+        .await
+        .expect("both waiters notified on registration");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while jobs.running() {
+                jobs.changed().await;
+            }
+        })
+        .await
+        .expect("changed wakes on job completion");
+
+        assert!(jobs.is_dirty());
+        let taken = jobs.take_metadata();
+        assert_eq!(taken.len(), 1);
+        assert!(!jobs.is_dirty());
+        jobs.return_metadata(taken);
+        assert!(jobs.is_dirty());
+        let final_taken = jobs.take_metadata();
+        assert_eq!(final_taken.len(), 1);
+        assert!(!jobs.is_dirty());
     }
 }

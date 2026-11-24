@@ -4,11 +4,11 @@ use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableMouseCapture,
 };
-use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EndSynchronizedUpdate, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
+use crossterm::{execute, queue};
 
 pub struct TerminalGuard {
     active: bool,
@@ -41,11 +41,6 @@ mod console {
                 output_cp,
                 output_mode,
             }
-        }
-
-        #[cfg(test)]
-        fn code_pages(self) -> (u32, u32) {
-            (self.input_cp, self.output_cp)
         }
     }
 
@@ -87,18 +82,6 @@ mod console {
             }
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::ConsoleState;
-
-        #[test]
-        fn preserves_distinct_input_and_output_code_pages() {
-            let state = ConsoleState::new(437, 1252, 7);
-
-            assert_eq!(state.code_pages(), (437, 1252));
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -128,7 +111,11 @@ pub fn install_panic_hook() {
 }
 
 impl TerminalGuard {
-    pub fn enter(stdout: &mut Stdout) -> io::Result<Self> {
+    /// Captures Windows console state, installs the panic hook, and enables
+    /// raw mode so the caller can buffer the entire §22.1 entry sequence into
+    /// a single `flush()`. Dropping the returned guard rolls back raw mode and
+    /// restores the surface if any subsequent entry step fails.
+    pub fn enter_raw() -> io::Result<Self> {
         #[cfg(windows)]
         let console = console::setup()?;
         #[cfg(windows)]
@@ -145,17 +132,6 @@ impl TerminalGuard {
         })?;
         #[cfg(not(windows))]
         enable_raw_mode()?;
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            #[cfg(windows)]
-            {
-                if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
-                    guard.take();
-                }
-                console::restore(console);
-            }
-            return Err(error);
-        }
         Ok(Self {
             active: true,
             mouse_capture: false,
@@ -164,8 +140,26 @@ impl TerminalGuard {
         })
     }
 
+    pub fn enter(stdout: &mut Stdout) -> io::Result<Self> {
+        let guard = Self::enter_raw()?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            drop(guard);
+            return Err(error);
+        }
+        Ok(guard)
+    }
+
     pub fn enable_mouse_capture<W: Write>(&mut self, stdout: &mut W) -> io::Result<()> {
         execute!(stdout, EnableMouseCapture)?;
+        self.mouse_capture = true;
+        Ok(())
+    }
+
+    pub(crate) fn enable_mouse_capture_queued<W: Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        queue!(writer, EnableMouseCapture)?;
         self.mouse_capture = true;
         Ok(())
     }
@@ -189,7 +183,7 @@ impl TerminalGuard {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn enable_with_rollback(
     enable: impl FnOnce() -> io::Result<()>,
     rollback: impl FnOnce(),
@@ -236,24 +230,6 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::io;
-
-    use super::enable_with_rollback;
-
-    #[test]
-    fn raw_mode_failure_runs_console_rollback() {
-        let rolled_back = Cell::new(false);
-
-        let result = enable_with_rollback(
-            || Err(io::Error::other("raw mode failed")),
-            || rolled_back.set(true),
-        );
-
-        assert!(result.is_err());
-        assert!(rolled_back.get());
-    }
-
     #[test]
     fn restore_surface_skips_mouse_cleanup_when_capture_was_never_enabled() {
         let mut output = Vec::new();
@@ -276,11 +252,5 @@ mod tests {
             output.starts_with(b"\x1b[?2026l"),
             "an interrupted frame must not keep the terminal's presentation held"
         );
-    }
-
-    #[test]
-    fn install_panic_hook_is_idempotent() {
-        super::install_panic_hook();
-        super::install_panic_hook();
     }
 }

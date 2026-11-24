@@ -731,3 +731,105 @@ fn a_resumed_duplicate_pointer_whose_original_was_compacted_away_is_rewritten() 
     std::fs::remove_file(&path).unwrap();
     let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
 }
+
+#[test]
+fn persist_compaction_commits_chains_multiple_commits_in_a_single_pass() {
+    use super::persist_compaction_commits;
+    use slim_core::context::{canonical_prefix_fingerprint, CompactionCommit};
+
+    let path = fixture_path("multi-commit-chain");
+    let mut repo = JsonlRepo::create(
+        &path,
+        DurableSessionHeader::new("session", "now", "D:\\Slim", None, None),
+    )
+    .unwrap();
+    let messages = vec![
+        ProviderMessage::user("m0"),
+        ProviderMessage::assistant("m1", Vec::new()),
+        ProviderMessage::user("m2"),
+        ProviderMessage::assistant("m3", Vec::new()),
+        ProviderMessage::user("m4"),
+        ProviderMessage::assistant("m5", Vec::new()),
+    ];
+    for (index, message) in messages.iter().cloned().enumerate() {
+        repo.append(DurableRecord::Entry {
+            seq: index as u64,
+            entry: DurableEntry::from_provider_message(
+                index.to_string(),
+                index.checked_sub(1).map(|i| i.to_string()),
+                "op".into(),
+                message,
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    }
+
+    // Commit 1 summarizes messages[..2] and keeps from index 2 ("m2").
+    let commit1 = CompactionCommit {
+        summary: "summary-one".into(),
+        canonical_prefix_fingerprint: canonical_prefix_fingerprint(&messages[..2]),
+        first_kept_index: 2,
+        tokens_before: 1_000,
+        tokens_after: 400,
+        input_tokens: 100,
+        output_tokens: 20,
+        duration_ms: 10,
+        reason: CompactionReason::Threshold,
+        read_files: vec!["a.rs".into()],
+        modified_files: Vec::new(),
+    };
+    // After commit 1 is applied: [summary_msg("summary-one"), m2, m3, m4, m5].
+    // Commit 2 summarizes the first 3 entries [summary_msg("summary-one"), m2, m3]
+    // and keeps from index 3 ("m4", original entry id "4").
+    let after_commit1_prefix = vec![
+        slim_core::context::compaction_summary_message("summary-one"),
+        messages[2].clone(),
+        messages[3].clone(),
+    ];
+    let commit2 = CompactionCommit {
+        summary: "summary-two".into(),
+        canonical_prefix_fingerprint: canonical_prefix_fingerprint(&after_commit1_prefix),
+        first_kept_index: 3,
+        tokens_before: 800,
+        tokens_after: 250,
+        input_tokens: 80,
+        output_tokens: 15,
+        duration_ms: 8,
+        reason: CompactionReason::Manual,
+        read_files: vec!["a.rs".into(), "b.rs".into()],
+        modified_files: vec!["b.rs".into()],
+    };
+
+    let warnings = persist_compaction_commits(&mut repo, vec![commit1, commit2]).unwrap();
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+    let preflight = super::SessionPreflight::from_open_repo(&repo);
+    let restored = durable_provider_history(&preflight).unwrap();
+    assert_eq!(restored.applied_checkpoint_id.as_deref(), Some("compact-session-7"));
+    assert_eq!(restored.messages.len(), 3);
+    assert!(restored.messages[0].content.contains("summary-two"));
+    assert_eq!(restored.messages[1].content, "m4");
+    assert_eq!(restored.messages[2].content, "m5");
+
+    let checkpoints: Vec<_> = repo
+        .records()
+        .iter()
+        .filter_map(|r| match r {
+            DurableRecord::Compaction { checkpoint, .. } => Some(checkpoint),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(checkpoints[0].previous_checkpoint_id, None);
+    assert_eq!(checkpoints[0].first_kept_entry_id, "2");
+    assert_eq!(
+        checkpoints[1].previous_checkpoint_id.as_deref(),
+        Some(checkpoints[0].checkpoint_id.as_str())
+    );
+    assert_eq!(checkpoints[1].first_kept_entry_id, "4");
+
+    drop(repo);
+    std::fs::remove_file(&path).unwrap();
+    let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
+}

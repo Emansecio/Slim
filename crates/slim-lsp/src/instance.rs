@@ -141,19 +141,6 @@ pub struct ServerInstanceConfig {
     pub max_open_documents: usize,
 }
 
-impl ServerInstanceConfig {
-    pub fn for_rust_analyzer(root: PathBuf, spec: ServerSpec) -> Self {
-        Self {
-            root,
-            spec,
-            transport_options: TransportOptions::default(),
-            initialization_options: json!({ "checkOnSave": false }),
-            settings: json!({ "rust-analyzer": { "checkOnSave": false } }),
-            max_open_documents: crate::document::DEFAULT_MAX_OPEN_DOCUMENTS,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct InstanceSnapshot {
     pub ready: bool,
@@ -921,17 +908,6 @@ impl LspServerInstance {
         Ok(true)
     }
 
-    #[cfg(test)]
-    pub async fn document_version_async(&self, path: &Path) -> Option<i64> {
-        let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
-        let _document_sync = self.document_lock(&path).lock_owned().await;
-        if self.transport.is_closed() {
-            return None;
-        }
-        let state = self.state.lock().await;
-        state.documents.get(&path).map(|doc| doc.version)
-    }
-
     pub(crate) async fn document_content_snapshot_async(
         &self,
         path: &Path,
@@ -1290,6 +1266,17 @@ fn wire_version(version: i64) -> i32 {
 mod tests {
     use super::*;
 
+    fn rust_analyzer_config(root: PathBuf, spec: ServerSpec) -> ServerInstanceConfig {
+        ServerInstanceConfig {
+            root,
+            spec,
+            transport_options: TransportOptions::default(),
+            initialization_options: json!({ "checkOnSave": false }),
+            settings: json!({ "rust-analyzer": { "checkOnSave": false } }),
+            max_open_documents: crate::document::DEFAULT_MAX_OPEN_DOCUMENTS,
+        }
+    }
+
     fn sync_fixture(capacity: usize) -> (LspServerInstance, tokio::io::DuplexStream, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "slim-sync-fault-{}-{}",
@@ -1322,7 +1309,7 @@ mod tests {
             document_lifecycle: Mutex::new(()),
             workspace_snapshot: Mutex::new(None),
             transport,
-            config: ServerInstanceConfig::for_rust_analyzer(
+            config: rust_analyzer_config(
                 root,
                 crate::discovery::rust_analyzer_spec("unused".into()),
             ),
@@ -1391,7 +1378,7 @@ mod tests {
             }
             let other = instance.config.root.join("other.rs");
             std::fs::write(&other, "other").unwrap();
-            assert_eq!(instance.document_version_async(&other).await, None);
+            assert!(instance.document_content_snapshot_async(&other).await.is_none());
         }
         assert!(instance.is_closed());
         assert_eq!(
@@ -1508,19 +1495,20 @@ mod tests {
 
     #[test]
     fn configuration_answers_per_requested_section() {
-        let handler = server_request_handler(
-            json!({ "rust-analyzer": { "checkOnSave": false, "cargo": { "allTargets": true } } }),
-            std::env::temp_dir(),
-        );
+        let settings =
+            json!({ "rust-analyzer": { "checkOnSave": false, "cargo": { "allTargets": true } } });
+        let handler = server_request_handler(settings.clone(), std::env::temp_dir());
         let response = handler(
             "workspace/configuration",
             Some(&json!({
                 "items": [
                     { "section": "rust-analyzer" },
                     { "section": "rust-analyzer.cargo" },
+                    { "section": "rust-analyzer.cargo.allTargets" },
                     { "section": "rust-analyzer.check" },
                     { "section": "rust-analyzerX" },
                     { "section": "other" },
+                    { "section": "" },
                     {},
                 ]
             })),
@@ -1531,10 +1519,12 @@ mod tests {
             json!([
                 { "checkOnSave": false, "cargo": { "allTargets": true } },
                 { "allTargets": true },
+                true,
                 null,
                 null,
                 null,
-                { "rust-analyzer": { "checkOnSave": false, "cargo": { "allTargets": true } } },
+                settings,
+                settings,
             ]),
             "section content must be answered verbatim, never re-wrapped"
         );
@@ -1545,36 +1535,6 @@ mod tests {
         assert_eq!(
             handler("workspace/applyEdit", None).expect("applyEdit answered"),
             json!({ "applied": false })
-        );
-    }
-
-    #[test]
-    fn configuration_resolves_multiple_sections_and_workspace_folders() {
-        let root = std::env::temp_dir();
-        let settings = json!({
-            "typescript": { "preferences": { "quotePreference": "single" } },
-            "javascript": { "preferences": { "quotePreference": "double" } },
-        });
-        let handler = server_request_handler(settings.clone(), root.clone());
-        assert_eq!(
-            handler(
-                "workspace/configuration",
-                Some(&json!({ "items": [
-                { "section": "typescript.preferences" },
-                { "section": "javascript.preferences.quotePreference" },
-                { "section": "typescriptX" },
-                { "section": "typescript.missing" },
-                { "section": "" },
-            ] }))
-            )
-            .unwrap(),
-            json!([{ "quotePreference": "single" }, "double", null, null, settings])
-        );
-        let folders = handler("workspace/workspaceFolders", None).unwrap();
-        assert_eq!(folders[0]["uri"], file_uri(&root).unwrap().as_str());
-        assert_eq!(
-            folders[0]["name"],
-            root.file_name().unwrap().to_string_lossy().as_ref()
         );
     }
 
@@ -1653,7 +1613,7 @@ mod tests {
             assert_eq!(changed["method"], "workspace/didChangeConfiguration");
             assert_eq!(changed["params"]["settings"], expected_settings);
         });
-        let mut config = ServerInstanceConfig::for_rust_analyzer(
+        let mut config = rust_analyzer_config(
             root,
             crate::discovery::rust_analyzer_spec("unused".into()),
         );
@@ -1916,45 +1876,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rust_analyzer_work_tokens_drive_indexing_flag() {
-        let state = Arc::new(Mutex::new(InstanceState::new(8)));
-        let root = Path::new("D:/demo");
-        LspServerInstance::handle_notification(
-            &state,
-            root,
-            "rust-analyzer",
-            progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "begin"),
-        )
-        .await;
-        {
-            let guard = state.lock().await;
-            assert!(guard.indexing_observed);
-            assert!(guard.indexing_active());
-        }
-        LspServerInstance::handle_notification(
-            &state,
-            root,
-            "rust-analyzer",
-            progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "report"),
-        )
-        .await;
-        assert!(state.lock().await.indexing_active());
-        LspServerInstance::handle_notification(
-            &state,
-            root,
-            "rust-analyzer",
-            progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "end"),
-        )
-        .await;
-        assert!(!state.lock().await.indexing_active());
-    }
-
-    #[tokio::test]
     async fn one_tokens_end_does_not_close_another_tokens_begin() {
         let state = Arc::new(Mutex::new(InstanceState::new(8)));
         let root = Path::new("D:/demo");
         for (token, kind) in [
             ("rustAnalyzer/Roots Scanned", "begin"),
+            ("rustAnalyzer/Roots Scanned", "report"),
             ("rustAnalyzer/Indexing", "begin"),
             ("rustAnalyzer/Roots Scanned", "end"),
         ] {
@@ -1967,6 +1894,7 @@ mod tests {
             .await;
         }
         let guard = state.lock().await;
+        assert!(guard.indexing_observed);
         assert!(guard.indexing_active(), "the Indexing token is still open");
         assert_eq!(guard.active_progress.len(), 1);
     }

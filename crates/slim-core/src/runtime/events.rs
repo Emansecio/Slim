@@ -5,20 +5,25 @@ pub(super) fn push_runtime_event(
     next_seq: &mut u64,
     kind: crate::EventKind,
 ) -> Result<(), ProviderError> {
-    let persistence = if let Some(journal) = &app.run_journal {
-        let record = || {
-            lock_journal(journal)
-                .and_then(|mut journal| journal.record_event(&kind).map_err(journal_error))
-        };
-        // An append the journal syncs to disk stalls the thread for the
-        // fsync. On a multi-thread runtime that thread is one of few workers
-        // (the provider stream and MCP share them), so it hands its tasks
-        // over for the duration instead of holding them.
-        if crate::session::ManualRunJournal::event_reaches_disk(&kind) && on_multi_thread_runtime()
-        {
-            tokio::task::block_in_place(record)
+    let persistence = if crate::session::ManualRunJournal::event_persists_to_journal(&kind) {
+        if let Some(journal) = &app.run_journal {
+            let record = || {
+                lock_journal(journal)
+                    .and_then(|mut journal| journal.record_event(&kind).map_err(journal_error))
+            };
+            // An append the journal syncs to disk stalls the thread for the
+            // fsync. On a multi-thread runtime that thread is one of few workers
+            // (the provider stream and MCP share them), so it hands its tasks
+            // over for the duration instead of holding them.
+            if crate::session::ManualRunJournal::event_reaches_disk(&kind)
+                && on_multi_thread_runtime()
+            {
+                tokio::task::block_in_place(record)
+            } else {
+                record()
+            }
         } else {
-            record()
+            Ok(())
         }
     } else {
         Ok(())
@@ -35,7 +40,7 @@ pub(super) fn push_runtime_event(
 /// Runs a journal append that syncs to disk. On a multi-thread runtime the
 /// worker hands its other tasks over for the duration of the fsync, as
 /// `push_runtime_event` does for events.
-fn journal_io<T>(append: impl FnOnce() -> T) -> T {
+pub(super) fn journal_io<T>(append: impl FnOnce() -> T) -> T {
     if on_multi_thread_runtime() {
         tokio::task::block_in_place(append)
     } else {

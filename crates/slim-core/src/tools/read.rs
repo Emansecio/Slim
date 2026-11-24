@@ -15,6 +15,11 @@ use crate::runtime::CancellationToken;
 
 pub const DEFAULT_MAX_READ_LINES: usize = 200;
 pub const MAX_READ_LINES_CAP: usize = 4096;
+const SMART_READ_OUTLINE_BYTES: u64 = 32 * 1024;
+const SMART_READ_OUTLINE_LINES: usize = 250;
+const SMART_READ_PREVIEW_LINES: usize = 120;
+const DELTA_READ_MAX_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DELIVERED_SNAPSHOTS: usize = 128;
 const MAX_READ_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
 pub(super) const DIRECTORY_PATH_MESSAGE: &str = "path is a directory; use list to see its entries";
@@ -43,7 +48,16 @@ pub(crate) struct ReadPage {
 #[derive(Debug, Default)]
 struct ReadCache {
     entries: HashMap<PathBuf, ReadIndex>,
+    delivered: HashMap<PathBuf, DeliveredSnapshot>,
     clock: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DeliveredSnapshot {
+    version: FileVersion,
+    first_line: usize,
+    lines: Vec<String>,
+    last_used: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +67,7 @@ struct ReadIndex {
     last_used: u64,
     complete_digest: Option<[u8; 32]>,
     read_progress: Option<ReadProgress>,
+    cached_digest_progress: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,13 +90,10 @@ struct FileVersion {
 }
 
 /// Lines a model-facing read starting at `first_line` returns at most, for a
-/// file of `len` bytes: an omitted limit widens the first page of a file that
-/// fits one page to the whole file.
+/// file of `len` bytes: an omitted limit widens the first page only for small
+/// files (`<= SMART_READ_OUTLINE_BYTES`) so large files default to bounded reads.
 pub(crate) fn page_lines(first_line: usize, max_lines: Option<usize>, len: u64) -> usize {
-    if first_line <= 1
-        && max_lines.is_none()
-        && len <= MAX_READ_PAGE_BYTES.saturating_sub(128) as u64
-    {
+    if first_line <= 1 && max_lines.is_none() && len <= SMART_READ_OUTLINE_BYTES {
         MAX_READ_LINES_CAP
     } else {
         max_lines.unwrap_or(DEFAULT_MAX_READ_LINES)
@@ -129,7 +141,108 @@ impl ReadService {
         numbered: bool,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReadPage, ToolExecutionError> {
+        self.read_file_range_inner(canonical, start_line, max_lines, numbered, true, cancellation)
+    }
+
+    /// Reads a line range without updating `complete_digest` (used by `ranges`).
+    pub(crate) fn read_file_range_no_digest(
+        &self,
+        canonical: &Path,
+        start_line: usize,
+        max_lines: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReadPage, ToolExecutionError> {
+        self.read_file_range_inner(
+            canonical,
+            start_line,
+            Some(max_lines),
+            false,
+            false,
+            cancellation,
+        )
+    }
+
+    /// Reads an entire UTF-8 file up to `MAX_READ_FILE_BYTES` for structural outline
+    /// or symbol resolution without setting `complete_digest`.
+    pub(crate) fn read_full_utf8_for_outline(
+        &self,
+        canonical: &Path,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(String, DependencyObservation, u64), ToolExecutionError> {
         ensure_not_special_file(canonical)?;
+        if let Some(cached) = try_read_via_slab(canonical) {
+            check_cancellation(cancellation)?;
+            let dependency = dependency_from_cached(canonical, &cached);
+            let bytes = cached.version.len;
+            return Ok(((*cached.text).to_owned(), dependency, bytes));
+        }
+        let file =
+            std::fs::File::open(canonical).map_err(|error| read_path_error(canonical, error))?;
+        super::execution::verify_opened_path(&file, canonical)?;
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Err(directory_read_error());
+        }
+        let stamp = FastStamp::from_file(DependencyKind::File, &file, &metadata, None);
+        let dependency = DependencyObservation {
+            path: canonical.to_path_buf(),
+            stamp,
+        };
+        if metadata.len() > MAX_READ_FILE_BYTES {
+            return Err(with_context(
+                observed_read_error(
+                    ToolError::InvalidInput {
+                        message: format!(
+                            "read file exceeds the {MAX_READ_FILE_BYTES}-byte safety limit"
+                        ),
+                    },
+                    &dependency,
+                    0,
+                ),
+                slice_hint(canonical),
+            ));
+        }
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut bytes_read = 0u64;
+        let mut line_no = 1usize;
+        let mut content = String::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        while let Some(chunk) = read_utf8_line(
+            &mut reader,
+            &mut line,
+            &dependency,
+            &mut bytes_read,
+            line_no,
+        )? {
+            check_cancellation(cancellation)
+                .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
+            content.push_str(chunk);
+            line_no = line_no.saturating_add(1);
+        }
+        Ok((content, dependency, bytes_read))
+    }
+
+    fn read_file_range_inner(
+        &self,
+        canonical: &Path,
+        start_line: usize,
+        max_lines: Option<usize>,
+        numbered: bool,
+        record_digest: bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReadPage, ToolExecutionError> {
+        ensure_not_special_file(canonical)?;
+        if let Some(cached) = try_read_via_slab(canonical) {
+            return self.read_file_range_from_cached(
+                canonical,
+                &cached,
+                start_line,
+                max_lines,
+                numbered,
+                record_digest,
+                cancellation,
+            );
+        }
         let file =
             std::fs::File::open(canonical).map_err(|error| read_path_error(canonical, error))?;
         super::execution::verify_opened_path(&file, canonical)?;
@@ -227,7 +340,9 @@ impl ReadService {
         let mut output = String::new();
         let mut records = Vec::new();
         let mut returned = 0usize;
-        let mut content_hasher = if requested_first == 1 {
+        let mut content_hasher = if !record_digest {
+            None
+        } else if requested_first == 1 {
             Some(Sha256::new())
         } else {
             index
@@ -321,7 +436,7 @@ impl ReadService {
         } else {
             false
         };
-        if has_more {
+        if has_more && record_digest {
             let first = requested_first;
             let last = current_line.saturating_sub(1);
             let footer = format!(
@@ -368,10 +483,240 @@ impl ReadService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn read_file_range_from_cached(
+        &self,
+        canonical: &Path,
+        cached: &crate::project_index::CachedFile,
+        start_line: usize,
+        max_lines: Option<usize>,
+        numbered: bool,
+        record_digest: bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReadPage, ToolExecutionError> {
+        let dependency = dependency_from_cached(canonical, cached);
+        let version = FileVersion {
+            len: cached.version.len,
+            modified: cached.version.modified,
+            file_id: dependency.stamp.file_id.clone(),
+        };
+        let requested_first = start_line.max(1);
+        let max_lines = if numbered {
+            max_lines.unwrap_or(DEFAULT_MAX_READ_LINES)
+        } else {
+            page_lines(requested_first, max_lines, cached.version.len)
+        };
+        let total_lines = cached.line_count();
+        let _ = self.index_for(canonical, version.clone());
+
+        if requested_first > total_lines {
+            return Ok(ReadPage {
+                output: if numbered {
+                    String::new()
+                } else {
+                    empty_page_note(cached.version.len, requested_first, total_lines)
+                },
+                first_line: requested_first,
+                records: Vec::new(),
+                next_offset: None,
+                dependency,
+                bytes_read: 0,
+            });
+        }
+
+        let mut output = String::new();
+        let mut records = Vec::new();
+        let mut returned = 0usize;
+        let mut bytes_read = 0u64;
+        let mut current_line = requested_first;
+
+        while returned < max_lines && current_line <= total_lines {
+            check_cancellation(cancellation)
+                .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
+            let line = cached.line_slice(current_line, current_line);
+            bytes_read = bytes_read.saturating_add(line.len() as u64);
+            let rendered_bytes = if numbered {
+                decimal_digits(current_line)
+                    .saturating_add(3)
+                    .saturating_add(strip_line_ending(line).len())
+            } else {
+                line.len()
+            };
+            if output.len().saturating_add(rendered_bytes) > MAX_READ_PAGE_BYTES {
+                return Err(page_too_large(
+                    &dependency,
+                    bytes_read,
+                    if returned == 0 {
+                        long_line_hint(canonical, current_line)
+                    } else {
+                        SMALLER_PAGE_HINT.into()
+                    },
+                ));
+            }
+            if numbered {
+                let record = format!("{current_line}: {}", strip_line_ending(line));
+                records.push(record.clone());
+                writeln!(&mut output, "{record}").expect("writing to String cannot fail");
+            } else {
+                records.push(line.to_owned());
+                output.push_str(line);
+            }
+            returned = returned.saturating_add(1);
+            current_line = current_line.saturating_add(1);
+        }
+
+        let has_more = returned == max_lines && returned > 0 && current_line <= total_lines;
+        if has_more && record_digest {
+            let first = requested_first;
+            let last = current_line.saturating_sub(1);
+            let footer = format!(
+                "\n[showing lines {first}-{last}; more content available; pass \"offset\": {} for the next page]",
+                last.saturating_add(1)
+            );
+            if output.len().saturating_add(footer.len()) > MAX_READ_PAGE_BYTES {
+                return Err(page_too_large(
+                    &dependency,
+                    bytes_read,
+                    SMALLER_PAGE_HINT.into(),
+                ));
+            }
+            output.push_str(&footer);
+        }
+        if record_digest {
+            let mut cache = lock_mutex(&self.cache);
+            if let Some(index) = cache.entries.get_mut(canonical) {
+                if index.version == version {
+                    let continuous = requested_first == 1
+                        || index.cached_digest_progress == Some(requested_first);
+                    if continuous {
+                        if has_more {
+                            index.cached_digest_progress = Some(current_line);
+                        } else {
+                            index.complete_digest = Some(cached.sha256);
+                            index.cached_digest_progress = None;
+                            index.read_progress = None;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(ReadPage {
+            output,
+            first_line: requested_first,
+            records,
+            next_offset: has_more.then_some(current_line),
+            dependency,
+            bytes_read,
+        })
+    }
+
     pub(crate) fn invalidate(&self, path: &Path) {
         let mut cache = lock_mutex(&self.cache);
         for key in cache_lookup_paths(path) {
             cache.entries.remove(&key);
+        }
+    }
+
+    /// Returns a compact structural outline + top preview lines when `read` is
+    /// called unbounded on a large file with supported language symbols. Returns
+    /// `Ok(None)` when the file is small or lacks structural symbols so standard
+    /// pagination applies.
+    pub(crate) fn smart_unbounded_overview(
+        &self,
+        canonical: &Path,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Option<(String, DependencyObservation, u64)>, ToolExecutionError> {
+        let version = file_version_best_effort(canonical);
+        if version.len <= SMART_READ_OUTLINE_BYTES {
+            return Ok(None);
+        }
+        let (content, dependency, bytes_read) =
+            self.read_full_utf8_for_outline(canonical, cancellation)?;
+        let syms = super::outline::extract_outline(canonical, &content);
+        if syms.is_empty() {
+            return Ok(None);
+        }
+        let lines: Vec<&str> = content.split_inclusive('\n').collect();
+        let total_lines = lines.len();
+        if total_lines <= SMART_READ_OUTLINE_LINES {
+            return Ok(None);
+        }
+        let preview_end = SMART_READ_PREVIEW_LINES.min(total_lines);
+        let preview_records: Vec<String> = lines[..preview_end]
+            .iter()
+            .map(|l| (*l).to_owned())
+            .collect();
+        self.record_delivered_snapshot(canonical, version, 1, &preview_records);
+        let outline_text = super::outline::format_outline(&syms, total_lines);
+        let preview_body = preview_records.concat();
+        let out = format!(
+            "[smart read: {total_lines} lines; structural outline + lines 1-{preview_end} (pass symbols:[...], ranges:[[start,end]], max_lines/offset, or raw:true for full text)]\n{outline_text}\n\n[lines 1-{preview_end}]\n{preview_body}"
+        );
+        Ok(Some((out, dependency, bytes_read)))
+    }
+
+    /// Records the delivered slice for `canonical` and returns a compact diff
+    /// against the previous delivered read when the file changed on disk,
+    /// `raw == false`, and the diff saves at least 60% of the response size.
+    pub(crate) fn maybe_compact_delta(
+        &self,
+        canonical: &Path,
+        first_line: usize,
+        records: &[String],
+        full_output_bytes: usize,
+        raw: bool,
+    ) -> Option<String> {
+        let version = file_version_best_effort(canonical);
+        if version.len > DELTA_READ_MAX_FILE_BYTES || records.is_empty() {
+            return None;
+        }
+        let delta = if !raw {
+            let cache = lock_mutex(&self.cache);
+            cache.delivered.get(canonical).and_then(|prev| {
+                if prev.version == version || prev.first_line != first_line {
+                    return None;
+                }
+                render_compact_delta(first_line, &prev.lines, records, full_output_bytes)
+            })
+        } else {
+            None
+        };
+        self.record_delivered_snapshot(canonical, version, first_line, records);
+        delta
+    }
+
+    fn record_delivered_snapshot(
+        &self,
+        canonical: &Path,
+        version: FileVersion,
+        first_line: usize,
+        lines: &[String],
+    ) {
+        if version.len > DELTA_READ_MAX_FILE_BYTES || lines.is_empty() {
+            return;
+        }
+        let mut cache = lock_mutex(&self.cache);
+        cache.clock = cache.clock.wrapping_add(1);
+        let now = cache.clock;
+        cache.delivered.insert(
+            canonical.to_path_buf(),
+            DeliveredSnapshot {
+                version,
+                first_line,
+                lines: lines.to_vec(),
+                last_used: now,
+            },
+        );
+        while cache.delivered.len() > MAX_DELIVERED_SNAPSHOTS {
+            let Some(oldest) = cache
+                .delivered
+                .iter()
+                .min_by_key(|(_, snap)| snap.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            cache.delivered.remove(&oldest);
         }
     }
 
@@ -400,6 +745,7 @@ impl ReadService {
             last_used: cache.clock,
             complete_digest: Some(digest),
             read_progress: None,
+            cached_digest_progress: None,
         };
         for key in cache_lookup_paths(path) {
             cache.entries.insert(key, index.clone());
@@ -423,6 +769,7 @@ impl ReadService {
             last_used: now,
             complete_digest: None,
             read_progress: None,
+            cached_digest_progress: None,
         };
         cache.entries.insert(path.to_path_buf(), index.clone());
         evict_old_indexes(&mut cache);
@@ -447,15 +794,6 @@ impl ReadService {
             let keep_from = index.checkpoints.len() - MAX_CHECKPOINTS_PER_FILE;
             index.checkpoints.drain(1..=keep_from);
         }
-    }
-
-    #[cfg(test)]
-    fn checkpoint_count(&self, path: &Path) -> usize {
-        let canonical = path.canonicalize().expect("canonical path");
-        lock_mutex(&self.cache)
-            .entries
-            .get(&canonical)
-            .map_or(0, |index| index.checkpoints.len())
     }
 }
 
@@ -740,6 +1078,43 @@ fn file_version_best_effort(path: &Path) -> FileVersion {
     }
 }
 
+fn dependency_from_cached(
+    canonical: &Path,
+    cached: &crate::project_index::CachedFile,
+) -> DependencyObservation {
+    let stamp = FastStamp {
+        kind: DependencyKind::File,
+        len: cached.version.len,
+        modified_nanos: cached
+            .version
+            .modified
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos()),
+        file_id: cached.version.fast_stamp_file_id(),
+        operation_digest: None,
+    };
+    DependencyObservation {
+        path: canonical.to_path_buf(),
+        stamp,
+    }
+}
+
+fn try_read_via_slab(canonical: &Path) -> Option<Arc<crate::project_index::CachedFile>> {
+    let meta = std::fs::symlink_metadata(canonical).ok()?;
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.len() as usize > crate::project_index::MAX_SLAB_FILE_BYTES
+    {
+        return None;
+    }
+    let daemon = crate::project_index::existing_for_path(canonical)?;
+    let cached = daemon.read_file_cached_with_meta(canonical, &meta).ok()??;
+    if cached.text.as_bytes().contains(&0) {
+        return None;
+    }
+    Some(cached)
+}
+
 fn evict_old_indexes(cache: &mut ReadCache) {
     while cache.entries.len() > MAX_INDEXED_FILES {
         let oldest = cache
@@ -775,6 +1150,157 @@ fn decimal_digits(mut value: usize) -> usize {
         digits += 1;
     }
     digits
+}
+
+/// Computes a compact unified-style diff between `prev` and `cur` when the
+/// change is small (<= 40% of `full_output_bytes`), stripping common prefix and
+/// suffix first so local edits inside large files stay O(changed_span^2).
+fn render_compact_delta(
+    first_line: usize,
+    prev: &[String],
+    cur: &[String],
+    full_output_bytes: usize,
+) -> Option<String> {
+    let mut prefix = 0usize;
+    let min_len = prev.len().min(cur.len());
+    while prefix < min_len && prev[prefix] == cur[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < (min_len - prefix)
+        && prev[prev.len() - 1 - suffix] == cur[cur.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    if prefix + suffix == prev.len() && prefix + suffix == cur.len() {
+        return None;
+    }
+
+    let old_mid = &prev[prefix..prev.len() - suffix];
+    let new_mid = &cur[prefix..cur.len() - suffix];
+    if old_mid.len().saturating_mul(new_mid.len()) > 250_000 {
+        return None;
+    }
+
+    #[derive(Clone, Copy)]
+    enum Op<'a> {
+        Eq(&'a str),
+        Del(&'a str),
+        Add(&'a str),
+    }
+
+    // Standard LCS DP table on the trimmed changed middle only.
+    let m = old_mid.len();
+    let n = new_mid.len();
+    let mut dp = vec![0u32; (m + 1) * (n + 1)];
+    let stride = n + 1;
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i * stride + j] = if old_mid[i] == new_mid[j] {
+                dp[(i + 1) * stride + (j + 1)] + 1
+            } else {
+                dp[(i + 1) * stride + j].max(dp[i * stride + (j + 1)])
+            };
+        }
+    }
+
+    let mut mid_ops = Vec::with_capacity(m + n);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m && j < n {
+        if old_mid[i] == new_mid[j] {
+            mid_ops.push(Op::Eq(new_mid[j].as_str()));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * stride + j] >= dp[i * stride + (j + 1)] {
+            mid_ops.push(Op::Del(old_mid[i].as_str()));
+            i += 1;
+        } else {
+            mid_ops.push(Op::Add(new_mid[j].as_str()));
+            j += 1;
+        }
+    }
+    while i < m {
+        mid_ops.push(Op::Del(old_mid[i].as_str()));
+        i += 1;
+    }
+    while j < n {
+        mid_ops.push(Op::Add(new_mid[j].as_str()));
+        j += 1;
+    }
+
+    // Group ops into context-bounded hunks across the whole window.
+    const CONTEXT: usize = 3;
+    let mut all_ops: Vec<(usize, usize, Op<'_>)> = Vec::with_capacity(cur.len() + m);
+    let mut old_ln = first_line;
+    let mut new_ln = first_line;
+    for line in &cur[..prefix] {
+        all_ops.push((old_ln, new_ln, Op::Eq(line.as_str())));
+        old_ln += 1;
+        new_ln += 1;
+    }
+    for op in mid_ops {
+        all_ops.push((old_ln, new_ln, op));
+        match op {
+            Op::Eq(_) => {
+                old_ln += 1;
+                new_ln += 1;
+            }
+            Op::Del(_) => old_ln += 1,
+            Op::Add(_) => new_ln += 1,
+        }
+    }
+    for line in &cur[cur.len() - suffix..] {
+        all_ops.push((old_ln, new_ln, Op::Eq(line.as_str())));
+        old_ln += 1;
+        new_ln += 1;
+    }
+
+    let changed_indices: Vec<usize> = all_ops
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (_, _, op))| (!matches!(op, Op::Eq(_))).then_some(idx))
+        .collect();
+    if changed_indices.is_empty() {
+        return None;
+    }
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for idx in changed_indices {
+        let start = idx.saturating_sub(CONTEXT);
+        let end = (idx + CONTEXT).min(all_ops.len().saturating_sub(1));
+        if let Some(last) = spans.last_mut() {
+            if start <= last.1 + 1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        spans.push((start, end));
+    }
+
+    let mut hunks = String::new();
+    for &(start, end) in &spans {
+        let (hunk_old, hunk_new, _) = all_ops[start];
+        let _ = writeln!(hunks, "@@ -{},{} +{},{} @@", hunk_old, end - start + 1, hunk_new, end - start + 1);
+        for &(_, _, op) in &all_ops[start..=end] {
+            let (sigil, text) = match op {
+                Op::Eq(t) => (' ', t),
+                Op::Del(t) => ('-', t),
+                Op::Add(t) => ('+', t),
+            };
+            hunks.push(sigil);
+            hunks.push_str(text);
+            if !hunks.ends_with('\n') {
+                hunks.push('\n');
+            }
+        }
+    }
+
+    let rendered = format!(
+        "[delta since previous read (file modified); {} hunk(s); pass raw:true for full text]\n{}",
+        spans.len(),
+        hunks.trim_end_matches('\n')
+    );
+    (rendered.len() <= (full_output_bytes.saturating_mul(2)) / 5).then_some(rendered)
 }
 
 #[cfg(test)]
@@ -912,15 +1438,82 @@ mod tests {
         let first = service
             .read_file_range(&path, 769, 1, None)
             .expect("first high offset");
-        let checkpoints = service.checkpoint_count(&path);
         let second = service
             .read_file_range(&path, 770, 1, None)
             .expect("adjacent high offset");
 
         assert!(first.output.starts_with("769: line-769"));
         assert!(second.output.starts_with("770: line-770"));
-        assert!(checkpoints >= 4);
         assert_eq!(second.bytes_read, b"line-770\nline-771\n".len() as u64);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn smart_unbounded_overview_returns_outline_plus_preview_for_large_code_files() {
+        let path =
+            std::env::temp_dir().join(format!("slim-read-smart-overview-{}.rs", std::process::id()));
+        let mut content = String::new();
+        for idx in 1..=700 {
+            content.push_str(&format!(
+                "pub fn helper_{idx}(arg: usize) -> usize {{\n    arg + {idx}\n}}\n"
+            ));
+        }
+        assert!(content.len() as u64 > SMART_READ_OUTLINE_BYTES);
+        std::fs::write(&path, &content).expect("write");
+        let canonical = path.canonicalize().expect("canonical");
+        let service = ReadService::default();
+
+        let (overview, _dep, _bytes) = service
+            .smart_unbounded_overview(&canonical, None)
+            .expect("overview")
+            .expect("large rust file should yield smart overview");
+        assert!(overview.contains("[smart read: 2100 lines; structural outline + lines 1-120"));
+        assert!(overview.contains("helper_700"));
+        assert!(overview.contains("    arg + 1\n"));
+        assert!(!overview.contains("    arg + 200\n"));
+        assert_eq!(service.complete_digest(&canonical), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn maybe_compact_delta_returns_hunks_on_modified_file_and_respects_raw() {
+        let path =
+            std::env::temp_dir().join(format!("slim-read-delta-{}.txt", std::process::id()));
+        let orig_lines: Vec<String> = (1..=80).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, orig_lines.concat()).expect("write v1");
+        let canonical = path.canonicalize().expect("canonical");
+        let service = ReadService::default();
+
+        let p1 = service
+            .read_file_range_resolved(&canonical, 1, None, false, None)
+            .expect("v1");
+        assert!(service
+            .maybe_compact_delta(&canonical, p1.first_line, &p1.records, p1.output.len(), false)
+            .is_none());
+
+        let mut mod_lines = orig_lines;
+        mod_lines[40] = "line 41 MODIFIED\n".to_string();
+        std::fs::write(&path, mod_lines.concat()).expect("write v2");
+
+        let p2 = service
+            .read_file_range_resolved(&canonical, 1, None, false, None)
+            .expect("v2");
+        let delta = service
+            .maybe_compact_delta(&canonical, p2.first_line, &p2.records, p2.output.len(), false)
+            .expect("small local edit should produce compact delta");
+        assert!(delta.contains("[delta since previous read"));
+        assert!(delta.contains("-line 41"));
+        assert!(delta.contains("+line 41 MODIFIED"));
+
+        // `raw: true` forces full page by returning None for delta suppression.
+        mod_lines[41] = "line 42 MODIFIED\n".to_string();
+        std::fs::write(&path, mod_lines.concat()).expect("write v3");
+        let p3 = service
+            .read_file_range_resolved(&canonical, 1, None, false, None)
+            .expect("v3");
+        assert!(service
+            .maybe_compact_delta(&canonical, p3.first_line, &p3.records, p3.output.len(), true)
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 }

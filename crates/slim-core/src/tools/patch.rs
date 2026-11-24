@@ -1,12 +1,15 @@
 use crate::runtime::CancellationToken;
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::write::{
     ensure_mutation_size, lock_mutations, patch_file_recovery_context, read_existing_file_observed,
-    replace_observed_file, resolved_public_path, CURRENT_FILE_RECOVERY_BYTES, UTF8_BOM,
+    replace_observed_file, resolved_public_path, ObservedText, CURRENT_FILE_RECOVERY_BYTES,
+    UTF8_BOM,
 };
-use super::{digest_bytes, DependencyObservation, FastStamp, ToolError, ToolExecutionError};
+use super::{
+    path_identity, digest_bytes, DependencyObservation, FastStamp, ToolError, ToolExecutionError,
+};
 
 pub(super) const MAX_PATCH_EDITS: usize = 64;
 
@@ -95,7 +98,7 @@ pub fn apply_exact_patch(
     apply_exact_patches_with_content(
         &path,
         &path,
-        &[(expected.to_owned(), replacement.to_owned())],
+        &[(expected.to_owned(), replacement.to_owned(), false)],
         None,
         &mut || {},
     )
@@ -113,39 +116,318 @@ pub(crate) struct PatchContent {
     /// SHA-256 of `text`, the bytes now on disk.
     pub(crate) written_digest: [u8; 32],
     pub(crate) text: String,
+    pub(crate) original_content: Option<String>,
     pub(crate) edits: Option<Vec<crate::codeintel::CodeIntelTextEdit>>,
     /// Display-only line view of the applied edits, in final-file positions.
     pub(crate) hunks: Vec<crate::ToolEditHunk>,
     pub(crate) hunks_truncated: bool,
+    /// Some edits of a single-file batch were rejected; the others are on disk.
+    pub(crate) partial: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToleranceKind {
+    Exact,
+    LineNumberPrefixes,
+    Indentation,
+}
+
+pub(crate) struct MultiFilePatchOutcome {
+    pub(crate) path: PathBuf,
+    pub(crate) content: PatchContent,
+}
+
+struct StagedFilePatch {
+    path: PathBuf,
+    observed: ObservedText,
+    updated: String,
+    before_digest: String,
+    summary: String,
+    resolved_edits: Option<Vec<crate::codeintel::CodeIntelTextEdit>>,
+    hunks: Vec<crate::ToolEditHunk>,
+    hunks_truncated: bool,
+    original_backup: Option<String>,
+}
+
+struct InMemoryEditsResult {
+    updated: String,
+    before_digest: String,
+    summary: String,
+    resolved_edits: Option<Vec<crate::codeintel::CodeIntelTextEdit>>,
+    hunks: Vec<crate::ToolEditHunk>,
+    hunks_truncated: bool,
+    /// The edits that did not match, when the others were kept.
+    rejected: Option<String>,
+}
+
+/// One patch edit: expected text, replacement, and whether every match of the
+/// expected text is replaced instead of exactly one.
+pub(crate) type Edit = (String, String, bool);
 
 pub(crate) fn apply_exact_patches_with_content(
     path: impl AsRef<Path>,
     // How messages name the file (workspace-relative for the model).
     display: &Path,
-    edits: &[(String, String)],
+    edits: &[Edit],
+    cancellation: Option<&CancellationToken>,
+    on_lock_wait: &mut impl FnMut(),
+) -> Result<PatchContent, ToolExecutionError> {
+    apply_exact_patches_with_content_and_original(
+        path,
+        display,
+        edits,
+        false,
+        cancellation,
+        on_lock_wait,
+    )
+}
+
+pub(crate) fn apply_exact_patches_with_content_and_original(
+    path: impl AsRef<Path>,
+    display: &Path,
+    edits: &[Edit],
+    capture_original: bool,
     cancellation: Option<&CancellationToken>,
     on_lock_wait: &mut impl FnMut(),
 ) -> Result<PatchContent, ToolExecutionError> {
     let path = path.as_ref();
     let slot = super::write::mutation_lock_slot(path);
     let _mutation_guard = lock_mutations(&slot, cancellation)?;
-    let observed =
-        read_existing_file_observed(path, cancellation, on_lock_wait).map_err(|failure| {
-            if path.exists() {
-                return failure;
+    let observed = read_patch_observed(path, None, cancellation, on_lock_wait)?;
+    let original_backup = capture_original.then(|| observed.content.clone());
+    let applied = apply_edits_in_memory(display, &observed, edits, true)?;
+    finalize_patch_write(path, observed, applied, original_backup, cancellation)
+}
+
+pub(crate) fn apply_atomic_multi_file_patches(
+    targets: &[(PathBuf, PathBuf, Vec<Edit>)],
+    capture_originals: bool,
+    cancellation: Option<&CancellationToken>,
+    on_lock_wait: &mut impl FnMut(),
+) -> Result<Vec<MultiFilePatchOutcome>, ToolExecutionError> {
+    if targets.is_empty() {
+        return Err(ToolError::InvalidInput {
+            message: "patch requires at least one target file".into(),
+        }
+        .into());
+    }
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.sort_by_key(|&idx| path_identity(&targets[idx].0));
+    let slots = order
+        .iter()
+        .map(|&idx| super::write::mutation_lock_slot(&targets[idx].0))
+        .collect::<Vec<_>>();
+    let mut _guards = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        _guards.push(lock_mutations(slot, cancellation)?);
+    }
+
+    // Acquire OS file locks in canonical path order to stay deadlock-free.
+    let mut observed_by_idx: Vec<Option<ObservedText>> = (0..targets.len()).map(|_| None).collect();
+    for &idx in &order {
+        let (path, display, _) = &targets[idx];
+        let observed = read_patch_observed(path, Some(display), cancellation, on_lock_wait)?;
+        observed_by_idx[idx] = Some(observed);
+    }
+
+    // Apply all edits purely in memory before touching disk.
+    let mut staged = Vec::with_capacity(targets.len());
+    for (idx, (path, display, edits)) in targets.iter().enumerate() {
+        let observed = observed_by_idx[idx].take().expect("observed present");
+        let original_backup = Some(observed.content.clone());
+        let applied = apply_edits_in_memory(display, &observed, edits, false)?;
+        staged.push(StagedFilePatch {
+            path: path.clone(),
+            observed,
+            updated: applied.updated,
+            before_digest: applied.before_digest,
+            summary: applied.summary,
+            resolved_edits: applied.resolved_edits,
+            hunks: applied.hunks,
+            hunks_truncated: applied.hunks_truncated,
+            original_backup,
+        });
+    }
+
+    // All files validated in memory. Commit to disk, tracking backups in case a publish fails mid-way.
+    let mut committed: Vec<(PathBuf, String)> = Vec::with_capacity(staged.len());
+    let mut outcomes = Vec::with_capacity(staged.len());
+    for item in staged {
+        let StagedFilePatch {
+            path,
+            observed,
+            updated,
+            before_digest,
+            summary,
+            resolved_edits,
+            hunks,
+            hunks_truncated,
+            original_backup,
+        } = item;
+        let orig_for_publish_rollback = original_backup.clone().expect("backup recorded");
+        let applied = InMemoryEditsResult {
+            updated,
+            before_digest,
+            summary,
+            resolved_edits,
+            hunks,
+            hunks_truncated,
+            rejected: None,
+        };
+        match finalize_patch_write(
+            &path,
+            observed,
+            applied,
+            capture_originals.then(|| orig_for_publish_rollback.clone()),
+            cancellation,
+        ) {
+            Ok(content) => {
+                committed.push((path.clone(), orig_for_publish_rollback));
+                outcomes.push(MultiFilePatchOutcome { path, content });
             }
-            ToolError::InvalidInput {
-                message: "file does not exist; patch edits existing files. To create it, use write with expected omitted.".into(),
+            Err(mut failure) => {
+                for (prev_path, prev_original) in committed.into_iter().rev() {
+                    if restore_file_under_lock(&prev_path, &prev_original).is_err() {
+                        failure.effects_uncertain = true;
+                    }
+                }
+                return Err(failure);
             }
-            .into()
-        })?;
+        }
+    }
+    Ok(outcomes)
+}
+
+pub(crate) fn restore_patched_files_atomic(
+    snapshots: &[(PathBuf, String)],
+) -> Result<(), String> {
+    let mut order: Vec<usize> = (0..snapshots.len()).collect();
+    order.sort_by_key(|&idx| path_identity(&snapshots[idx].0));
+    let slots = order
+        .iter()
+        .map(|&idx| super::write::mutation_lock_slot(&snapshots[idx].0))
+        .collect::<Vec<_>>();
+    let mut _guards = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        _guards.push(
+            lock_mutations(slot, None)
+                .map_err(|err| format!("rollback lock failed: {}", super::tool_error_message(err)))?,
+        );
+    }
+    for &idx in &order {
+        let (path, original) = &snapshots[idx];
+        restore_file_under_lock(path, original)?;
+    }
+    Ok(())
+}
+
+fn restore_file_under_lock(path: &Path, original: &str) -> Result<(), String> {
+    let observed = read_existing_file_observed(path, None, &mut || {})
+        .map_err(|err| format!("{}: {}", path.display(), super::tool_error_message(err.error)))?;
+    if observed.content == original {
+        return Ok(());
+    }
+    replace_observed_file(path, observed, original, None)
+        .map(|_| ())
+        .map_err(|err| format!("{}: {}", path.display(), super::tool_error_message(err.error)))
+}
+
+fn read_patch_observed(
+    path: &Path,
+    display_on_missing: Option<&Path>,
+    cancellation: Option<&CancellationToken>,
+    on_lock_wait: &mut impl FnMut(),
+) -> Result<ObservedText, ToolExecutionError> {
+    read_existing_file_observed(path, cancellation, on_lock_wait).map_err(|failure| {
+        if path.exists() {
+            return failure;
+        }
+        let message = match display_on_missing {
+            Some(display) => format!(
+                "{}: file does not exist; patch edits existing files. To create it, use write with expected omitted.",
+                display.display()
+            ),
+            None => "file does not exist; patch edits existing files. To create it, use write with expected omitted.".into(),
+        };
+        ToolError::InvalidInput { message }.into()
+    })
+}
+
+fn finalize_patch_write(
+    path: &Path,
+    observed: ObservedText,
+    applied: InMemoryEditsResult,
+    original_content: Option<String>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PatchContent, ToolExecutionError> {
+    let InMemoryEditsResult {
+        updated,
+        before_digest,
+        mut summary,
+        resolved_edits,
+        hunks,
+        hunks_truncated,
+        rejected,
+    } = applied;
+    let mut written = replace_observed_file(path, observed, &updated, cancellation)?;
+    // The receipt already hashed the final content: reuse it for the summary.
+    summary = format!(
+        "{summary}; bytes={}; sha256={}; do not re-read",
+        updated.len(),
+        written.written_sha256_12
+    );
+    if let Some(note) = &written.recovery_note {
+        summary.push_str("; ");
+        summary.push_str(note);
+    }
+    if let Some(diagnostic) = &written.syntax_diagnostic {
+        summary.push('\n');
+        summary.push_str(diagnostic);
+    }
+    if let Some(rejected) = &rejected {
+        summary.push('\n');
+        summary.push_str(rejected);
+    }
+    let dependency = written
+        .dependency
+        .take()
+        .expect("an observed replacement always has a dependency");
+    Ok(PatchContent {
+        displaced_version_preserved: written.recovery_note.is_some(),
+        summary,
+        before_digest,
+        dependency,
+        stamp: written.after,
+        bytes_read: written.bytes_read,
+        written_digest: written.written_digest,
+        text: updated,
+        original_content,
+        edits: resolved_edits,
+        hunks,
+        hunks_truncated,
+        partial: rejected.is_some(),
+    })
+}
+
+/// `partial` keeps the edits of a batch that matched and reports the others;
+/// without it one rejected edit rejects the batch.
+fn apply_edits_in_memory(
+    display: &Path,
+    observed: &ObservedText,
+    edits: &[Edit],
+    partial: bool,
+) -> Result<InMemoryEditsResult, ToolExecutionError> {
+    // Edit number, match count and recovery text of each rejected edit.
+    let mut rejected: Vec<(usize, usize, String)> = Vec::new();
     let mut updated = observed.content.clone();
+    let before_digest = digest_bytes(b"slim-written-content-v1", observed.content.as_bytes());
     let mut summary = String::new();
     let mut resolved_edits = Some(Vec::with_capacity(edits.len()));
     let mut sync_bytes = 0usize;
     let mut diff = EditDiffBuilder::default();
-    for (edit_index, (expected, replacement)) in edits.iter().enumerate() {
+    let mut used_prefix_strip = false;
+    let mut used_indent_norm = false;
+    for (edit_index, (expected, replacement, replace_all)) in edits.iter().enumerate() {
         let mut expected = Cow::Borrowed(expected.as_str());
         let mut replacement = Cow::Borrowed(replacement.as_str());
         let mut found = first_two_matches(&updated, expected.as_ref());
@@ -166,7 +448,57 @@ pub(crate) fn apply_exact_patches_with_content(
             replacement = Cow::Owned(super::write::with_crlf_line_endings(&replacement));
             normalized_crlf = true;
         }
-        if found.seen != 1 {
+
+        let mut tolerance = ToleranceKind::Exact;
+        let mut match_range: Option<std::ops::Range<usize>> =
+            (found.seen == 1).then(|| {
+                let offset = found.first.expect("one match was counted");
+                offset..offset + expected.len()
+            });
+
+        // Stage A: Deterministic strip of copied `N: ` / `N- ` / `N| ` / `N\t` prefixes
+        // when stripping yields an exact unique match in the file.
+        if found.seen == 0 {
+            if let Some(stripped_expected) = strip_line_number_prefixes(expected.as_ref()) {
+                let stripped_matches = first_two_matches(&updated, &stripped_expected);
+                if stripped_matches.seen == 1 {
+                    let offset = stripped_matches.first.expect("unique stripped match");
+                    if let Some(stripped_rep) = strip_line_number_prefixes(replacement.as_ref()) {
+                        replacement = Cow::Owned(stripped_rep);
+                    }
+                    if contains_bare_lf(&replacement) && has_only_crlf_newlines(&updated) {
+                        replacement = Cow::Owned(super::write::with_crlf_line_endings(&replacement));
+                        normalized_crlf = true;
+                    }
+                    expected = Cow::Owned(stripped_expected);
+                    found = stripped_matches;
+                    match_range = Some(offset..offset + expected.len());
+                    tolerance = ToleranceKind::LineNumberPrefixes;
+                    used_prefix_strip = true;
+                }
+            }
+        }
+
+        // Stage B: Strictly unique whole-line indentation / trailing-whitespace fallback
+        // (internal whitespace must still match byte-for-byte).
+        if found.seen == 0 {
+            if let Some((span, reindented_replacement)) =
+                find_unique_trimmed_line_match(&updated, expected.as_ref(), replacement.as_ref())
+            {
+                found = Matches {
+                    seen: 1,
+                    first: Some(span.start),
+                };
+                match_range = Some(span);
+                replacement = Cow::Owned(reindented_replacement);
+                tolerance = ToleranceKind::Indentation;
+                used_indent_norm = true;
+            }
+        }
+
+        // `replace_all` takes every exact match; a unique match needs no flag.
+        let replace_every = *replace_all && found.seen >= 2;
+        if found.seen != 1 && !replace_every {
             // Only the failure path pays for the full count.
             let count = updated.matches(expected.as_ref()).count();
             let context = if count == 0 {
@@ -241,6 +573,10 @@ pub(crate) fn apply_exact_patches_with_content(
             } else {
                 context
             };
+            if partial && edits.len() > 1 {
+                rejected.push((edit_index + 1, count, context));
+                continue;
+            }
             let mut failure = ToolExecutionError::observed(
                 ToolError::MatchCount { count },
                 vec![observed.dependency.clone()],
@@ -266,56 +602,110 @@ pub(crate) fn apply_exact_patches_with_content(
             });
             return Err(failure);
         }
-        let updated_len = updated
-            .len()
-            .saturating_sub(expected.len())
-            .saturating_add(replacement.len());
-        ensure_mutation_size(updated_len).map_err(|error| {
-            ToolExecutionError::observed(
-                error,
-                vec![observed.dependency.clone()],
-                observed.bytes_read,
-            )
-        })?;
-        let offset = found.first.expect("one match was counted");
-        let start_line = 1 + updated[..offset]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        summary = if expected == replacement {
-            format!(
-                "unchanged {}:{start_line}; expected equals replacement",
-                display.display()
-            )
+        // Back to front, so the offsets of the matches still to replace stay valid.
+        let ranges: Vec<std::ops::Range<usize>> = if replace_every {
+            let mut all: Vec<_> = updated
+                .match_indices(expected.as_ref())
+                .map(|(offset, matched)| offset..offset + matched.len())
+                .collect();
+            all.reverse();
+            all
         } else {
-            format!(
-                "patched {}:{start_line}; replaced {} bytes with {} bytes{}",
-                display.display(),
-                expected.len(),
-                replacement.len(),
-                if normalized_crlf {
-                    "; LF input normalized to CRLF"
-                } else {
-                    ""
-                }
-            )
+            vec![match_range.expect("one match was counted")]
         };
-        record_sync_edit(
-            &mut resolved_edits,
-            &mut sync_bytes,
-            &updated,
-            offset..offset + expected.len(),
-            &replacement,
-            (start_line - 1) as u32,
-        );
-        diff.record(
-            &updated,
-            offset..offset + expected.len(),
-            &replacement,
-            start_line,
-        );
-        updated.replace_range(offset..offset + expected.len(), replacement.as_ref());
+        let replaced = ranges.len();
+        for range in ranges {
+            let matched_len = range.end - range.start;
+            let updated_len = updated
+                .len()
+                .saturating_sub(matched_len)
+                .saturating_add(replacement.len());
+            ensure_mutation_size(updated_len).map_err(|error| {
+                ToolExecutionError::observed(
+                    error,
+                    vec![observed.dependency.clone()],
+                    observed.bytes_read,
+                )
+            })?;
+            let offset = range.start;
+            let start_line = 1 + updated[..offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            summary = if updated[range.clone()] == *replacement {
+                format!(
+                    "unchanged {}:{start_line}; expected equals replacement",
+                    display.display()
+                )
+            } else {
+                format!(
+                    "patched {}:{start_line}; replaced {} bytes with {} bytes{}{}",
+                    display.display(),
+                    matched_len,
+                    replacement.len(),
+                    if normalized_crlf {
+                        "; LF input normalized to CRLF"
+                    } else {
+                        ""
+                    },
+                    match tolerance {
+                        ToleranceKind::Exact => "",
+                        ToleranceKind::LineNumberPrefixes => "; line-number prefixes stripped",
+                        ToleranceKind::Indentation => "; indentation normalized",
+                    }
+                )
+            };
+            record_sync_edit(
+                &mut resolved_edits,
+                &mut sync_bytes,
+                &updated,
+                range.clone(),
+                &replacement,
+                (start_line - 1) as u32,
+            );
+            diff.record(
+                &updated,
+                range.clone(),
+                &replacement,
+                start_line,
+            );
+            updated.replace_range(range, replacement.as_ref());
+        }
+        if replace_every {
+            summary = format!(
+                "patched {}; replaced {replaced} matches of the expected text",
+                display.display()
+            );
+        }
     }
+    let rejected_note = match rejected.first() {
+        None => None,
+        Some(&(_, count, _)) => {
+            let detail = rejected
+                .iter()
+                .map(|(index, _, context)| {
+                    // The first edit is tried against the file on disk.
+                    let tried = if *index > 1 {
+                        " Line numbers below count the content as tried."
+                    } else {
+                        ""
+                    };
+                    format!("Edit {index} rejected.{tried}\n{context}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if rejected.len() == edits.len() {
+                let mut failure = ToolExecutionError::observed(
+                    ToolError::MatchCount { count },
+                    vec![observed.dependency.clone()],
+                    observed.bytes_read,
+                );
+                failure.context = Some(format!("No edits applied.\n{detail}"));
+                return Err(failure);
+            }
+            Some(detail)
+        }
+    };
     // An edit that spelled the BOM must not drop it from the file.
     if observed.content.starts_with(UTF8_BOM) && !updated.starts_with(UTF8_BOM) {
         updated.insert(0, UTF8_BOM);
@@ -324,43 +714,33 @@ pub(crate) fn apply_exact_patches_with_content(
     let (hunks, hunks_truncated) = diff.finish();
     if edits.len() > 1 {
         summary = format!(
-            "patched {}; {} edits applied atomically",
+            "patched {}; {}{}{}",
             display.display(),
-            edits.len()
+            if rejected.is_empty() {
+                format!("{} edits applied atomically", edits.len())
+            } else {
+                format!("{} of {} edits applied", edits.len() - rejected.len(), edits.len())
+            },
+            if used_prefix_strip {
+                "; line-number prefixes stripped"
+            } else {
+                ""
+            },
+            if used_indent_norm {
+                "; indentation normalized"
+            } else {
+                ""
+            }
         );
     }
-    let before_digest = digest_bytes(b"slim-written-content-v1", observed.content.as_bytes());
-    let mut written = replace_observed_file(path, observed, &updated, cancellation)?;
-    // The receipt already hashed the final content: reuse it for the summary.
-    summary = format!(
-        "{summary}; bytes={}; sha256={}; do not re-read",
-        updated.len(),
-        written.written_sha256_12
-    );
-    if let Some(note) = &written.recovery_note {
-        summary.push_str("; ");
-        summary.push_str(note);
-    }
-    if let Some(diagnostic) = &written.syntax_diagnostic {
-        summary.push('\n');
-        summary.push_str(diagnostic);
-    }
-    let dependency = written
-        .dependency
-        .take()
-        .expect("an observed replacement always has a dependency");
-    Ok(PatchContent {
-        displaced_version_preserved: written.recovery_note.is_some(),
-        summary,
+    Ok(InMemoryEditsResult {
+        updated,
         before_digest,
-        dependency,
-        stamp: written.after,
-        bytes_read: written.bytes_read,
-        written_digest: written.written_digest,
-        text: updated,
-        edits: resolved_edits,
+        summary,
+        resolved_edits,
         hunks,
         hunks_truncated,
+        rejected: rejected_note,
     })
 }
 
@@ -736,6 +1116,194 @@ fn search_prefix_hint(expected: &str) -> Option<String> {
     })
 }
 
+fn strip_line_number_prefixes(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut stripped_any = false;
+    for segment in text.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = segment.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = segment.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (segment, "")
+        };
+        if body.trim().is_empty() {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        }
+        let ws_len = body.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        let after_ws = &body[ws_len..];
+        let digits = after_ws.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let rest = &after_ws[digits..];
+        let content = if let Some(after_tab) = rest.strip_prefix('\t') {
+            after_tab
+        } else if let Some(sep) = rest.as_bytes().first().copied().filter(|b| matches!(b, b':' | b'|' | b'-')) {
+            let after_sep = &rest[1..];
+            let _ = sep;
+            after_sep.strip_prefix(' ').unwrap_or(after_sep)
+        } else {
+            return None;
+        };
+        stripped_any = true;
+        out.push_str(content);
+        out.push_str(ending);
+    }
+    stripped_any.then_some(out)
+}
+
+fn common_leading_whitespace<'a>(lines: &[&'a str]) -> &'a str {
+    let mut non_empty = lines.iter().copied().filter(|line| !line.trim().is_empty());
+    let Some(first) = non_empty.next() else {
+        return "";
+    };
+    let first_ws_len = first
+        .bytes()
+        .take_while(|byte| *byte == b' ' || *byte == b'\t')
+        .count();
+    let mut prefix = &first[..first_ws_len];
+    for line in non_empty {
+        let common_bytes = prefix
+            .bytes()
+            .zip(line.bytes())
+            .take_while(|(a, b)| a == b && (*a == b' ' || *a == b'\t'))
+            .count();
+        prefix = &prefix[..common_bytes];
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+fn reindent_replacement(
+    replacement: &str,
+    exp_indent: &str,
+    file_indent: &str,
+    crlf: bool,
+) -> String {
+    if replacement.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(replacement.len() + 32);
+    for segment in replacement.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = segment.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = segment.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (segment, "")
+        };
+        if body.trim().is_empty() {
+            out.push_str(body);
+        } else if let Some(rest) = body.strip_prefix(exp_indent) {
+            out.push_str(file_indent);
+            out.push_str(rest);
+        } else if exp_indent.is_empty() {
+            out.push_str(file_indent);
+            out.push_str(body);
+        } else {
+            out.push_str(body);
+        }
+        if !ending.is_empty() {
+            out.push_str(if crlf { "\r\n" } else { "\n" });
+        }
+    }
+    out
+}
+
+fn find_unique_trimmed_line_match(
+    updated: &str,
+    expected: &str,
+    replacement: &str,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let exp_has_trailing_nl = expected.ends_with('\n');
+    let exp_body = expected
+        .strip_suffix("\r\n")
+        .or_else(|| expected.strip_suffix('\n'))
+        .unwrap_or(expected);
+    if exp_body.is_empty() {
+        return None;
+    }
+    let exp_lines: Vec<&str> = exp_body
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if exp_lines.is_empty() || !exp_lines.iter().any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    let exp_trimmed: Vec<&str> = exp_lines.iter().map(|line| line.trim()).collect();
+
+    struct LineSpan<'a> {
+        body: &'a str,
+        trimmed: &'a str,
+        start: usize,
+        end_without_nl: usize,
+        end_with_nl: usize,
+    }
+
+    let mut file_lines = Vec::new();
+    let mut offset = 0usize;
+    for segment in updated.split_inclusive('\n') {
+        let len = segment.len();
+        let body = segment
+            .strip_suffix("\r\n")
+            .or_else(|| segment.strip_suffix('\n'))
+            .unwrap_or(segment);
+        file_lines.push(LineSpan {
+            body,
+            trimmed: body.trim(),
+            start: offset,
+            end_without_nl: offset + body.len(),
+            end_with_nl: offset + len,
+        });
+        offset += len;
+    }
+    if exp_lines.len() > file_lines.len() {
+        return None;
+    }
+
+    let mut unique_start: Option<usize> = None;
+    for start in 0..=file_lines.len() - exp_lines.len() {
+        if exp_has_trailing_nl {
+            let last = &file_lines[start + exp_lines.len() - 1];
+            if last.end_with_nl == last.end_without_nl {
+                continue;
+            }
+        }
+        let matches = file_lines[start..start + exp_lines.len()]
+            .iter()
+            .zip(&exp_trimmed)
+            .all(|(file_line, exp_trim)| file_line.trimmed == *exp_trim);
+        if matches {
+            if unique_start.is_some() {
+                return None;
+            }
+            unique_start = Some(start);
+        }
+    }
+
+    let start = unique_start?;
+    let matched_slice = &file_lines[start..start + exp_lines.len()];
+    let match_start = matched_slice[0].start;
+    let last = &matched_slice[matched_slice.len() - 1];
+    let match_end = if exp_has_trailing_nl {
+        last.end_with_nl
+    } else {
+        last.end_without_nl
+    };
+
+    let matched_bodies: Vec<&str> = matched_slice.iter().map(|line| line.body).collect();
+    let exp_indent = common_leading_whitespace(&exp_lines);
+    let file_indent = common_leading_whitespace(&matched_bodies);
+    let crlf = has_only_crlf_newlines(updated);
+    let reindented = reindent_replacement(replacement, exp_indent, file_indent, crlf);
+    Some((match_start..match_end, reindented))
+}
+
 fn contains_bare_lf(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes
@@ -772,7 +1340,7 @@ mod diff_tests {
         let path = path.canonicalize().expect("canonical");
         let edits = edits
             .iter()
-            .map(|(expected, replacement)| ((*expected).to_owned(), (*replacement).to_owned()))
+            .map(|(expected, replacement)| ((*expected).to_owned(), (*replacement).to_owned(), false))
             .collect::<Vec<_>>();
         let content = apply_exact_patches_with_content(
             &path,
@@ -871,5 +1439,184 @@ mod tuning_tests {
         assert!(!tuning_only_edit("x = 1.0.max(y)", "x = 1.0.min(y)"));
         assert!(!tuning_only_edit("a = 1", "a  = 1"));
         assert!(!tuning_only_edit("x - 0.5", "x + 0.5"));
+    }
+}
+
+#[cfg(test)]
+mod tolerant_and_atomic_tests {
+    use super::{
+        apply_atomic_multi_file_patches, apply_exact_patches_with_content,
+        strip_line_number_prefixes,
+    };
+    use crate::tools::ToolRegistry;
+    use crate::OperatingMode;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slim-patch-tol-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn stage_a_strips_read_and_search_line_prefixes() {
+        let stripped = strip_line_number_prefixes("10: fn a() {\n11-     let x = 1;\n12|\treturn x;\n13\t}").unwrap();
+        assert_eq!(stripped, "fn a() {\n    let x = 1;\n\treturn x;\n}");
+        assert!(strip_line_number_prefixes("10: ok\nplain line").is_none());
+
+        let dir = temp_dir("stage-a");
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn a() {\n    let x = 1;\n    return x;\n}\n").unwrap();
+        let outcome = apply_exact_patches_with_content(
+            &path,
+            Path::new("a.rs"),
+            &[(
+                "2:     let x = 1;\n3-     return x;".into(),
+                "    let x = 2;\n    return x;".into(),
+                false,
+            )],
+            None,
+            &mut || {},
+        )
+        .unwrap();
+        assert!(outcome.summary.contains("line-number prefixes stripped"), "{}", outcome.summary);
+        assert!(outcome.text.contains("let x = 2;"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replace_all_replaces_every_match_and_plain_edit_still_rejects_duplicates() {
+        let dir = temp_dir("replace-all");
+        let path = dir.join("r.rs");
+        std::fs::write(&path, "let a = old;\nlet b = old;\nlet c = old;\n").unwrap();
+        let plain = apply_exact_patches_with_content(
+            &path,
+            Path::new("r.rs"),
+            &[("old".into(), "new".into(), false)],
+            None,
+            &mut || {},
+        );
+        assert!(plain.is_err(), "a plain edit still needs a unique match");
+        let all = apply_exact_patches_with_content(
+            &path,
+            Path::new("r.rs"),
+            &[("old".into(), "old_new".into(), true)],
+            None,
+            &mut || {},
+        )
+        .unwrap();
+        assert_eq!(all.text, "let a = old_new;\nlet b = old_new;\nlet c = old_new;\n");
+        assert!(all.summary.contains("replaced 3 matches"), "{}", all.summary);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stage_b_normalizes_unique_indentation_and_rejects_ambiguous() {
+        let dir = temp_dir("stage-b");
+        let path = dir.join("b.rs");
+        let original = "fn one() {\n\tlet v = 10;\n\tlet w = 20;\n}\nfn two() {\n\tlet z = 1;\n}\nfn three() {\n\tlet z = 1;\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        let ok = apply_exact_patches_with_content(
+            &path,
+            Path::new("b.rs"),
+            &[(
+                "    let v = 10;\n    let w = 20;".into(),
+                "    if true {\n        let v = 99;\n    }".into(),
+                false,
+            )],
+            None,
+            &mut || {},
+        )
+        .unwrap();
+        assert!(ok.summary.contains("indentation normalized"), "{}", ok.summary);
+        assert!(ok.text.contains("\tif true {\n\t    let v = 99;\n\t}"));
+
+        // Two matches for `let z = 1;` -> Stage B must refuse.
+        let err = apply_exact_patches_with_content(
+            &path,
+            Path::new("b.rs"),
+            &[("    let z = 1;".into(), "    let z = 2;".into(), false)],
+            None,
+            &mut || {},
+        )
+        .err()
+        .expect("ambiguous indent match must fail");
+        assert!(matches!(err.error, crate::tools::ToolError::MatchCount { count: 0 }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multi_file_patch_is_atomic_and_supports_rollback_on_check_fail() {
+        let dir = temp_dir("multi-atomic");
+        let f1 = dir.join("one.rs");
+        let f2 = dir.join("two.rs");
+        std::fs::write(&f1, "pub fn one() -> i32 { 1 }\n").unwrap();
+        std::fs::write(&f2, "pub fn two() -> i32 { 2 }\n").unwrap();
+
+        // File 2 fails -> file 1 MUST remain untouched on disk!
+        let err = apply_atomic_multi_file_patches(
+            &[
+                (f1.clone(), PathBuf::from("one.rs"), vec![("1".into(), "10".into(), false)]),
+                (f2.clone(), PathBuf::from("two.rs"), vec![("missing".into(), "20".into(), false)]),
+            ],
+            false,
+            None,
+            &mut || {},
+        )
+        .err()
+        .expect("missing edit in file 2 should abort entire transaction");
+        let _ = err;
+        assert_eq!(std::fs::read_to_string(&f1).unwrap(), "pub fn one() -> i32 { 1 }\n");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), "pub fn two() -> i32 { 2 }\n");
+
+        // Multi-file patch via ToolRegistry with rollback_on_check_fail: true when then_run fails.
+        let registry = ToolRegistry::default();
+        let res = registry.execute(
+            OperatingMode::Auto,
+            &dir,
+            "patch",
+            &json!({
+                "path": "one.rs",
+                "edits": [{"expected": "{ 1 }", "replacement": "{ 11 }"}],
+                "files": [
+                    {"path": "two.rs", "edits": [{"expected": "{ 2 }", "replacement": "{ 22 }"}]}
+                ],
+                "rollback_on_check_fail": true,
+                "then_run": {"command": "exit 1"}
+            })
+            .to_string(),
+        );
+        assert!(!res.success, "{}", res.output);
+        assert!(res.output.contains("[rollback] reverted patched file(s)"), "{}", res.output);
+        assert_eq!(std::fs::read_to_string(&f1).unwrap(), "pub fn one() -> i32 { 1 }\n");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), "pub fn two() -> i32 { 2 }\n");
+
+        // Multi-file patch via standalone `files` without top-level `path`/`edits` succeeds.
+        let ok = registry.execute(
+            OperatingMode::Auto,
+            &dir,
+            "patch",
+            &json!({
+                "files": [
+                    {"path": "one.rs", "edits": [{"expected": "{ 1 }", "replacement": "{ 101 }"}]},
+                    {"path": "two.rs", "edits": [{"expected": "{ 2 }", "replacement": "{ 202 }"}]}
+                ]
+            })
+            .to_string(),
+        );
+        assert!(ok.success, "{}", ok.output);
+        assert_eq!(std::fs::read_to_string(&f1).unwrap(), "pub fn one() -> i32 { 101 }\n");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), "pub fn two() -> i32 { 202 }\n");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

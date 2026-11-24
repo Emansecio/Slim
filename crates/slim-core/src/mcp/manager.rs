@@ -77,12 +77,133 @@ fn drop_detached<T: Send + 'static>(value: T) {
 }
 
 /// Owns every configured MCP server and its lazily established connection.
+const MCP_READONLY_CACHE_MAX_ENTRIES: usize = 256;
+const MCP_READONLY_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MCP_READONLY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+static MCP_READONLY_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static MCP_READONLY_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide (hits, misses) for the shared MCP read-only call cache.
+pub fn read_only_cache_stats() -> (u64, u64) {
+    (
+        MCP_READONLY_CACHE_HITS.load(Ordering::Relaxed),
+        MCP_READONLY_CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct McpCallCacheKey {
+    server: String,
+    tool: String,
+    args_hash: String,
+    generation: u64,
+}
+
+struct CachedMcpCall {
+    value: Value,
+    bytes: usize,
+    stored_at: std::time::Instant,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct McpToolCallCache {
+    entries: std::collections::HashMap<McpCallCacheKey, CachedMcpCall>,
+    total_bytes: usize,
+    clock: u64,
+}
+
+impl McpToolCallCache {
+    fn get(&mut self, key: &McpCallCacheKey) -> Option<Value> {
+        let expired = self
+            .entries
+            .get(key)
+            .is_some_and(|e| e.stored_at.elapsed() >= MCP_READONLY_CACHE_TTL);
+        if expired {
+            if let Some(removed) = self.entries.remove(key) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            }
+            return None;
+        }
+        self.clock = self.clock.saturating_add(1);
+        let clock = self.clock;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used = clock;
+            MCP_READONLY_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(entry.value.clone());
+        }
+        None
+    }
+
+    fn insert(&mut self, key: McpCallCacheKey, value: Value) {
+        let bytes = value.to_string().len();
+        if bytes > MCP_READONLY_CACHE_MAX_BYTES / 4 {
+            return;
+        }
+        if let Some(prev) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.bytes);
+        }
+        while (self.entries.len() >= MCP_READONLY_CACHE_MAX_ENTRIES
+            || self.total_bytes.saturating_add(bytes) > MCP_READONLY_CACHE_MAX_BYTES)
+            && !self.entries.is_empty()
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            }
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            CachedMcpCall {
+                value,
+                bytes,
+                stored_at: std::time::Instant::now(),
+                last_used: self.clock,
+            },
+        );
+    }
+
+    fn invalidate_server(&mut self, server: &str) {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|k, v| {
+            if k.server == server {
+                removed_bytes = removed_bytes.saturating_add(v.bytes);
+                false
+            } else {
+                true
+            }
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+}
+
+/// Manages the lifecycle and RPC calls of configured MCP servers.
+///
 /// Nothing is spawned or connected at construction: the first `list_tools`,
 /// `describe`, or `call` (or a `/mcp` test) performs the handshake. All state
 /// transitions bump `revision` so UIs can poll cheaply.
 pub struct McpManager {
     cwd: PathBuf,
     resolver: ExecutableResolver,
+    /// Optional shared project-wide manager; when set, `self.servers` holds
+    /// session-private overlays (e.g. per-member `slim_swarm`) that never
+    /// leak to sibling sessions and never tear down `parent` on `disconnect_all`.
+    parent: Option<Arc<McpManager>>,
     servers: Arc<RwLock<BTreeMap<String, Arc<ServerEntry>>>>,
     revision: AtomicU64,
     /// Where servers' `notifications/message` log entries go, if anywhere.
@@ -99,6 +220,8 @@ pub struct McpManager {
     direct: Mutex<crate::mcp::exposure::DirectState>,
     /// Complete resource listings per server (see `resources`).
     resource_cache: resources::ResourceCache,
+    /// Shared LRU cache for read-only, non-destructive MCP tool calls.
+    tool_call_cache: Mutex<McpToolCallCache>,
 }
 
 struct ServerEntry {
@@ -146,6 +269,7 @@ impl McpManager {
         Self {
             cwd,
             resolver,
+            parent: None,
             servers: Arc::new(RwLock::new(servers)),
             revision: AtomicU64::new(0),
             log: None,
@@ -155,7 +279,36 @@ impl McpManager {
             startup_wait_spent: AtomicBool::new(false),
             direct: Mutex::new(Default::default()),
             resource_cache: resources::ResourceCache::default(),
+            tool_call_cache: Mutex::new(McpToolCallCache::default()),
         }
+    }
+
+    /// Creates a lightweight per-session overlay backed by a shared project-wide
+    /// `parent` manager. Calls to [`Self::insert_connection`] stay private to
+    /// this overlay (e.g. per-member `slim_swarm`), while all other servers are
+    /// transparently served by `parent`. [`Self::disconnect_all`] tears down
+    /// only local overlays and never disconnects `parent`.
+    pub fn with_session_overlays(parent: Arc<McpManager>) -> Arc<Self> {
+        Arc::new(Self {
+            cwd: parent.cwd.clone(),
+            resolver: parent.resolver.clone(),
+            parent: Some(Arc::clone(&parent)),
+            servers: Arc::new(RwLock::new(BTreeMap::new())),
+            revision: AtomicU64::new(0),
+            log: parent.log.clone(),
+            changed: tokio::sync::Notify::new(),
+            startup_cancel: Mutex::new(None),
+            startup_wait_ms: AtomicU64::new(parent.startup_wait_ms.load(Ordering::Relaxed)),
+            startup_wait_spent: AtomicBool::new(false),
+            direct: Mutex::new(Default::default()),
+            resource_cache: resources::ResourceCache::default(),
+            tool_call_cache: Mutex::new(McpToolCallCache::default()),
+        })
+    }
+
+    /// True if this manager is a session overlay wrapping a shared project manager.
+    pub fn has_shared_parent(&self) -> bool {
+        self.parent.is_some()
     }
 
     /// Appends server log messages (`notifications/message`) to `path`
@@ -201,22 +354,36 @@ impl McpManager {
 
     pub fn is_empty(&self) -> bool {
         read_lock(&self.servers).is_empty()
+            && self.parent.as_ref().is_none_or(|parent| parent.is_empty())
     }
 
     pub fn has_enabled_servers(&self) -> bool {
         read_lock(&self.servers)
             .values()
             .any(|entry| entry.spec.enabled)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.has_enabled_servers())
     }
 
     pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Relaxed)
+        let local = self.revision.load(Ordering::Relaxed);
+        let parent = self
+            .parent
+            .as_ref()
+            .map_or(0, |parent| parent.revision());
+        local.wrapping_add(parent)
     }
 
     /// Configured header/env values across all servers; callers register them
     /// for redaction so secrets never reach prompts, events, or logs.
     pub fn sensitive_values(&self) -> Vec<String> {
-        collect_sensitive_values(&self.servers)
+        let mut values = collect_sensitive_values(&self.servers);
+        if let Some(parent) = &self.parent {
+            values.extend(parent.sensitive_values());
+        }
+        values
     }
 
     fn bump(&self) {
@@ -244,8 +411,12 @@ impl McpManager {
     /// already connecting or connected are left alone. Returns how many
     /// connects were started; without a tokio runtime nothing is started.
     pub fn start_background_connect(self: &Arc<Self>) -> usize {
+        let parent_started = self
+            .parent
+            .as_ref()
+            .map_or(0, |parent| parent.start_background_connect());
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return 0;
+            return parent_started;
         };
         let cancellation = {
             let mut slot = lock_mutex(&self.startup_cancel);
@@ -259,7 +430,7 @@ impl McpManager {
             }
         };
         let entries: Vec<Arc<ServerEntry>> = read_lock(&self.servers).values().cloned().collect();
-        let mut started = 0;
+        let mut started = parent_started;
         for entry in entries {
             if !entry.wants_startup_connect() || entry.startup_pending.swap(true, Ordering::AcqRel)
             {
@@ -295,18 +466,30 @@ impl McpManager {
         read_lock(&self.servers)
             .values()
             .any(|entry| entry.startup_pending.load(Ordering::Acquire))
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.startup_in_progress())
     }
 
     /// Direct-exposure servers whose background connect has not ended.
     fn pending_direct_servers(&self) -> Vec<String> {
-        read_lock(&self.servers)
+        let mut pending: Vec<String> = read_lock(&self.servers)
             .values()
             .filter(|entry| {
                 entry.spec.options.has_direct_tools()
                     && entry.startup_pending.load(Ordering::Acquire)
             })
             .map(|entry| entry.spec.name.clone())
-            .collect()
+            .collect();
+        if let Some(parent) = &self.parent {
+            for name in parent.pending_direct_servers() {
+                if !pending.contains(&name) {
+                    pending.push(name);
+                }
+            }
+        }
+        pending
     }
 
     /// Waits until the direct-exposure servers started by
@@ -316,6 +499,15 @@ impl McpManager {
     /// run, not every run. Gateway servers are never waited for here; a call
     /// that names one waits for that server alone.
     pub async fn wait_for_direct_servers(&self, timeout: Duration) -> McpStartupWait {
+        if let Some(parent) = &self.parent {
+            let report = Box::pin(parent.wait_for_direct_servers(timeout)).await;
+            if read_lock(&self.servers).values().all(|e| {
+                !e.spec.options.has_direct_tools() || !e.startup_pending.load(Ordering::Acquire)
+            }) {
+                self.startup_wait_spent.store(true, Ordering::Release);
+                return report;
+            }
+        }
         if self.startup_wait_spent.load(Ordering::Acquire) {
             return McpStartupWait::default();
         }
@@ -340,10 +532,13 @@ impl McpManager {
     }
 
     fn entry(&self, name: &str) -> Result<Arc<ServerEntry>, McpError> {
-        read_lock(&self.servers)
-            .get(name)
-            .cloned()
-            .ok_or_else(|| McpError::UnknownServer(name.to_owned()))
+        if let Some(local) = read_lock(&self.servers).get(name).cloned() {
+            return Ok(local);
+        }
+        if let Some(parent) = &self.parent {
+            return parent.entry(name);
+        }
+        Err(McpError::UnknownServer(name.to_owned()))
     }
 
     fn set_status(entry: &ServerEntry, status: McpServerStatus) {
@@ -384,6 +579,11 @@ impl McpManager {
     /// added disconnected, changed specs drop their connection, removed
     /// servers disappear.
     pub fn reconcile(&self, specs: BTreeMap<String, McpServerSpec>) {
+        if let Some(parent) = &self.parent {
+            parent.reconcile(specs);
+            self.bump();
+            return;
+        }
         let mut replaced: Vec<Arc<ServerEntry>> = Vec::new();
         {
             let mut servers = write_lock(&self.servers);
@@ -411,6 +611,12 @@ impl McpManager {
                     .or_insert_with(|| Arc::new(ServerEntry::new(spec)));
             }
         }
+        {
+            let mut cache = lock_mutex(&self.tool_call_cache);
+            for old in &replaced {
+                cache.invalidate_server(&old.spec.name);
+            }
+        }
         for old in &replaced {
             old.retire();
         }
@@ -419,8 +625,8 @@ impl McpManager {
     }
 
     pub fn statuses(&self) -> Vec<McpServerInfo> {
-        read_lock(&self.servers)
-            .values()
+        self.entries_snapshot()
+            .into_iter()
             .map(|entry| McpServerInfo {
                 name: entry.spec.name.clone(),
                 transport: entry.spec.transport.kind(),
@@ -694,6 +900,20 @@ impl McpManager {
                 "MCP tool arguments must be an object".into(),
             )));
         }
+        // Delegate non-overlay servers directly to the shared parent manager so
+        // all sessions share both warm connections and the read-only call cache.
+        if let Some(parent) = &self.parent {
+            if !read_lock(&self.servers).contains_key(server) {
+                return Box::pin(parent.call_with_progress(
+                    server,
+                    tool,
+                    arguments,
+                    cancellation,
+                    progress,
+                ))
+                .await;
+            }
+        }
         let entry = match self.entry(server) {
             Ok(entry) => entry,
             Err(error) => return McpRequestOutcome::Completed(Err(error)),
@@ -726,6 +946,32 @@ impl McpManager {
         if cancellation.is_cancelled() {
             return McpRequestOutcome::cancelled_before_send();
         }
+        // Never cache session-private overlays (e.g. in-process `slim_swarm::board_read`
+        // advances cursors even though it sets `read_only_hint = true`).
+        let is_session_overlay = self.parent.is_some();
+        let tool_cacheable = !is_session_overlay
+            && progress.is_none()
+            && self.is_tool_cacheable_read_only(&entry, tool);
+        let cache_key = if tool_cacheable {
+            let args_json = canonical_json_string(&arguments);
+            let args_hash = crate::tools::digest_bytes(b"slim-mcp-ro-v1", args_json.as_bytes());
+            let key = McpCallCacheKey {
+                server: server.to_owned(),
+                tool: tool.to_owned(),
+                args_hash,
+                generation,
+            };
+            if let Some(cached) = lock_mutex(&self.tool_call_cache).get(&key) {
+                return McpRequestOutcome::Completed(Ok(cached));
+            }
+            MCP_READONLY_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            Some(key)
+        } else {
+            if !is_session_overlay {
+                lock_mutex(&self.tool_call_cache).invalidate_server(server);
+            }
+            None
+        };
         let progress = progress.unwrap_or_else(|| Arc::new(|_| {}));
         let outcome = connection
             .request_with_progress(
@@ -735,8 +981,30 @@ impl McpManager {
                 Some(progress),
             )
             .await;
-        self.settle_request(&entry, generation, &connection, outcome)
-            .await
+        let settled = self
+            .settle_request(&entry, generation, &connection, outcome)
+            .await;
+        if let (Some(key), McpRequestOutcome::Completed(Ok(value))) = (cache_key, &settled) {
+            if value.get("isError").and_then(Value::as_bool) != Some(true) {
+                lock_mutex(&self.tool_call_cache).insert(key, value.clone());
+            }
+        }
+        settled
+    }
+
+    fn is_tool_cacheable_read_only(&self, entry: &ServerEntry, tool_name: &str) -> bool {
+        let tools = match read_lock(&entry.status).clone() {
+            McpServerStatus::Ready { tools } => Some(tools),
+            McpServerStatus::Disconnected | McpServerStatus::Connecting => {
+                read_lock(&entry.last_tools).clone()
+            }
+            _ => None,
+        };
+        tools.is_some_and(|list| {
+            list.iter()
+                .find(|summary| summary.name == tool_name)
+                .is_some_and(|summary| summary.read_only_hint && !summary.destructive_hint)
+        })
     }
 
     /// Transport clean-up every manager request performs once its outcome is
@@ -879,8 +1147,8 @@ impl McpManager {
             taken_connections.extend(taken);
             Self::set_status(&entry, entry.idle_status());
         }
+        lock_mutex(&self.tool_call_cache).clear();
         self.bump();
-        // HTTP sessions are ended before the connections go away, all at
         // once: each is bounded to a second, so shutdown waits for the
         // slowest rather than the sum.
         futures_util::future::join_all(
@@ -1487,6 +1755,21 @@ async fn fetch_tools_pages_cancellable(
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"})),
+                read_only_hint: tool
+                    .get("annotations")
+                    .and_then(|annotations| annotations.get("readOnlyHint"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                destructive_hint: tool
+                    .get("annotations")
+                    .and_then(|annotations| annotations.get("destructiveHint"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                idempotent_hint: tool
+                    .get("annotations")
+                    .and_then(|annotations| annotations.get("idempotentHint"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             });
         }
         // Some servers end pagination with `null` or `""`.
@@ -1505,6 +1788,27 @@ async fn fetch_tools_pages_cancellable(
         }
     }
     McpRequestOutcome::Completed(Ok(Arc::new(summaries)))
+}
+
+fn canonical_json_string(value: &Value) -> String {
+    fn sort_value(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut sorted = serde_json::Map::with_capacity(map.len());
+                for k in keys {
+                    if let Some(val) = map.get(k) {
+                        sorted.insert(k.clone(), sort_value(val));
+                    }
+                }
+                Value::Object(sorted)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sort_value).collect()),
+            other => other.clone(),
+        }
+    }
+    sort_value(value).to_string()
 }
 
 fn merge_cleanup(first: McpCleanupStatus, second: McpCleanupStatus) -> McpCleanupStatus {

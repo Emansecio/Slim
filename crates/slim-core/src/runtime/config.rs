@@ -29,6 +29,20 @@ pub struct AgentLoopConfig {
     /// Wall-clock budget of one run. From three quarters on, tuning-only
     /// patches are refused; once spent, the run asks for its final answer.
     pub time_budget: Option<std::time::Duration>,
+    /// Opt-in latency optimization: after a workspace mutation and a clean
+    /// verification check pass, lower model reasoning effort for follow-up turns
+    /// on supported OpenAI/Codex adapters without altering prompt-cache prefixes.
+    pub adaptive_reasoning: bool,
+    /// Preserve the canonical Auto tool schema envelope across ReadOnly/Plan/Auto
+    /// mode switches (gating mutations locally at admission) so KV-cache prefixes
+    /// remain intact across `Plan -> Auto` transitions.
+    pub stable_tool_envelope: bool,
+    /// Opt-in cache keep-alive pings before TTL expiry (OFF by default).
+    pub cache_keep_alive: bool,
+    /// Maximum session idle duration allowed for cache keep-alive pings (seconds, capped at 900).
+    pub cache_keep_alive_max_secs: u64,
+    /// Optional cumulative total token cap for bounded subagent/task runs.
+    pub max_total_tokens: Option<u64>,
 }
 
 impl AgentLoopConfig {
@@ -62,6 +76,11 @@ impl Default for AgentLoopConfig {
             context_compaction_enabled: true,
             provider_recovery_backoff: Self::DEFAULT_PROVIDER_RECOVERY_BACKOFF,
             time_budget: None,
+            adaptive_reasoning: false,
+            stable_tool_envelope: false,
+            cache_keep_alive: false,
+            cache_keep_alive_max_secs: 900,
+            max_total_tokens: None,
         }
     }
 }
@@ -75,6 +94,8 @@ pub enum AgentLoopStop {
     ToolLimit,
     /// `time_budget` elapsed.
     TimeLimit,
+    /// `max_total_tokens` budget exhausted.
+    TokenLimit,
     RepeatedFailedTool,
     /// The causal ledger asked to stop (repeated evidence / stagnant turns):
     /// continuing would only burn turns without progress.

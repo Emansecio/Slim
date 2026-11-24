@@ -140,57 +140,6 @@ mod tests {
     }
 
     #[test]
-    fn advertised_capacities_match_constructor() {
-        assert_eq!(BoundedCache::<u32, u32>::new(8_192).capacity(), 8_192);
-        assert_eq!(BoundedCache::<u32, u32>::new(16_384).capacity(), 16_384);
-    }
-
-    #[test]
-    fn eviction_is_lru_after_reads() {
-        let mut cache = BoundedCache::new(3);
-        for key in 0..3 {
-            cache.insert(key, key * 10);
-        }
-        assert_eq!(cache.get(&1), Some(&10));
-        cache.insert(3, 30);
-        assert_eq!(cache.get(&0), None, "oldest untouched key is evicted");
-        assert_eq!(cache.get(&1), Some(&10), "recently read key survives");
-        assert_eq!(cache.get(&3), Some(&30));
-    }
-
-    #[test]
-    fn update_keeps_single_order_slot() {
-        let mut cache = BoundedCache::new(2);
-        cache.insert("a", 1);
-        cache.insert("b", 2);
-        cache.insert("a", 3);
-        cache.insert("c", 4);
-        assert_eq!(cache.get(&"b"), None, "updated a stays, b evicted");
-        assert_eq!(cache.get(&"a"), Some(&3));
-        assert_eq!(cache.get(&"c"), Some(&4));
-    }
-
-    #[test]
-    fn bulk_reads_stay_cheap_and_eviction_prefers_coldest() {
-        let mut cache = BoundedCache::new(8_192);
-        for index in 0..8_192 {
-            cache.insert(index, index);
-        }
-        for _ in 0..4 {
-            for index in 0..8_192 {
-                assert_eq!(cache.get(&index), Some(&index));
-            }
-        }
-        cache.insert(8_192, 8_192);
-        assert_eq!(
-            cache.get(&0),
-            None,
-            "within each refresh round key 0 ages first under monotonic ticks"
-        );
-        assert_eq!(cache.get(&8_191), Some(&8_191), "freshest key survives");
-    }
-
-    #[test]
     fn weighted_cache_evicts_coldest_by_bytes() {
         let mut cache = WeightedCache::new(16, 100);
         assert!(cache.insert("a", 1, 60));

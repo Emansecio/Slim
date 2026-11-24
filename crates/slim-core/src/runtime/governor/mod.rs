@@ -717,6 +717,71 @@ impl CausalGovernor {
         )]
     }
 
+    pub(super) fn note_internal_state_change(&mut self) {
+        self.ledger.internal_epoch = self.ledger.internal_epoch.saturating_add(1);
+        self.ledger.turn.has_calls = true;
+        self.mark_progress();
+    }
+
+    pub(super) fn observe_external_call(
+        &mut self,
+        batch_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        call_fingerprint: String,
+    ) -> Vec<GovernorObservation> {
+        self.unclassifiable_call(CallIds::named(batch_id, call_id, tool_name), call_fingerprint)
+            .1
+    }
+
+    pub(super) fn observe_codemode_glob(
+        &mut self,
+        batch_id: &str,
+        call_id: &str,
+        canonical_fingerprint: &str,
+        result: &ToolResult,
+    ) -> Vec<GovernorObservation> {
+        let spec = ToolOperationalSpec {
+            effect_class: ToolEffectClass::SnapshotRead,
+            cacheability: crate::tools::ToolCacheability::Evidence,
+            volatility: ToolVolatility::ObservedWorkspace,
+            dependency_scope: ToolDependencyScope::ObservedWorkspace,
+            replay_policy: ToolReplayPolicy::EquivalentEvidence,
+        };
+        let ids = CallIds::named(batch_id, call_id, "glob");
+        let call_fingerprint = stateful_call_fingerprint(
+            canonical_fingerprint,
+            "",
+            self.ledger.uncertainty_epoch,
+            Some(self.ledger.workspace_revision),
+        );
+        let scope = evidence_scope(
+            spec,
+            "",
+            self.ledger.workspace_revision,
+            self.ledger.uncertainty_epoch,
+        );
+        let confidence = confidence_for(spec);
+        self.begin_call(&ids, &call_fingerprint, confidence);
+        let pending = PendingCall {
+            evidence_scope: scope,
+            spec: Some(spec),
+            confidence,
+            ..PendingCall::new(
+                ids,
+                canonical_fingerprint.to_owned(),
+                call_fingerprint,
+                self.ledger.workspace_revision,
+            )
+        };
+        let outcome = if result.success {
+            EvidenceOutcome::Success
+        } else {
+            EvidenceOutcome::Failure
+        };
+        self.observe_evidence(pending, result, outcome)
+    }
+
     /// A call the governor cannot classify: an uncertainty boundary.
     fn unclassifiable_call(
         &mut self,

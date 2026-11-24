@@ -85,11 +85,15 @@ impl Runtime {
 fn describe_native(name: &str, native: &str, definition: &Value) -> Value {
     let description = definition["description"].as_str();
     let schema = &definition["input_schema"];
+    let returns = definition
+        .get("return_type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
     json!({
         "name": name,
         "description": description,
         "inputSchema": schema,
-        "signature": typescript::signature(native, description, schema, "string"),
+        "signature": typescript::signature(native, description, schema, returns),
     })
 }
 

@@ -77,7 +77,8 @@ pub use transcript::{
     provider_messages_from_entries, provider_messages_from_records, recovery_tool_results,
 };
 pub use turns::{
-    fork_session_before_turn, list_turns, peek_session, SessionPeek, TurnError, TurnInfo,
+    fork_session_before_turn, fork_session_completed, list_turns, peek_session, SessionPeek,
+    TurnError, TurnInfo,
 };
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 1;

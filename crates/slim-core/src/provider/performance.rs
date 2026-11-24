@@ -70,10 +70,10 @@ fn request_preparation_costs() {
             );
             complete.push(start.elapsed().as_secs_f64() * 1000.0);
             let start = Instant::now();
-            black_box(provider_native_prompt_cache_key(
+            black_box(provider_native_prompt_cache_key_for_prefixes(
                 adapter.wire_kind(),
                 adapter.model(),
-                &body,
+                provider_request_fingerprints(&body),
             ));
             affinity.push(start.elapsed().as_secs_f64() * 1000.0);
             let start = Instant::now();

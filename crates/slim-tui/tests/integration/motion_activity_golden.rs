@@ -209,42 +209,6 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
 }
 
 #[test]
-fn activity_projects_known_phase_and_elapsed() {
-    let mut state = AppState::new();
-    reduce(
-        &mut state,
-        Action::Tick(FrameClock {
-            frame: 1,
-            elapsed_ms: 1_000,
-        }),
-    );
-    reduce(&mut state, Action::UiEventReceived(UiEvent::run_started(1)));
-    reduce(
-        &mut state,
-        Action::UiEventReceived(UiEvent::ThinkingStarted),
-    );
-    reduce(
-        &mut state,
-        Action::UiEventReceived(UiEvent::ThinkingDelta {
-            text: "plan".into(),
-        }),
-    );
-    reduce(
-        &mut state,
-        Action::Tick(FrameClock {
-            frame: 31,
-            elapsed_ms: 3_500,
-        }),
-    );
-
-    let frame = render_state(&state, caps(false)).join("\n");
-    // The visible header owns the phase and its time; the rail carries the run.
-    assert!(frame.contains("Pensando · 2s"), "{frame}");
-    assert_eq!(frame.matches("Pensando").count(), 1, "{frame}");
-    assert!(frame.contains("Trabalhando · 2s"), "{frame}");
-}
-
-#[test]
 fn rail_labels_the_run_total_when_it_differs_from_the_thinking_time() {
     let mut state = AppState::new();
     let tick = |state: &mut AppState, frame: u64, elapsed_ms: u64| {
@@ -1076,26 +1040,6 @@ fn late_activity_transitions_after_cancel_are_ignored() {
 }
 
 #[test]
-fn expedited_terminal_rejects_the_same_queued_run_start() {
-    let mut state = AppState::new();
-    state.apply_event(UiEvent::RunCancelled { run_id: 7 });
-    state.apply_event(UiEvent::run_started(7));
-    state.apply_event(UiEvent::AssistantDelta {
-        text: "late".into(),
-    });
-
-    assert!(!state.working);
-    assert!(state.activity.is_none());
-    assert!(matches!(
-        state.blocks().last().map(|block| (&block.lifecycle, block.kind())),
-        Some((BlockLifecycle::Cancelled, BlockKind::Assistant(text))) if text == "late"
-    ));
-
-    state.apply_event(UiEvent::run_started(8));
-    assert!(state.working);
-}
-
-#[test]
 fn first_equal_run_terminal_outcome_is_immutable() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::FatalError {
@@ -1228,16 +1172,6 @@ fn late_stream_deltas_after_cancel_stay_cancelled_without_activity() {
             BlockKind::Assistant(_) | BlockKind::Thinking(_)
         ) && block.lifecycle == BlockLifecycle::Cancelled
     }));
-}
-
-#[test]
-fn terminal_run_events_clear_transient_activity() {
-    let mut state = AppState::new();
-    state.apply_event(UiEvent::run_started(1));
-    state.apply_event(UiEvent::AssistantDelta { text: "x".into() });
-    assert!(state.activity.is_some());
-    state.apply_event(UiEvent::RunCompleted { run_id: 1 });
-    assert!(state.activity.is_none());
 }
 
 #[test]

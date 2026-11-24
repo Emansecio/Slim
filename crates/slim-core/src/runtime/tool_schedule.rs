@@ -9,7 +9,7 @@ pub(super) enum ToolCallBucket {
 
 pub(super) fn tool_call_bucket(name: &str) -> ToolCallBucket {
     match name {
-        "read" | "list" | "search" | "code_intel" => ToolCallBucket::Read,
+        "read" | "list" | "search" | "code_intel" | "history_recall" => ToolCallBucket::Read,
         _ => ToolCallBucket::Mutating,
     }
 }
@@ -19,6 +19,16 @@ pub(super) fn tool_call_slots(call: &ProviderToolCall) -> usize {
         && serde_json::from_str::<Value>(&call.arguments)
             .ok()
             .is_some_and(|arguments| arguments.get("then_run").is_some_and(Value::is_object))
+    {
+        2
+    } else {
+        1
+    }
+}
+
+pub(super) fn tool_call_slots_value(name: &str, arguments: &Value) -> usize {
+    if matches!(name, "write" | "patch")
+        && arguments.get("then_run").is_some_and(Value::is_object)
     {
         2
     } else {
@@ -51,7 +61,7 @@ pub(super) fn is_serial_barrier(prepared: &PreparedToolInvocation) -> bool {
     }
     matches!(
         prepared.name.as_str(),
-        "shell" | "skill" | "mcp" | "codemode"
+        "shell" | "skill" | "mcp" | "codemode" | "batch_code"
     ) || matches!(
         &prepared.arguments,
         PreparedToolArguments::Write {
@@ -103,20 +113,25 @@ pub(super) fn mutation_path_key(prepared: &PreparedToolInvocation) -> Option<Str
         .map(|path| schedule_key(&crate::tools::path_identity(path)))
 }
 
+pub(super) fn schedule_key_for_path(path: &Path) -> String {
+    schedule_key(&crate::tools::path_identity(path))
+}
+
+pub(super) fn mutation_path_keys(prepared: &PreparedToolInvocation) -> Vec<String> {
+    prepared
+        .target_paths
+        .iter()
+        .map(|path| schedule_key(&crate::tools::path_identity(path)))
+        .collect()
+}
+
 pub(super) fn snapshot_depends_on_prior_mutation(
     prior: &PreparedToolInvocation,
     snapshot: &PreparedToolInvocation,
 ) -> bool {
-    // A file mutation always has a target path, so the filter only rejects
-    // calls that are not file mutations.
-    let Some(mutated) = prior
-        .target_paths
-        .first()
-        .filter(|_| is_file_mutation(prior))
-        .map(|path| schedule_path(path))
-    else {
+    if !is_file_mutation(prior) || prior.target_paths.is_empty() {
         return false;
-    };
+    }
     match snapshot.name.as_str() {
         "search" => true,
         // Semantic results span the whole workspace: a patch to b.rs changes
@@ -127,13 +142,21 @@ pub(super) fn snapshot_depends_on_prior_mutation(
             .target_paths
             .first()
             .map(|dir| schedule_path(dir))
-            .is_some_and(|dir| mutated == dir || mutated.starts_with(&dir)),
+            .is_some_and(|dir| {
+                prior.target_paths.iter().any(|path| {
+                    let mutated = schedule_path(path);
+                    mutated == dir || mutated.starts_with(&dir)
+                })
+            }),
         _ => {
             snapshot.target_paths.is_empty()
-                || snapshot
-                    .target_paths
-                    .iter()
-                    .any(|path| schedule_path(path) == mutated)
+                || snapshot.target_paths.iter().any(|snap_path| {
+                    let snap = schedule_path(snap_path);
+                    prior
+                        .target_paths
+                        .iter()
+                        .any(|mut_path| schedule_path(mut_path) == snap)
+                })
         }
     }
 }
@@ -198,23 +221,78 @@ pub(super) fn independent_mutation_cluster<P: Borrow<PreparedToolInvocation>>(
     results: &[Option<ToolResult>],
     start: usize,
 ) -> Vec<usize> {
-    let file_key = |index: usize| {
+    let file_keys = |index: usize| {
         let call: &PreparedToolInvocation = prepared[index].borrow();
         (is_file_mutation(call) && !is_serial_barrier(call))
-            .then(|| mutation_path_key(call))
-            .flatten()
+            .then(|| mutation_path_keys(call))
+            .filter(|keys| !keys.is_empty())
     };
-    let Some(first) = file_key(start) else {
+    let Some(first) = file_keys(start) else {
         return Vec::new();
     };
-    let mut seen = std::collections::HashSet::from([first]);
+    let mut seen: std::collections::HashSet<String> = first.into_iter().collect();
     let mut cluster = vec![start];
-    cluster.extend(
-        (start + 1..prepared.len())
-            .filter(|&index| results[index].is_none())
-            .map_while(|index| seen.insert(file_key(index)?).then_some(index)),
-    );
+    for index in start + 1..prepared.len() {
+        if results[index].is_some() {
+            continue;
+        }
+        let Some(keys) = file_keys(index) else {
+            break;
+        };
+        if keys.iter().any(|key| seen.contains(key)) {
+            break;
+        }
+        seen.extend(keys);
+        cluster.push(index);
+    }
     cluster
+}
+
+/// Snapshot reads that are ready to overlap with `mutation_indices` in the same
+/// parallel wave because they are behind no serial barrier and touch no target
+/// path of any pending mutation or any mutation in `mutation_indices`.
+pub(super) fn disjoint_ready_reads_for_mutations<P: Borrow<PreparedToolInvocation>>(
+    tools: &ToolRegistry,
+    prepared: &[P],
+    results: &[Option<ToolResult>],
+    mutation_indices: &[usize],
+) -> Vec<usize> {
+    if mutation_indices.is_empty() {
+        return Vec::new();
+    }
+    let mut indices = Vec::new();
+    let mut barrier = false;
+    let mut pending_mutations: Vec<&PreparedToolInvocation> = Vec::new();
+    for (index, call) in prepared.iter().enumerate() {
+        let call: &PreparedToolInvocation = call.borrow();
+        let is_completed = results.get(index).is_some_and(Option::is_some);
+        if is_completed {
+            continue;
+        }
+        if mutation_indices.contains(&index) {
+            pending_mutations.push(call);
+            continue;
+        }
+        if is_serial_barrier(call) {
+            barrier = true;
+        }
+        if !barrier
+            && tool_call_is_parallel_snapshot_read(tools, &call.name)
+            && !pending_mutations
+                .iter()
+                .any(|prior| snapshot_depends_on_prior_mutation(prior, call))
+            && !mutation_indices
+                .iter()
+                .any(|&mi| snapshot_depends_on_prior_mutation(prepared[mi].borrow(), call))
+        {
+            indices.push(index);
+            continue;
+        }
+        if is_file_mutation(call) {
+            pending_mutations.push(call);
+        }
+    }
+    indices
 }
 
 /// Maps each call to the first earlier call with identical reusable
@@ -332,6 +410,52 @@ pub(super) const TUNING_CLOSED_ERROR: &str = "patch refused: the time budget is 
 pub(super) const MAX_BUDGET_STEERS: usize = 2;
 
 pub(super) const BATCH_CONCURRENCY: usize = 8;
+
+#[cfg(test)]
+mod tests {
+    use super::disjoint_ready_reads_for_mutations;
+    use crate::tools::ToolRegistry;
+    use crate::OperatingMode;
+    use serde_json::json;
+
+    #[test]
+    fn disjoint_ready_reads_overlap_unrelated_mutations_and_block_conflicts() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-schedule-dag-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            std::fs::write(root.join(name), "fn x() {}\n").unwrap();
+        }
+        let registry = ToolRegistry::default();
+        let calls = vec![
+            (
+                "patch".into(),
+                json!({
+                    "path": "a.rs",
+                    "edits": [{"expected": "fn x()", "replacement": "fn y()"}],
+                    "files": [{"path": "c.rs", "edits": [{"expected": "fn x()", "replacement": "fn z()"}]}]
+                })
+                .to_string(),
+            ),
+            ("read".into(), json!({"path": "b.rs"}).to_string()),
+            ("read".into(), json!({"path": "a.rs"}).to_string()),
+            ("read".into(), json!({"path": "c.rs"}).to_string()),
+            ("search".into(), json!({"query": "fn x"}).to_string()),
+            ("shell".into(), json!({"command": "echo hi"}).to_string()),
+            ("read".into(), json!({"path": "d.rs"}).to_string()),
+        ];
+        let prepared = registry.prepare_invocations(OperatingMode::Auto, root.clone(), &calls);
+        let results = vec![None; prepared.len()];
+        let ready = disjoint_ready_reads_for_mutations(&registry, &prepared, &results, &[0]);
+        // Only b.rs (index 1) is safe: a.rs (2) & c.rs (3) are in patch targets,
+        // search (4) scans workspace, and d.rs (6) sits after serial barrier shell (5).
+        assert_eq!(ready, vec![1]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
 
 pub(super) struct PoolOutcome {
     pub(super) outcome: ToolExecutionOutcome,

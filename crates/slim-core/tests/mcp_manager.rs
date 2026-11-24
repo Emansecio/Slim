@@ -255,6 +255,9 @@ fn ready_tool(name: &str) -> McpToolSummary {
         name: name.into(),
         description: Some("fake tool".into()),
         schema: json!({"type": "object"}),
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
     }
 }
 
@@ -613,6 +616,9 @@ fn describe_truncates_on_a_utf8_char_boundary() {
         name: "big".into(),
         description: None,
         schema: json!({"x": content}),
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
     };
     manager.insert_connection(stdio_spec("s"), FakeConnection::new(), vec![tool]);
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
@@ -1474,4 +1480,107 @@ fn default_spec_uses_the_sixty_second_timeout_and_is_enabled() {
     assert_eq!(spec.options, McpServerOptions::default());
     assert_eq!(McpExposure::parse("direct"), Some(McpExposure::Direct));
     assert_eq!(McpExposure::parse("codemode"), None);
+}
+
+#[test]
+fn session_overlays_isolate_swarm_servers_and_share_readonly_call_cache() {
+    let parent = Arc::new(McpManager::new(
+        BTreeMap::new(),
+        PathBuf::from("."),
+        ExecutableResolver::default(),
+    ));
+    let shared_conn = FakeConnection::new();
+    let ro_tool = McpToolSummary {
+        name: "lookup".into(),
+        description: Some("read-only lookup".into()),
+        schema: json!({"type": "object"}),
+        output_schema: None,
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: true,
+    };
+    let mut_tool = McpToolSummary {
+        name: "update".into(),
+        description: Some("mutating update".into()),
+        schema: json!({"type": "object"}),
+        output_schema: None,
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
+    };
+    parent.insert_connection(
+        stdio_spec("docs"),
+        Arc::clone(&shared_conn) as Arc<dyn McpConnection>,
+        vec![ro_tool, mut_tool],
+    );
+
+    let session_a = McpManager::with_session_overlays(Arc::clone(&parent));
+    let session_b = McpManager::with_session_overlays(Arc::clone(&parent));
+    let swarm_a = FakeConnection::new();
+    let swarm_b = FakeConnection::new();
+    let board_read = McpToolSummary {
+        name: "board_read".into(),
+        description: None,
+        schema: json!({"type": "object"}),
+        output_schema: None,
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: false,
+    };
+    session_a.insert_connection(
+        stdio_spec("slim_swarm"),
+        Arc::clone(&swarm_a) as Arc<dyn McpConnection>,
+        vec![board_read.clone()],
+    );
+    session_b.insert_connection(
+        stdio_spec("slim_swarm"),
+        Arc::clone(&swarm_b) as Arc<dyn McpConnection>,
+        vec![board_read],
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio");
+    rt.block_on(async {
+        // Session A and Session B both call their own private `slim_swarm` without colliding
+        // AND without caching overlay `board_read` calls even though read_only_hint == true.
+        let _ = session_a.call("slim_swarm", "board_read", json!({})).await.expect("a1");
+        let _ = session_a.call("slim_swarm", "board_read", json!({})).await.expect("a2");
+        let _ = session_b.call("slim_swarm", "board_read", json!({})).await.expect("b1");
+        assert_eq!(swarm_a.calls.lock().unwrap().len(), 2, "overlay board_read must never be cached");
+        assert_eq!(swarm_b.calls.lock().unwrap().len(), 1, "session B must route to its own overlay");
+
+        // Shared `docs/lookup` is cached across session A and session B even with reordered JSON keys.
+        let _ = session_a
+            .call("docs", "lookup", json!({"b": 2, "a": 1}))
+            .await
+            .expect("doc from A");
+        let _ = session_b
+            .call("docs", "lookup", json!({"a": 1, "b": 2}))
+            .await
+            .expect("doc cached for B");
+        assert_eq!(
+            shared_conn.calls.lock().unwrap().len(),
+            1,
+            "second identical read-only call across sibling sessions must hit shared cache"
+        );
+
+        // Disconnecting session A tears down only session A's overlay; parent stays Ready for B.
+        session_a.disconnect_all().await;
+        let _ = session_b
+            .call("docs", "lookup", json!({"a": 1, "b": 2}))
+            .await
+            .expect("parent still alive after child disconnect");
+        assert_eq!(shared_conn.calls.lock().unwrap().len(), 1);
+
+        // A mutating call on `docs` invalidates the read-only cache for `docs`.
+        let _ = session_b.call("docs", "update", json!({})).await.expect("update");
+        let _ = session_b
+            .call("docs", "lookup", json!({"a": 1, "b": 2}))
+            .await
+            .expect("re-fetched after mutation");
+        assert_eq!(
+            shared_conn.calls.lock().unwrap().len(),
+            3,
+            "mutating call must invalidate read-only cache for the server"
+        );
+    });
 }

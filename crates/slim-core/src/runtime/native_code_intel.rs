@@ -16,6 +16,8 @@ pub(super) fn code_intel_action_name(request: &CodeIntelRequest) -> &'static str
 #[derive(Default)]
 pub(super) struct EditedFiles {
     paths: Vec<PathBuf>,
+    /// Post-edit checks in a row that used their whole deadline.
+    slow_checks: u8,
 }
 
 impl EditedFiles {
@@ -25,6 +27,10 @@ impl EditedFiles {
                 self.paths.push(path.clone());
             }
         }
+    }
+
+    pub(super) fn remove_paths(&mut self, targets: &[PathBuf]) {
+        self.paths.retain(|existing| !targets.contains(existing));
     }
 }
 
@@ -52,6 +58,16 @@ pub(super) async fn run_code_intel_request(
         }
     };
     let action = code_intel_action_name(&request);
+    let cache_slot = code_intel_cache_key(&request).and_then(|(ws, key)| {
+        let daemon = crate::project_index::for_workspace(&ws).ok()?;
+        let epoch = daemon.fs_epoch();
+        Some((daemon, key, epoch))
+    });
+    if let Some((daemon, key, _)) = &cache_slot {
+        if let Some(hit) = daemon.lookup_code_intel(key) {
+            return (hit.result, hit.presentation);
+        }
+    }
     let result = match request {
         CodeIntelRequest::Status { workspace } => code_intel.status(&workspace).await,
         CodeIntelRequest::Definition(mut query) => {
@@ -78,11 +94,81 @@ pub(super) async fn run_code_intel_request(
     // Error payloads ("error" key) are failures: governors and turn
     // accounting must not observe them as successful tool calls.
     let success = result.payload.get("error").is_none();
+    let cacheable = success
+        && !result.meta.stale
+        && result.meta.state == crate::codeintel::CodeIntelServerState::Ready
+        && result.meta.completeness == crate::codeintel::CodeIntelCompleteness::Complete;
     let presentation = crate::tools::presentation_for_code_intel(action, &result);
-    (
-        ToolResult::new("code_intel", success, presentation.full.clone()),
-        Some(presentation),
-    )
+    let tool_result = ToolResult::new("code_intel", success, presentation.full.clone());
+    if cacheable {
+        if let Some((daemon, key, epoch)) = cache_slot {
+            daemon.store_code_intel(
+                key,
+                epoch,
+                crate::project_index::CachedCodeIntelOutcome {
+                    result: tool_result.clone(),
+                    presentation: Some(presentation.clone()),
+                },
+            );
+        }
+    }
+    (tool_result, Some(presentation))
+}
+
+fn code_intel_cache_key(request: &CodeIntelRequest) -> Option<(PathBuf, String)> {
+    match request {
+        CodeIntelRequest::Status { .. } => None,
+        CodeIntelRequest::Definition(q) => Some((
+            q.workspace.clone(),
+            format!(
+                "def|{}|{}:{}|{}|{}|{:?}|{:?}",
+                q.path.display(),
+                q.line,
+                q.column,
+                q.max_results,
+                q.offset,
+                q.symbol,
+                q.revision
+            ),
+        )),
+        CodeIntelRequest::References(q) => Some((
+            q.workspace.clone(),
+            format!(
+                "ref|{}|{}:{}|{}|{}|{:?}|{:?}",
+                q.path.display(),
+                q.line,
+                q.column,
+                q.max_results,
+                q.offset,
+                q.symbol,
+                q.revision
+            ),
+        )),
+        CodeIntelRequest::Hover(q) => Some((
+            q.workspace.clone(),
+            format!(
+                "hov|{}|{}:{}|{:?}",
+                q.path.display(),
+                q.line,
+                q.column,
+                q.symbol
+            ),
+        )),
+        CodeIntelRequest::Symbols(q) => Some((
+            q.workspace.clone(),
+            format!(
+                "sym|{:?}|{:?}|{:?}|{}|{}|{:?}",
+                q.path, q.server, q.query, q.max_results, q.offset, q.revision
+            ),
+        )),
+        CodeIntelRequest::Diagnostics(q) => Some((
+            q.workspace.clone(),
+            format!(
+                "diag|{:?}|{:?}|{}|{}",
+                q.path, q.server, q.include_info, q.max_results
+            ),
+        )),
+    }
 }
 
 pub(super) fn prepared_code_intel_request(
@@ -119,6 +205,9 @@ pub(super) fn admit_code_intel_output(
 /// of edits. Bounded so a silent server costs one short pause, not a stall.
 pub(super) const POST_EDIT_DIAGNOSTICS_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(1500);
+/// The wait once the server used two whole deadlines in a row.
+const POST_EDIT_DIAGNOSTICS_SHORT_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 impl Runtime {
     /// Runs one code_intel tool call against the installed CodeIntelligence
@@ -174,9 +263,9 @@ impl Runtime {
         let Some(code_intel) = self.code_intel.as_ref() else {
             return;
         };
-        let Some(absolute) = prepared.target_paths.first().cloned() else {
+        if prepared.target_paths.is_empty() {
             return;
-        };
+        }
         self.edited.record(&prepared.target_paths);
         let text = if outcome.receipt.effects_uncertain || outcome.receipt.fused_shell.is_some() {
             None
@@ -192,11 +281,26 @@ impl Runtime {
                 _ => None,
             }
         };
+        let target_paths = &prepared.target_paths;
+        if let Ok(daemon) = crate::project_index::for_workspace(cwd) {
+            for (idx, absolute) in target_paths.iter().enumerate() {
+                let bytes = if idx == 0 {
+                    text.as_ref().map(|u| u.text.as_bytes())
+                } else {
+                    None
+                };
+                daemon.notify_local_write(absolute, bytes);
+            }
+        }
         let synchronize = async {
-            if let Some(update) = text {
-                code_intel.notify_file_updated(cwd, &absolute, update).await;
-            } else {
-                code_intel.notify_file_changed(cwd, &absolute, None).await;
+            for (idx, absolute) in target_paths.iter().enumerate() {
+                if idx == 0 {
+                    if let Some(update) = text.clone() {
+                        code_intel.notify_file_updated(cwd, absolute, update).await;
+                        continue;
+                    }
+                }
+                code_intel.notify_file_changed(cwd, absolute, None).await;
             }
         };
         if let Some(cancellation) = &self.cancellation {
@@ -219,14 +323,25 @@ impl Runtime {
             return None;
         }
         let code_intel = self.code_intel.as_ref()?;
+        // A server that keeps using the whole deadline gets a short one; every
+        // fourth check tries the full one again, so a server that warmed up
+        // is trusted again.
+        let slow = self.edited.slow_checks;
+        let deadline = if slow >= 2 && slow % 4 != 0 {
+            POST_EDIT_DIAGNOSTICS_SHORT_DEADLINE
+        } else {
+            POST_EDIT_DIAGNOSTICS_DEADLINE
+        };
+        let started = std::time::Instant::now();
         let report = code_intel
-            .diagnostics_after_edits(
-                cwd,
-                &paths,
-                POST_EDIT_DIAGNOSTICS_DEADLINE,
-                self.cancellation.clone(),
-            )
-            .await?;
+            .diagnostics_after_edits(cwd, &paths, deadline, self.cancellation.clone())
+            .await;
+        self.edited.slow_checks = if started.elapsed() >= deadline {
+            slow.wrapping_add(1)
+        } else {
+            0
+        };
+        let report = report?;
         crate::codeintel::render_edit_diagnostics(&report, true)
             .map(|note| self.redact_sensitive(&note))
     }

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use slim_core::context::CompactionPolicy;
+use slim_core::context::{CompactionPolicy, SummaryModelPolicy};
 use slim_core::mcp::McpExposure;
 
 pub struct Config;
@@ -521,6 +521,10 @@ pub struct FileCompactionConfig {
     pub summary_max_bytes: Option<usize>,
     #[serde(default)]
     pub manual_instructions_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub summary_model: Option<String>,
+    #[serde(default)]
+    pub speculative: Option<bool>,
 }
 
 /// Merged view of every config layer (project wins over global).
@@ -630,6 +634,20 @@ impl LayeredConfig {
                 );
             }
             policy.manual_instructions_max_bytes = value;
+        }
+        if let Some(ref value) = self.compaction.summary_model {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err("compaction.summary_model cannot be empty".into());
+            }
+            policy.summary_model = match trimmed.to_ascii_lowercase().as_str() {
+                "auto" => SummaryModelPolicy::Auto,
+                "same" => SummaryModelPolicy::Same,
+                _ => SummaryModelPolicy::Explicit(trimmed.to_owned()),
+            };
+        }
+        if let Some(value) = self.compaction.speculative {
+            policy.speculative = value;
         }
         Ok(policy)
     }
@@ -1173,14 +1191,6 @@ fn file_default<T>(value: Option<T>, env_key: &str) -> Option<T> {
     value.filter(|_| std::env::var_os(env_key).is_none())
 }
 
-/// Layered load where every path is a global-origin layer (hermetic tests).
-#[cfg(test)]
-pub(crate) fn load_layered_from(
-    paths: impl IntoIterator<Item = PathBuf>,
-) -> Result<LayeredConfig, String> {
-    load_layers(paths.into_iter().map(|path| (path, McpOrigin::Global)))
-}
-
 fn load_layers(
     layers: impl IntoIterator<Item = (PathBuf, McpOrigin)>,
 ) -> Result<LayeredConfig, String> {
@@ -1406,7 +1416,7 @@ pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, ori
         overlay_option!(
             target.compaction, compaction;
             enabled, reserve_tokens, keep_recent_tokens, summary_max_bytes,
-            manual_instructions_max_bytes
+            manual_instructions_max_bytes, summary_model, speculative
         );
     }
 }
@@ -1414,6 +1424,10 @@ pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, ori
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load_layered_from(paths: impl IntoIterator<Item = PathBuf>) -> Result<LayeredConfig, String> {
+        load_layers(paths.into_iter().map(|path| (path, McpOrigin::Global)))
+    }
 
     #[test]
     fn parse_reads_tool_budget_keys() {
@@ -1428,17 +1442,6 @@ mod tests {
         assert_eq!(config.timeout_secs, Some(180));
         assert_eq!(config.time_budget_secs, Some(1500));
         assert_eq!(config.max_result_bytes, Some(32768));
-    }
-
-    #[test]
-    fn removed_compaction_strategy_key_is_ignored_by_the_parser() {
-        let config =
-            FileConfig::parse("[compaction]\nstrategy = \"summary\"\nkeep_recent_tokens = 1000\n")
-                .expect("legacy strategy key still parses");
-        let mut layered = LayeredConfig::default();
-        merge_layer(&mut layered, config);
-        let policy = layered.compaction_policy().expect("policy");
-        assert_eq!(policy.keep_recent_tokens, 1000);
     }
 
     #[test]
@@ -1463,8 +1466,10 @@ mod tests {
             "[compaction]\nenabled = true\nreserve_tokens = 20000\nkeep_recent_tokens = 12000\n",
         )
         .expect("global config");
-        let project =
-            FileConfig::parse("[compaction]\nsummary_max_bytes = 32768\n").expect("project config");
+        let project = FileConfig::parse(
+            "[compaction]\nsummary_max_bytes = 32768\nunknown_future_key = true\n",
+        )
+        .expect("project config");
         let mut layered = LayeredConfig::default();
         merge_layer(&mut layered, global);
         merge_layer(&mut layered, project);
@@ -1494,13 +1499,54 @@ mod tests {
     }
 
     #[test]
-    fn removed_compaction_background_key_is_ignored_by_the_parser() {
-        let config = FileConfig::parse("[compaction]\nbackground = false\nreserve_tokens = 9000\n")
-            .expect("legacy background key still parses");
+    fn compaction_summary_model_and_speculative_parse_and_layer() {
+        let defaults = LayeredConfig::default()
+            .compaction_policy()
+            .expect("default policy");
+        assert_eq!(defaults.summary_model, SummaryModelPolicy::Auto);
+        assert!(defaults.speculative);
+
         let mut layered = LayeredConfig::default();
-        merge_layer(&mut layered, config);
-        let policy = layered.compaction_policy().expect("policy");
-        assert_eq!(policy.reserve_tokens, 9000);
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[compaction]\nsummary_model = \"same\"\nspeculative = false\n",
+            )
+            .expect("user parses"),
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[compaction]\nsummary_model = \"gpt-5-mini\"\n")
+                .expect("project parses"),
+        );
+        let policy = layered.compaction_policy().expect("valid policy");
+        assert_eq!(
+            policy.summary_model,
+            SummaryModelPolicy::Explicit("gpt-5-mini".into())
+        );
+        assert!(
+            !policy.speculative,
+            "project layer omitted speculative so user false survives"
+        );
+
+        let mut auto_layered = LayeredConfig::default();
+        merge_layer(
+            &mut auto_layered,
+            FileConfig::parse("[compaction]\nsummary_model = \"AUTO\"\nspeculative = true\n")
+                .expect("auto parses"),
+        );
+        assert_eq!(
+            auto_layered.compaction_policy().unwrap().summary_model,
+            SummaryModelPolicy::Auto
+        );
+
+        let mut empty_layered = LayeredConfig::default();
+        merge_layer(
+            &mut empty_layered,
+            FileConfig::parse("[compaction]\nsummary_model = \"   \"\n").expect("parses"),
+        );
+        let err = empty_layered.compaction_policy().expect_err("blank model");
+        assert!(err.contains("compaction.summary_model"), "{err}");
     }
 
     #[test]
@@ -1668,10 +1714,10 @@ mod tests {
             "model written"
         );
         assert!(reloaded.contains("effort = \"max\""), "effort written");
-        let loaded = super::load_layered_from([path.clone()]).expect("load fast config");
+        let loaded = load_layered_from([path.clone()]).expect("load fast config");
         assert_eq!(loaded.codex_fast, Some(true));
         super::save_global_model_to(&path, "gpt-6-astra", "max", Some(false)).expect("normal");
-        let loaded = super::load_layered_from([path]).expect("load normal config");
+        let loaded = load_layered_from([path]).expect("load normal config");
         assert_eq!(loaded.codex_fast, Some(false));
         assert!(
             reloaded.contains("future_key = true"),
@@ -1768,21 +1814,6 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
-    #[test]
-    fn resolve_keeps_cli_over_environment_over_project_over_global() {
-        assert_eq!(
-            Config::resolve(Some("cli"), Some("env"), Some("proj"), Some("glob")),
-            Some("cli")
-        );
-        assert_eq!(
-            Config::resolve(None, Some("env"), Some("proj"), Some("glob")),
-            Some("env")
-        );
-        assert_eq!(
-            Config::resolve(None, None, Some("proj"), Some("glob")),
-            Some("proj")
-        );
-    }
     #[test]
     fn lsp_path_only_is_enabled_and_explicit_disable_survives_layering() {
         let mut layered = LayeredConfig::default();

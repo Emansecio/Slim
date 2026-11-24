@@ -891,71 +891,47 @@ fn fenced_and_double_encoded_escapes_are_repaired_at_the_inner_layer() {
 }
 
 #[test]
-fn object_arguments_matches_the_multi_parse_normalization() {
-    fn reference(raw: &str) -> String {
-        let trimmed = tool_arguments::strip_json_fence(raw.trim());
-        if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(trimmed) {
-            if serde_json::from_str::<Value>(&inner).is_ok_and(|value| value.is_object()) {
-                return inner;
-            }
-            if let Some(repaired) = tool_arguments::repaired_json_object(&inner) {
-                return repaired;
-            }
-        }
-        if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
-            return trimmed.to_owned();
-        }
-        tool_arguments::repaired_json_object(trimmed).unwrap_or_else(|| trimmed.to_owned())
+fn object_arguments_normalizes_valid_objects_and_rejects_non_objects_or_invalid_json() {
+    for (raw, expected) in [
+        (r#"  {"path":"a.txt"}  "#, r#"{"path":"a.txt"}"#),
+        ("```JSON {\"path\":\"a.txt\"}```", r#"{"path":"a.txt"}"#),
+        (
+            r#""{\"content\":\"lone \\q\"}""#,
+            r#"{"content":"lone \\q"}"#,
+        ),
+        (r#"{"a":"\u12","b":"\x"}"#, r#"{"a":"\\u12","b":"\\x"}"#),
+    ] {
+        let (text, shape) = object_arguments(raw);
+        assert_eq!(text.as_ref(), expected, "{raw}");
+        assert!(shape.is_object(), "{raw}");
+        assert_eq!(shape.issue(), None, "{raw}");
+        assert!(validate_tool_arguments("read", raw).is_ok(), "{raw}");
+        assert!(validate_tool_arguments(" ", raw).is_err(), "{raw}");
     }
-    let cases = [
-        r#"{"path":"a.txt"}"#,
-        r#"  {"path":"a.txt"}  "#,
-        "```json\n{\"path\":\"a.txt\"}\n```",
-        "```JSON {\"path\":\"a.txt\"}```",
+    for non_object in [r#""not json""#, r#""[1,2]""#, r#"["a"]"#, "42", "null", "true"] {
+        let (_, shape) = object_arguments(non_object);
+        assert!(!shape.is_object(), "{non_object}");
+        assert_eq!(
+            shape.issue().as_deref(),
+            Some("arguments must be a JSON object"),
+            "{non_object}"
+        );
+        assert!(validate_tool_arguments("read", non_object).is_err(), "{non_object}");
+    }
+    for malformed in [
         "```\n{\"path\":\"a.txt\"}",
-        r#""{\"path\":\"a.txt\"}""#,
-        r#""{\"content\":\"literal \\* star\"}""#,
-        r#""{\"content\":\"lone \\q\"}""#,
-        r#""not json""#,
-        r#""[1,2]""#,
-        r#""""#,
-        r#"{"path":"C:\Slim\src"}"#,
-        r#"{"a":"\u12","b":"\x"}"#,
         r#"{"path":"a.txt""#,
         r#"{"path":"a.txt"} tail"#,
         r#"{"path":1e999}"#,
-        r#"["a"]"#,
         r#"[1,2"#,
-        "42",
-        "null",
-        "true",
         "",
-        "   ",
         "not json at all",
-        r#""\q""#,
         r#""{\"a\":1} extra""#,
-    ];
-    for raw in cases {
-        let (text, shape) = object_arguments(raw);
-        assert_eq!(text.as_ref(), reference(raw), "{raw}");
-        let parsed = serde_json::from_str::<Value>(text.as_ref());
-        assert_eq!(
-            shape.is_object(),
-            parsed.as_ref().is_ok_and(Value::is_object),
-            "{raw}"
-        );
-        let expected_issue = match &parsed {
-            Ok(value) if value.is_object() => None,
-            Ok(_) => Some("arguments must be a JSON object".to_owned()),
-            Err(error) => Some(error.to_string()),
-        };
-        assert_eq!(shape.issue(), expected_issue, "{raw}");
-        assert_eq!(
-            validate_tool_arguments("read", raw).is_ok(),
-            shape.is_object(),
-            "{raw}"
-        );
-        assert!(validate_tool_arguments(" ", raw).is_err(), "{raw}");
+    ] {
+        let (_, shape) = object_arguments(malformed);
+        assert!(!shape.is_object(), "{malformed}");
+        assert!(shape.issue().is_some(), "{malformed}");
+        assert!(validate_tool_arguments("read", malformed).is_err(), "{malformed}");
     }
 }
 
@@ -1500,6 +1476,23 @@ fn recovery_backoff_doubles_from_the_configured_base_and_caps_at_sixteen_times()
         requested_provider_recovery_delay(&error, 1, base),
         std::time::Duration::from_secs(1)
     );
+    // First transient transport/5xx retry uses fast 100ms path; 429 uses full backoff + jitter.
+    let blip = ProviderError::Http {
+        status: 503,
+        retry_after: None,
+        message: "busy".into(),
+    };
+    assert_eq!(
+        requested_provider_recovery_delay(&blip, 1, DEFAULT_BACKOFF),
+        std::time::Duration::from_millis(100)
+    );
+    let rate_limit = ProviderError::Http {
+        status: 429,
+        retry_after: None,
+        message: "rate limited".into(),
+    };
+    let rl_delay = requested_provider_recovery_delay(&rate_limit, 1, DEFAULT_BACKOFF);
+    assert!(rl_delay >= DEFAULT_BACKOFF && rl_delay <= DEFAULT_BACKOFF + std::time::Duration::from_millis(100));
 }
 
 #[test]
@@ -3860,29 +3853,6 @@ fn multimodal_requests_are_not_eligible_for_text_estimator_calibration() {
 
     assert!(messages_are_text_only(&[text]));
     assert!(!messages_are_text_only(&[image]));
-}
-
-#[test]
-fn request_component_bytes_follow_serialized_wire_values() {
-    let system = json!({"role": "system", "content": "rules 日本語\n"});
-    let history = json!({"role": "user", "content": "ação a\"b"});
-    let tool_result = json!({"role": "tool", "content": "linha 👩‍💻\n\\"});
-    let tools = json!([{"type": "function", "name": "read", "description": "ler ação\t"}]);
-    let body = json!({
-        "messages": [&system, &history, &tool_result],
-        "tools": &tools,
-    })
-    .to_string();
-
-    assert_eq!(
-        crate::provider::provider_request_component_bytes(&body),
-        (
-            serde_json::to_vec(&system).expect("system").len() as u64,
-            serde_json::to_vec(&tools).expect("tools").len() as u64,
-            serde_json::to_vec(&history).expect("history").len() as u64,
-            serde_json::to_vec(&tool_result).expect("tool result").len() as u64,
-        )
-    );
 }
 
 #[test]

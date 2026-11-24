@@ -973,6 +973,7 @@ pub enum EffortTarget {
     Xai(String),
     OpenDesign(String),
     Devin(String),
+    Anthropic(String),
 }
 
 impl EffortTarget {
@@ -986,6 +987,7 @@ impl EffortTarget {
             Self::Xai(_) => LoginProvider::Xai,
             Self::OpenDesign(_) => LoginProvider::OpenDesign,
             Self::Devin(_) => LoginProvider::Devin,
+            Self::Anthropic(_) => LoginProvider::Anthropic,
         }
     }
 }
@@ -1134,6 +1136,12 @@ pub struct AppState {
     pub inspector: InspectorState,
     pub search: Option<SearchState>,
     blocks: Vec<Block>,
+    /// Index of the most recent `BlockKind::User` block (or 0 when none exists).
+    active_turn_start: usize,
+    /// Lowest block index modified since the last `clear_dirty_from_block`.
+    dirty_from_block: usize,
+    /// `revisions.content` when `clear_dirty_from_block` last ran.
+    dirty_base_content_rev: u64,
     /// Index of the prompt block currently drawing the pending agent header.
     awaiting_agent: Option<usize>,
     /// Prompts sent in this conversation, oldest first (DESIGN §15.3: 100).
@@ -1153,6 +1161,8 @@ pub struct AppState {
     pub todo_items: Vec<crate::api::TodoItemView>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub input_tokens_overflowed: bool,
     pub output_tokens_overflowed: bool,
     pub context_tokens: u64,
@@ -1316,6 +1326,9 @@ impl Default for AppState {
             inspector: InspectorState::default(),
             search: None,
             blocks: Vec::new(),
+            active_turn_start: 0,
+            dirty_from_block: 0,
+            dirty_base_content_rev: 0,
             awaiting_agent: None,
             prompt_history: VecDeque::new(),
             history_cursor: None,
@@ -1329,6 +1342,8 @@ impl Default for AppState {
             todo_items: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_tokens_overflowed: false,
             output_tokens_overflowed: false,
             context_tokens: 0,
@@ -1537,12 +1552,6 @@ impl AppState {
         self.skills_revision
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_skill_names_for_test(&mut self, names: Vec<String>) {
-        self.skill_names = names;
-        self.skills_revision = self.skills_revision.wrapping_add(1);
-    }
-
     /// Workspace plus its already-discovered skill names (discovery runs off
     /// the UI thread, at the event producer).
     fn set_workspace(&mut self, cwd: String, skill_names: Vec<String>) {
@@ -1550,6 +1559,54 @@ impl AppState {
         if self.skill_names != skill_names {
             self.skill_names = skill_names;
             self.skills_revision = self.skills_revision.wrapping_add(1);
+        }
+    }
+
+    fn mark_blocks_dirty_from(&mut self, index: usize) {
+        self.dirty_from_block = self.dirty_from_block.min(index);
+    }
+
+    fn mark_blocks_removed(&mut self) {
+        self.dirty_from_block = 0;
+    }
+
+    pub(crate) fn dirty_from_block(&self) -> usize {
+        self.dirty_from_block
+    }
+
+    pub(crate) fn dirty_base_content_rev(&self) -> u64 {
+        self.dirty_base_content_rev
+    }
+
+    pub(crate) fn clear_dirty_from_block(&mut self) {
+        self.dirty_from_block = self.blocks.len();
+        self.dirty_base_content_rev = self.revisions.content;
+    }
+
+    pub(crate) fn active_turn_blocks(&self) -> &[Block] {
+        &self.blocks[self.active_turn_start.min(self.blocks.len())..]
+    }
+
+    fn recompute_active_turn_start(&mut self) {
+        self.active_turn_start = self
+            .blocks
+            .iter()
+            .rposition(|block| matches!(block.kind(), BlockKind::User(_)))
+            .unwrap_or(0);
+    }
+
+    fn note_block_inserted(&mut self, index: usize) {
+        if matches!(self.blocks[index].kind(), BlockKind::User(_)) {
+            if index >= self.active_turn_start {
+                self.active_turn_start = index;
+            }
+        } else if index <= self.active_turn_start
+            && self
+                .blocks
+                .get(self.active_turn_start + 1)
+                .is_some_and(|block| matches!(block.kind(), BlockKind::User(_)))
+        {
+            self.active_turn_start += 1;
         }
     }
 
@@ -1567,6 +1624,8 @@ impl AppState {
             .position(|existing| matches!(existing.kind(), BlockKind::QueuedUser(_)))
             .unwrap_or(self.blocks.len());
         self.blocks.insert(insertion, block);
+        self.note_block_inserted(insertion);
+        self.mark_blocks_dirty_from(insertion);
         self.queued_prompts.push_front(text);
         self.note_new_content();
         self.revisions.content += 1;
@@ -1758,6 +1817,8 @@ impl AppState {
             }
             self.blocks = folded;
         }
+        self.recompute_active_turn_start();
+        self.mark_blocks_removed();
         self.revisions.content += 1;
         self.revisions.status += 1;
         self.revisions.viewport += 1;
@@ -1775,6 +1836,8 @@ impl AppState {
         let mut row = Block::new(id, BlockKind::Work(work), BlockLifecycle::Complete);
         row.fold = FoldState::Collapsed;
         self.blocks.insert(at, row);
+        self.note_block_inserted(at);
+        self.mark_blocks_dirty_from(at);
     }
 
     pub fn push_notification(&mut self, message: String) {
@@ -1958,21 +2021,23 @@ impl AppState {
         &mut self,
         request_id: &InteractionRequestId,
     ) -> bool {
-        let changed = self
+        let changed_index = self
             .blocks
             .iter_mut()
+            .enumerate()
             .rev()
-            .find(|block| {
+            .find(|(_, block)| {
                 block.lifecycle == BlockLifecycle::Pending
                     && matches!(block.kind(), BlockKind::InteractionRequest(state)
                         if &state.request_id == request_id && state.acknowledgement.is_none())
             })
-            .is_some_and(Block::mark_interaction_response_pending);
-        if changed {
+            .and_then(|(index, block)| block.mark_interaction_response_pending().then_some(index));
+        if let Some(index) = changed_index {
+            self.mark_blocks_dirty_from(index);
             self.revisions.content += 1;
             self.revisions.status += 1;
         }
-        changed
+        changed_index.is_some()
     }
 
     pub(crate) fn move_question_selection(
@@ -1980,19 +2045,21 @@ impl AppState {
         request_id: &InteractionRequestId,
         forward: bool,
     ) -> bool {
-        let changed = self
+        let changed_index = self
             .blocks
             .iter_mut()
+            .enumerate()
             .rev()
-            .find(|block| {
+            .find(|(_, block)| {
                 matches!(block.kind(), BlockKind::InteractionRequest(state)
                 if &state.request_id == request_id && state.acknowledgement.is_none())
             })
-            .is_some_and(|block| block.move_question_selection(forward));
-        if changed {
+            .and_then(|(index, block)| block.move_question_selection(forward).then_some(index));
+        if let Some(index) = changed_index {
+            self.mark_blocks_dirty_from(index);
             self.revisions.content += 1;
         }
-        changed
+        changed_index.is_some()
     }
 
     pub(crate) fn select_question_option(
@@ -2000,38 +2067,44 @@ impl AppState {
         request_id: &InteractionRequestId,
         index: usize,
     ) -> bool {
-        let changed = self
+        let changed_index = self
             .blocks
             .iter_mut()
+            .enumerate()
             .rev()
-            .find(|block| {
+            .find(|(_, block)| {
                 matches!(block.kind(), BlockKind::InteractionRequest(state)
                 if &state.request_id == request_id && state.acknowledgement.is_none())
             })
-            .is_some_and(|block| block.select_question_option(index));
-        if changed {
+            .and_then(|(block_index, block)| {
+                block.select_question_option(index).then_some(block_index)
+            });
+        if let Some(block_index) = changed_index {
+            self.mark_blocks_dirty_from(block_index);
             self.revisions.content += 1;
         }
-        changed
+        changed_index.is_some()
     }
 
     pub(crate) fn activate_custom_question_answer(
         &mut self,
         request_id: &InteractionRequestId,
     ) -> bool {
-        let changed = self
+        let changed_index = self
             .blocks
             .iter_mut()
+            .enumerate()
             .rev()
-            .find(|block| {
+            .find(|(_, block)| {
                 matches!(block.kind(), BlockKind::InteractionRequest(state)
                 if &state.request_id == request_id && state.acknowledgement.is_none())
             })
-            .is_some_and(Block::activate_custom_question_answer);
-        if changed {
+            .and_then(|(index, block)| block.activate_custom_question_answer().then_some(index));
+        if let Some(index) = changed_index {
+            self.mark_blocks_dirty_from(index);
             self.revisions.content += 1;
         }
-        changed
+        changed_index.is_some()
     }
 
     pub(crate) fn record_question_answer(
@@ -2039,16 +2112,18 @@ impl AppState {
         request_id: &InteractionRequestId,
         answer: String,
     ) {
-        let changed = self
+        let changed_index = self
             .blocks
             .iter_mut()
+            .enumerate()
             .rev()
-            .find(|block| {
+            .find(|(_, block)| {
                 matches!(block.kind(), BlockKind::InteractionRequest(state)
                 if &state.request_id == request_id)
             })
-            .is_some_and(|block| block.record_question_answer(answer));
-        if changed {
+            .and_then(|(index, block)| block.record_question_answer(answer).then_some(index));
+        if let Some(index) = changed_index {
+            self.mark_blocks_dirty_from(index);
             self.revisions.content += 1;
         }
     }
@@ -2164,6 +2239,7 @@ impl AppState {
                 });
             if let Some((start, _)) = tool_group {
                 self.blocks[start].group_expanded = true;
+                self.mark_blocks_dirty_from(start);
                 return (self.toggle_block(id), None);
             }
             let target = crate::block::consecutive_complete_thinking_span(&self.blocks, index)
@@ -2184,6 +2260,7 @@ impl AppState {
                 anchor.block_id = leader.id.clone();
                 anchor.row_offset = 0;
             }
+            self.mark_blocks_dirty_from(start);
             self.revisions.fold += 1;
             return (true, None);
         }
@@ -2209,6 +2286,7 @@ impl AppState {
                     anchor.block_id = leader_id;
                     anchor.row_offset = 0;
                 }
+                self.mark_blocks_dirty_from(start);
                 self.revisions.fold += 1;
                 return (true, None);
             }
@@ -2224,6 +2302,7 @@ impl AppState {
 
         if !was_expanded {
             self.blocks[index].fold = FoldState::Expanded;
+            self.mark_blocks_dirty_from(index);
             self.revisions.fold += 1;
             if has_materialized_output || pending || handle.is_none() {
                 return (true, None);
@@ -2232,6 +2311,7 @@ impl AppState {
             return (false, None);
         } else if (has_materialized_output && next_cursor.is_none()) || handle.is_none() {
             self.blocks[index].fold = FoldState::Collapsed;
+            self.mark_blocks_dirty_from(index);
             self.revisions.fold += 1;
             return (true, None);
         }
@@ -2256,6 +2336,7 @@ impl AppState {
             .expect("tool checked above");
         tool.pending_page = Some(PendingContentPage { request_id, cursor });
         self.blocks[index].touch_tool_content();
+        self.mark_blocks_dirty_from(index);
         self.revisions.content += 1;
         let command = UiCommand::RequestContentPage {
             handle: handle.expect("tool handle checked above"),
@@ -2280,7 +2361,10 @@ impl AppState {
             block.set_turn_boundary_before(true);
         }
         let prompt_id = matches!(block.kind(), BlockKind::User(_)).then(|| block.id.clone());
+        let pushed_index = self.blocks.len();
         self.blocks.push(block);
+        self.note_block_inserted(pushed_index);
+        self.mark_blocks_dirty_from(pushed_index);
         self.note_new_content();
         if self.scroll.is_live_edge() {
             if let Some(prompt_id) = prompt_id {
@@ -2316,7 +2400,9 @@ impl AppState {
             BlockLifecycle::Complete,
         );
         block.started_ms = Some(self.clock.elapsed_ms);
+        let pushed_index = self.blocks.len();
         self.blocks.push(block);
+        self.mark_blocks_dirty_from(pushed_index);
         self.queued_prompts.push_back(text);
         self.note_new_content();
         self.revisions.content += 1;
@@ -2345,6 +2431,12 @@ impl AppState {
         if let Some(block_index) = block_index {
             let block = self.blocks.remove(block_index);
             self.block_ids.remove(&block.id.0);
+            if block_index < self.active_turn_start {
+                self.active_turn_start -= 1;
+            } else if block_index == self.active_turn_start {
+                self.recompute_active_turn_start();
+            }
+            self.mark_blocks_removed();
         }
         self.revisions.content += 1;
         Some(prompt)
@@ -2367,6 +2459,12 @@ impl AppState {
         {
             let block = self.blocks.remove(index);
             self.block_ids.remove(&block.id.0);
+            if index < self.active_turn_start {
+                self.active_turn_start -= 1;
+            } else if index == self.active_turn_start {
+                self.recompute_active_turn_start();
+            }
+            self.mark_blocks_removed();
             self.revisions.content += 1;
         }
         Some(prompt)
@@ -2382,7 +2480,7 @@ impl AppState {
             .map(|(_, _, name)| name.clone())
             .collect();
         names.extend(
-            self.blocks
+            self.active_turn_blocks()
                 .iter()
                 .filter(|block| block.lifecycle == BlockLifecycle::Pending)
                 .filter_map(|block| match block.kind() {
@@ -2394,7 +2492,7 @@ impl AppState {
     }
 
     fn running_tool_names(&self) -> Vec<String> {
-        self.blocks
+        self.active_turn_blocks()
             .iter()
             .filter(|block| block.lifecycle == BlockLifecycle::Streaming)
             .filter_map(|block| match block.kind() {
@@ -2493,11 +2591,13 @@ impl AppState {
             return;
         }
         let id = self.fresh_id("receipt");
+        let pushed_index = self.blocks.len();
         self.blocks.push(Block::new(
             id,
             BlockKind::Receipt(receipt),
             BlockLifecycle::Complete,
         ));
+        self.mark_blocks_dirty_from(pushed_index);
         self.note_new_content();
     }
 
@@ -2577,7 +2677,9 @@ impl AppState {
             BlockLifecycle::Pending,
         );
         block.started_ms = Some(self.clock.elapsed_ms);
+        let pushed_index = self.blocks.len();
         self.blocks.push(block);
+        self.mark_blocks_dirty_from(pushed_index);
         self.approval_scroll = InspectorScroll::default();
         self.approval_content_accessible = false;
         self.slash_suggestions = None;
@@ -2605,18 +2707,25 @@ impl AppState {
         accepted: bool,
         message: String,
     ) {
-        let acknowledged = self
+        let ack_idx = self
             .blocks
-            .iter_mut()
+            .iter()
+            .enumerate()
             .rev()
-            .find(|block| {
+            .find(|(_, block)| {
                 block.lifecycle == BlockLifecycle::Pending
                     && matches!(block.kind(), BlockKind::InteractionRequest(state)
                         if &state.request_id == request_id && state.acknowledgement.is_none())
             })
-            .is_some_and(|block| block.acknowledge_interaction(accepted, message));
+            .map(|(index, _)| index);
+        let acknowledged = ack_idx.is_some_and(|index| {
+            self.blocks[index].acknowledge_interaction(accepted, message)
+        });
         if !acknowledged {
             return;
+        }
+        if let Some(index) = ack_idx {
+            self.mark_blocks_dirty_from(index);
         }
 
         if self.pending_interaction().is_some() {
@@ -2826,7 +2935,8 @@ impl AppState {
         // callers bump too, but the invariant lives here so a future caller
         // cannot forget it.
         self.revisions.content += 1;
-        for block in &mut self.blocks {
+        let mut first_dirty: Option<usize> = None;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
             if block.lifecycle == BlockLifecycle::Streaming
                 && matches!(
                     block.kind(),
@@ -2837,7 +2947,11 @@ impl AppState {
                 if lifecycle != BlockLifecycle::Streaming {
                     block.ended_ms = Some(self.clock.elapsed_ms);
                 }
+                first_dirty.get_or_insert(index);
             }
+        }
+        if let Some(index) = first_dirty {
+            self.mark_blocks_dirty_from(index);
         }
     }
 
@@ -2846,17 +2960,19 @@ impl AppState {
             return;
         };
         self.revisions.content += 1;
-        if let Some(block) = self.blocks.iter_mut().find(|block| {
+        if let Some(index) = self.blocks.iter().rposition(|block| {
             block.id == id
                 && matches!(
                     block.lifecycle,
                     BlockLifecycle::Streaming | BlockLifecycle::Complete
                 )
         }) {
+            let block = &mut self.blocks[index];
             block.lifecycle = lifecycle;
             if lifecycle != BlockLifecycle::Streaming {
                 block.ended_ms = Some(self.clock.elapsed_ms);
             }
+            self.mark_blocks_dirty_from(index);
         }
     }
 
@@ -3016,16 +3132,24 @@ impl AppState {
             return;
         }
         let mut changed = false;
+        let mut min_dirty = usize::MAX;
         if let Some(previous) = self.awaiting_agent.take() {
             if let Some(block) = self.blocks.get_mut(previous) {
-                changed |= block.set_awaiting_agent(false);
+                if block.set_awaiting_agent(false) {
+                    changed = true;
+                    min_dirty = min_dirty.min(previous);
+                }
             }
         }
         if let Some(index) = target {
-            changed |= self.blocks[index].set_awaiting_agent(true);
+            if self.blocks[index].set_awaiting_agent(true) {
+                changed = true;
+                min_dirty = min_dirty.min(index);
+            }
         }
         self.awaiting_agent = target;
         if changed {
+            self.mark_blocks_dirty_from(min_dirty);
             self.revisions.content += 1;
         }
     }
@@ -3444,6 +3568,7 @@ impl AppState {
                     );
                     if pending > 0 {
                         let id = self.fresh_id("pending-tasks");
+                        let pushed_index = self.blocks.len();
                         self.blocks.push(Block::new(
                             id,
                             BlockKind::System(format!(
@@ -3451,6 +3576,7 @@ impl AppState {
                             )),
                             BlockLifecycle::Complete,
                         ));
+                        self.mark_blocks_dirty_from(pushed_index);
                         self.note_new_content();
                     }
                     self.thinking_open = false;
@@ -3475,7 +3601,9 @@ impl AppState {
                     let mut block =
                         Block::new(id, BlockKind::System(message), BlockLifecycle::Complete);
                     block.fold = FoldState::Collapsed;
+                    let pushed_index = self.blocks.len();
                     self.blocks.push(block);
+                    self.mark_blocks_dirty_from(pushed_index);
                     self.note_new_content();
                     self.append_turn_receipt(crate::receipt::ReceiptOutcome::Interrupted);
                     self.turns_used = 0;
@@ -3523,11 +3651,13 @@ impl AppState {
                     } else {
                         message
                     };
+                    let pushed_index = self.blocks.len();
                     self.blocks.push(Block::new(
                         id,
                         BlockKind::Error(failure_message),
                         BlockLifecycle::Failed,
                     ));
+                    self.mark_blocks_dirty_from(pushed_index);
                     self.note_new_content();
                     self.revisions.content += 1;
                     self.revisions.status += 1;
@@ -3545,7 +3675,10 @@ impl AppState {
                     block.set_turn_boundary_before(true);
                 }
                 let prompt_id = block.id.clone();
+                let pushed_index = self.blocks.len();
                 self.blocks.push(block);
+                self.note_block_inserted(pushed_index);
+                self.mark_blocks_dirty_from(pushed_index);
                 self.note_new_content();
                 if self.scroll.is_live_edge() {
                     self.scroll.mode = FollowMode::LiveEdge {
@@ -3600,6 +3733,8 @@ impl AppState {
                     if lifecycle != BlockLifecycle::Streaming {
                         block.ended_ms = Some(self.clock.elapsed_ms);
                     }
+                    let dirty_index = self.blocks.len() - 1;
+                    self.mark_blocks_dirty_from(dirty_index);
                 } else {
                     let id = self.fresh_id("assistant");
                     let mut block = Block::new(id, BlockKind::Assistant(text), lifecycle);
@@ -3608,7 +3743,9 @@ impl AppState {
                     } else {
                         block.ended_ms = Some(self.clock.elapsed_ms);
                     }
+                    let pushed_index = self.blocks.len();
                     self.blocks.push(block);
+                    self.mark_blocks_dirty_from(pushed_index);
                 }
                 self.latest_run_assistant = self.blocks.last().map(|block| block.id.clone());
                 self.note_new_content();
@@ -3620,12 +3757,14 @@ impl AppState {
                 // RunCompleted may promote it to exact.
                 self.project_request_usage();
                 self.request_estimate_open = false;
-                if let Some(block) = self.blocks.iter_mut().rev().find(|block| {
+                if let Some(index) = self.blocks.iter().rposition(|block| {
                     block.lifecycle == BlockLifecycle::Streaming
                         && matches!(block.kind(), BlockKind::Assistant(_))
                 }) {
+                    let block = &mut self.blocks[index];
                     block.lifecycle = BlockLifecycle::Complete;
                     block.ended_ms = Some(self.clock.elapsed_ms);
+                    self.mark_blocks_dirty_from(index);
                 }
                 self.revisions.content += 1;
             }
@@ -3667,11 +3806,13 @@ impl AppState {
                         let message =
                             "Lacuna no fluxo de raciocínio: o delta chegou antes do início; é necessária a ressincronização do snapshot";
                         let id = self.fresh_id("reasoning-gap");
+                        let pushed_index = self.blocks.len();
                         self.blocks.push(Block::new(
                             id,
                             BlockKind::Error(message.into()),
                             BlockLifecycle::Failed,
                         ));
+                        self.mark_blocks_dirty_from(pushed_index);
                         self.push_notification_with_priority(
                             message.into(),
                             NotificationPriority::Error,
@@ -3712,6 +3853,8 @@ impl AppState {
                     if block.reasoning_classification.is_none() {
                         block.reasoning_classification = classification;
                     }
+                    let dirty_index = self.blocks.len() - 1;
+                    self.mark_blocks_dirty_from(dirty_index);
                 } else {
                     let mut block = Block::new(
                         self.fresh_id("thinking"),
@@ -3725,31 +3868,37 @@ impl AppState {
                         block.ended_ms = Some(self.clock.elapsed_ms);
                     }
                     block.reasoning_classification = classification;
+                    let pushed_index = self.blocks.len();
                     self.blocks.push(block);
+                    self.mark_blocks_dirty_from(pushed_index);
                 }
                 self.note_new_content();
                 self.revisions.content += 1;
             }
             UiEvent::ThinkingClassificationChanged { classification } => {
                 self.reasoning_classification = Some(classification);
-                if let Some(block) = self.blocks.iter_mut().rev().find(|block| {
+                if let Some(index) = self.blocks.iter().rposition(|block| {
                     block.lifecycle == BlockLifecycle::Streaming
                         && matches!(block.kind(), BlockKind::Thinking(_))
                 }) {
-                    block.reasoning_classification = Some(classification);
+                    self.blocks[index].reasoning_classification = Some(classification);
+                    self.mark_blocks_dirty_from(index);
                 }
                 self.revisions.content += 1;
                 self.revisions.status += 1;
             }
             UiEvent::ThinkingEnded => {
                 let lifecycle_was_open = std::mem::take(&mut self.thinking_open);
-                if let Some(block) = self.blocks.iter_mut().rev().find(|block| {
+                if let Some(index) = self.blocks.iter().rposition(|block| {
                     block.lifecycle == BlockLifecycle::Streaming
                         && matches!(block.kind(), BlockKind::Thinking(_))
                 }) {
+                    let block = &mut self.blocks[index];
                     block.lifecycle = BlockLifecycle::Complete;
                     block.ended_ms = Some(self.clock.elapsed_ms);
+                    self.mark_blocks_dirty_from(index);
                 }
+                let before_len = self.blocks.len();
                 self.blocks.retain(|block| {
                     if let BlockKind::Thinking(text) = block.kind() {
                         !text.trim().is_empty()
@@ -3757,6 +3906,10 @@ impl AppState {
                         true
                     }
                 });
+                if self.blocks.len() != before_len {
+                    self.recompute_active_turn_start();
+                    self.mark_blocks_removed();
+                }
                 let was_thinking = matches!(
                     self.activity.as_ref().map(|activity| &activity.phase),
                     Some(ActivityPhase::Thinking)
@@ -3794,6 +3947,15 @@ impl AppState {
                 input_tokens,
                 output_tokens,
             } => self.note_request_usage(input_tokens, output_tokens, true),
+            UiEvent::UsageBreakdown {
+                cache_read_tokens,
+                cache_write_tokens,
+                ..
+            } => {
+                self.cache_read_tokens = self.cache_read_tokens.saturating_add(cache_read_tokens);
+                self.cache_write_tokens = self.cache_write_tokens.saturating_add(cache_write_tokens);
+                self.revisions.status += 1;
+            }
             UiEvent::RequestCompleted {
                 provider_latency_ms,
             } => self.recalculate_tok_per_sec(provider_latency_ms),
@@ -3976,13 +4138,16 @@ impl AppState {
                         next_cursor: None,
                         pending_page: None,
                         edit_diff: None,
+                        program_source: None,
                     }),
                     lifecycle,
                 );
                 if lifecycle == BlockLifecycle::Streaming {
                     block.started_ms = Some(self.clock.elapsed_ms);
                 }
+                let pushed_index = self.blocks.len();
                 self.blocks.push(block);
+                self.mark_blocks_dirty_from(pushed_index);
                 if lifecycle == BlockLifecycle::Streaming {
                     self.retry = None;
                     self.refresh_tool_activity();
@@ -4043,28 +4208,30 @@ impl AppState {
                 preview,
                 content_handle,
             } => {
-                let found =
-                    if let Some(block) = tool_block_mut(&mut self.blocks, &batch_id, &call_id) {
-                        block.set_tool_preview(preview);
-                        if let Some(state) = block.tool_state_mut() {
-                            // Process summaries are projected through the same
-                            // progress lane after ToolOutput. A missing handle
-                            // means "leave the existing inspector attachment";
-                            // only a newly supplied handle replaces it.
-                            if content_handle.is_some() {
-                                // A shell job can publish its final output through
-                                // the same handle as its launch acknowledgment.
-                                // Discard any page already loaded from that handle.
-                                state.materialized_output.clear();
-                                state.next_cursor = None;
-                                state.pending_page = None;
-                                state.content_handle = content_handle;
-                            }
+                let found = if let Some((index, block)) =
+                    tool_block_index_mut(&mut self.blocks, &batch_id, &call_id)
+                {
+                    block.set_tool_preview(preview);
+                    if let Some(state) = block.tool_state_mut() {
+                        // Process summaries are projected through the same
+                        // progress lane after ToolOutput. A missing handle
+                        // means "leave the existing inspector attachment";
+                        // only a newly supplied handle replaces it.
+                        if content_handle.is_some() {
+                            // A shell job can publish its final output through
+                            // the same handle as its launch acknowledgment.
+                            // Discard any page already loaded from that handle.
+                            state.materialized_output.clear();
+                            state.next_cursor = None;
+                            state.pending_page = None;
+                            state.content_handle = content_handle;
                         }
-                        true
-                    } else {
-                        false
-                    };
+                    }
+                    self.mark_blocks_dirty_from(index);
+                    true
+                } else {
+                    false
+                };
                 if !found {
                     self.lifecycle_anomaly(
                         "Progresso órfão do ciclo de vida da ferramenta ignorado",
@@ -4079,10 +4246,36 @@ impl AppState {
                 call_id,
                 diff,
             } => {
-                let found = tool_block_mut(&mut self.blocks, &batch_id, &call_id)
-                    .is_some_and(|block| block.set_tool_diff(diff));
+                let mut dirty_index = None;
+                let found = tool_block_index_mut(&mut self.blocks, &batch_id, &call_id)
+                    .is_some_and(|(index, block)| {
+                        dirty_index = Some(index);
+                        block.set_tool_diff(diff)
+                    });
+                if let Some(index) = dirty_index {
+                    self.mark_blocks_dirty_from(index);
+                }
                 if !found {
                     self.lifecycle_anomaly("Diff órfão do ciclo de vida da ferramenta ignorado");
+                }
+                self.revisions.content += 1;
+            }
+            UiEvent::ToolSource {
+                batch_id,
+                call_id,
+                source,
+            } => {
+                let mut dirty_index = None;
+                let found = tool_block_index_mut(&mut self.blocks, &batch_id, &call_id)
+                    .is_some_and(|(index, block)| {
+                        dirty_index = Some(index);
+                        block.set_tool_source(source)
+                    });
+                if let Some(index) = dirty_index {
+                    self.mark_blocks_dirty_from(index);
+                }
+                if !found {
+                    self.lifecycle_anomaly("Código órfão do ciclo de vida da ferramenta ignorado");
                 }
                 self.revisions.content += 1;
             }
@@ -4129,31 +4322,33 @@ impl AppState {
                         active_batch != &batch_id || active_call != &call_id
                     });
                 let mut duplicate_terminal = false;
-                let ended =
-                    if let Some(block) = tool_block_mut(&mut self.blocks, &batch_id, &call_id) {
-                        let transitioned = block.lifecycle == BlockLifecycle::Streaming;
-                        if transitioned {
-                            block.lifecycle = if success {
-                                BlockLifecycle::Complete
-                            } else {
-                                BlockLifecycle::Failed
-                            };
-                            block.ended_ms = Some(self.clock.elapsed_ms);
+                let ended = if let Some((index, block)) =
+                    tool_block_index_mut(&mut self.blocks, &batch_id, &call_id)
+                {
+                    let transitioned = block.lifecycle == BlockLifecycle::Streaming;
+                    if transitioned {
+                        block.lifecycle = if success {
+                            BlockLifecycle::Complete
+                        } else {
+                            BlockLifecycle::Failed
+                        };
+                        block.ended_ms = Some(self.clock.elapsed_ms);
+                    }
+                    if let Some(state) = block.tool_state_mut() {
+                        if state.duration_ms.is_none() {
+                            state.duration_ms = Some(duration_ms);
+                        } else {
+                            duplicate_terminal = true;
                         }
-                        if let Some(state) = block.tool_state_mut() {
-                            if state.duration_ms.is_none() {
-                                state.duration_ms = Some(duration_ms);
-                            } else {
-                                duplicate_terminal = true;
-                            }
-                        }
-                        transitioned
-                    } else {
-                        self.lifecycle_anomaly(
-                            "Finalização órfã do ciclo de vida da ferramenta ignorada",
-                        );
-                        false
-                    };
+                    }
+                    self.mark_blocks_dirty_from(index);
+                    transitioned
+                } else {
+                    self.lifecycle_anomaly(
+                        "Finalização órfã do ciclo de vida da ferramenta ignorada",
+                    );
+                    false
+                };
                 if duplicate_terminal {
                     self.lifecycle_anomaly(
                         "Finalização duplicada do ciclo de vida da ferramenta ignorada",
@@ -4287,7 +4482,9 @@ impl AppState {
                     BlockLifecycle::Pending,
                 );
                 block.started_ms = Some(self.clock.elapsed_ms);
+                let pushed_index = self.blocks.len();
                 self.blocks.push(block);
+                self.mark_blocks_dirty_from(pushed_index);
                 self.queued_prompts.push_back(text);
                 self.note_new_content();
                 self.revisions.content += 1;
@@ -4386,7 +4583,7 @@ impl AppState {
                 text,
                 next_cursor,
             } => {
-                let Some(block) = self.blocks.iter_mut().find(|block| {
+                let Some(block_index) = self.blocks.iter().rposition(|block| {
                     matches!(block.kind(), BlockKind::Tool(state)
                         if state.content_handle.as_ref() == Some(&handle)
                             && state.pending_page.as_ref().is_some_and(|pending|
@@ -4403,7 +4600,7 @@ impl AppState {
                         next.0 <= cursor_start || Some(next.0) != expected_next
                     });
                 if invalid_page {
-                    if let Some(state) = block.tool_state_mut() {
+                    if let Some(state) = self.blocks[block_index].tool_state_mut() {
                         state.pending_page = None;
                     }
                     self.push_notification_with_priority(
@@ -4411,10 +4608,11 @@ impl AppState {
                         NotificationPriority::Error,
                     );
                     self.revisions.status += 1;
-                } else if block.append_tool_page(&text, next_cursor) {
+                } else if self.blocks[block_index].append_tool_page(&text, next_cursor) {
+                    self.mark_blocks_dirty_from(block_index);
                     self.revisions.content += 1;
                 } else {
-                    if let Some(state) = block.tool_state_mut() {
+                    if let Some(state) = self.blocks[block_index].tool_state_mut() {
                         state.pending_page = None;
                     }
                     self.push_notification_with_priority(
@@ -4430,7 +4628,7 @@ impl AppState {
                 cursor,
                 message,
             } => {
-                let Some(block) = self.blocks.iter_mut().find(|block| {
+                let Some(block) = self.blocks.iter_mut().rev().find(|block| {
                     matches!(block.kind(), BlockKind::Tool(state)
                         if state.content_handle.as_ref() == Some(&handle)
                             && state.pending_page.as_ref().is_some_and(|pending|
@@ -4509,7 +4707,9 @@ impl AppState {
                 let id = self.fresh_id("compaction");
                 let mut block = Block::new(id, BlockKind::System(text), BlockLifecycle::Complete);
                 block.fold = FoldState::Collapsed;
+                let pushed_index = self.blocks.len();
                 self.blocks.push(block);
+                self.mark_blocks_dirty_from(pushed_index);
                 self.note_new_content();
                 self.revisions.content += 1;
             }
@@ -4540,16 +4740,21 @@ impl AppState {
                     // `thinking_open` alone (RunStarted resets it).
                     self.clear_run_state(explicitly_cancelled);
                     let id = self.fresh_id("error");
+                    let pushed_index = self.blocks.len();
                     self.blocks.push(Block::new(
                         id,
                         BlockKind::Error(message),
                         BlockLifecycle::Failed,
                     ));
+                    self.mark_blocks_dirty_from(pushed_index);
                     self.note_new_content();
                     self.revisions.content += 1;
                     self.revisions.status += 1;
                 }
             }
+            UiEvent::SubagentsChanged { .. }
+            | UiEvent::ContextTelemetry { .. }
+            | UiEvent::CacheDriftDetected { .. } => {}
             UiEvent::Shutdown => self.shutdown = true,
         }
     }
@@ -4561,7 +4766,18 @@ fn tool_block_mut<'a>(
     batch_id: &ToolBatchId,
     call_id: &ToolCallId,
 ) -> Option<&'a mut Block> {
-    blocks.iter_mut().find(|block| {
+    blocks.iter_mut().rev().find(|block| {
+        matches!(block.kind(), BlockKind::Tool(state)
+            if &state.batch_id == batch_id && &state.call_id == call_id)
+    })
+}
+
+fn tool_block_index_mut<'a>(
+    blocks: &'a mut [Block],
+    batch_id: &ToolBatchId,
+    call_id: &ToolCallId,
+) -> Option<(usize, &'a mut Block)> {
+    blocks.iter_mut().enumerate().rev().find(|(_, block)| {
         matches!(block.kind(), BlockKind::Tool(state)
             if &state.batch_id == batch_id && &state.call_id == call_id)
     })
@@ -4589,4 +4805,74 @@ impl InteractionRequestState {
 
 fn format_run_failure_message(message: &str) -> String {
     format!("{message}\nEnvie uma nova mensagem nesta conversa para continuar.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_turn_blocks_tracks_mutations_and_tool_queries_across_turns() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::UserMessageAdded {
+            text: "turn 1".into(),
+        });
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: ToolBatchId("b1".into()),
+            call_id: ToolCallId("c1".into()),
+            name: "read".into(),
+            arguments_summary: "path=a.rs".into(),
+        });
+        assert_eq!(state.running_tool_names(), vec!["read".to_string()]);
+
+        // Turn 2 starts: turn 1's running tool is outside active_turn_blocks.
+        state.apply_event(UiEvent::UserMessageAdded {
+            text: "turn 2".into(),
+        });
+        assert_eq!(state.running_tool_names(), Vec::<String>::new());
+
+        state.apply_event(UiEvent::ToolAdmitted {
+            batch_id: ToolBatchId("b2".into()),
+            call_id: ToolCallId("c0".into()),
+            name: "write".into(),
+        });
+        assert_eq!(state.queued_tool_names(), vec!["write".to_string()]);
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: ToolBatchId("b2".into()),
+            call_id: ToolCallId("c2".into()),
+            name: "shell".into(),
+            arguments_summary: "command=ls".into(),
+        });
+        assert_eq!(state.running_tool_names(), vec!["shell".to_string()]);
+
+        // Inserting and removing a queued prompt keeps turn 2's running tool active.
+        state.enqueue_queued_prompt_front("queued".into());
+        assert_eq!(state.running_tool_names(), vec!["shell".to_string()]);
+
+        let removed = state.remove_queued_prompt(0);
+        assert_eq!(removed.as_deref(), Some("queued"));
+        assert_eq!(state.running_tool_names(), vec!["shell".to_string()]);
+
+        // Reverse tool lookup finds the newest matching block and updates it.
+        let found = tool_block_mut(
+            &mut state.blocks,
+            &ToolBatchId("b2".into()),
+            &ToolCallId("c2".into()),
+        );
+        assert!(found.is_some());
+
+        // SessionRestored recomputes active_turn_start accurately.
+        state.apply_event(UiEvent::SessionRestored {
+            session_id: SessionId("s1".into()),
+            cwd: "/tmp".into(),
+            messages: vec![
+                TranscriptMessage {
+                    role: TranscriptRole::User,
+                    text: "restored turn".into(),
+                },
+            ],
+            skill_names: Vec::new(),
+        });
+        assert_eq!(state.active_turn_blocks().len(), 1);
+    }
 }

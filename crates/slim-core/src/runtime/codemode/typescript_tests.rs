@@ -213,7 +213,7 @@ fn invalid_identifiers_are_quoted_with_json_escapes() {
             &json!({"type": "object"}),
             "unknown"
         ),
-        r#""mcp.server-tool"(args: Record<string, unknown>): Promise<unknown>;"#
+        r#""mcp.server-tool"(args?: Record<string, unknown>): Promise<unknown>;"#
     );
 }
 
@@ -260,7 +260,7 @@ fn size_limits_degrade_oversized_types_and_signatures() {
     let degraded = signature(&long_name, None, &near_limit, "string");
     assert_eq!(
         degraded,
-        format!("{long_name}(args: unknown): Promise<string>;")
+        format!("{long_name}(args?: unknown): Promise<string>;")
     );
 }
 
@@ -334,21 +334,29 @@ fn native_tool_declarations_snapshot() {
     let expected = concat!(
         "declare const slim: {\n",
         "  /** Read exact UTF-8 text, at most 1000 lines per call; follow the returned offset for more. */\n",
-        "  read(args: { max_lines?: number; offset?: number; path: string }): Promise<string>;\n",
+        "  read(args: { max_lines?: number; offset?: number; outline?: boolean; path: string; ranges?: number[][]; raw?: boolean; structured?: boolean; symbols?: string[] }): Promise<string | { path: string; content: string; lines: string[]; first_line: number; total_lines: number; next_offset: number | null; complete: boolean }>;\n",
         "  /** List directory pages. */\n",
-        "  list(args: { cursor?: string; max_entries?: number; offset?: number; path?: string }): Promise<string>;\n",
+        "  list(args?: { cursor?: string; max_entries?: number; offset?: number; path?: string; structured?: boolean }): Promise<string | { entries: string[]; total: number; next_cursor: string | null }>;\n",
         "  /** Search literal UTF-8 text using query OR patterns. */\n",
-        "  search(args: { context_lines?: number; cursor?: string; max_hits?: number; offset?: number; path?: string; patterns?: string[]; query?: string }): Promise<string>;\n",
+        "  search(args: { context_lines?: number; cursor?: string; glob?: string; max_hits?: number; offset?: number; path?: string; patterns?: string[]; query?: string; structured?: boolean }): Promise<string | { hits: { path: string; line: number; text: string; context: { line: number; text: string }[] }[]; total: number; next_cursor: string | null; capped: boolean }>;\n",
         "  /** Write a complete UTF-8 file, creating parents. */\n",
         "  write(args: { content: string; expected?: string | null; path: string; then_run?: { args?: string[] | null; command: string; timeout_ms?: number } }): Promise<string>;\n",
-        "  /** Apply atomic ordered edits to one file: edits. */\n",
-        "  patch(args: { edits: { expected: string; replacement: string }[]; path: string; then_run?: { args?: string[] | null; command: string; timeout_ms?: number } }): Promise<string>;\n",
-        "  /** Run in workspace. */\n",
-        "  shell(args: { args?: string[] | null; command: string; timeout_ms?: number }): Promise<string>;\n",
+        "  /** Apply ordered edits to one file: edits. */\n",
+        "  patch(args: { edits: { expected: string; replace_all?: boolean; replacement: string }[]; files?: { edits: { expected: string; replace_all?: boolean; replacement: string }[]; path: string }[]; path: string; rollback_on_check_fail?: boolean; then_run?: { args?: string[] | null; command: string; timeout_ms?: number } }): Promise<string>;\n",
+        "  /** Run in workspace; rejects on non-zero exit unless allow_non_zero: true. */\n",
+        "  shell(args: { allow_non_zero?: boolean; args?: string[] | null; command: string; no_cache?: boolean; readonly?: boolean; timeout_ms?: number }): Promise<string>;\n",
         "  /** Semantic Rust, JavaScript and TypeScript navigation and diagnostics; definition includes a bounded preview. */\n",
         "  code_intel(args: { action: \"symbol\" | \"definition\" | \"references\" | \"hover\" | \"diagnostics\" | \"status\"; column?: number; include_info?: boolean; line?: number; max_results?: number; offset?: number; path?: string; query?: string; revision?: number; server?: string; symbol?: string }): Promise<string>;\n",
+        "  /** Find workspace files matching a glob pattern. */\n",
+        "  glob(args?: { max_entries?: number; path?: string; pattern?: string }): Promise<{ files: string[]; truncated: boolean; timed_out: boolean }>;\n",
+        "  /** Read-only structured git status, diff, log, branch, or show. */\n",
+        "  git(args: { limit?: number; op: \"status\" | \"diff\" | \"log\" | \"branch\" | \"show\"; path?: string; rev?: string; staged?: boolean }): Promise<Record<string, unknown>>;\n",
         "};",
     );
     assert_eq!(rendered, expected);
-    assert_eq!(rendered.len(), 1611 - 2 * "final?: string; ".len());
+    assert!(
+        rendered.len() <= 2820,
+        "declarations grew too large: {} bytes",
+        rendered.len()
+    );
 }

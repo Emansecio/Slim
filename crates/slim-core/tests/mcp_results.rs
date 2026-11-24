@@ -632,6 +632,9 @@ fn mcp_runtime(result: Value, artifacts: Option<&std::path::Path>) -> Runtime {
             description: None,
             schema: json!({"type": "object"}),
             output_schema: None,
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
         }],
     );
     let mut runtime = match artifacts {

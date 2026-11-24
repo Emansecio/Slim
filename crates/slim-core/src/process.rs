@@ -469,12 +469,14 @@ impl ProcessRunner {
             ..PipeProgress::default()
         }));
         let stop_reading = CancellationToken::new();
+        let caller_thread = std::thread::current();
         let stdout_reader = spawn_pipe_reader(
             stdout,
             PipeKind::Stdout,
             request.output_budget.stdout_bytes,
             Arc::clone(&progress),
             stop_reading.clone(),
+            Some(caller_thread.clone()),
         );
         let stderr_reader = spawn_pipe_reader(
             stderr,
@@ -482,6 +484,7 @@ impl ProcessRunner {
             request.output_budget.stderr_bytes,
             Arc::clone(&progress),
             stop_reading.clone(),
+            Some(caller_thread),
         );
         #[cfg(all(test, windows))]
         performance::mark("readers_spawned");
@@ -591,7 +594,7 @@ impl ProcessRunner {
                     wait,
                 )?;
                 #[cfg(not(windows))]
-                std::thread::sleep(wait);
+                std::thread::park_timeout(wait);
             }
         })();
         #[cfg(all(test, windows))]
@@ -898,14 +901,14 @@ fn ready_bytes(pipe: &impl PipeHandle) -> io::Result<usize> {
 }
 
 #[cfg(unix)]
-fn ready_bytes(pipe: &impl PipeHandle) -> io::Result<usize> {
+fn ready_bytes(pipe: &impl PipeHandle, timeout_ms: libc::c_int) -> io::Result<usize> {
     let mut descriptor = libc::pollfd {
         fd: pipe.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: descriptor points to one initialized pollfd and the timeout is zero.
-    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    // SAFETY: descriptor points to one initialized pollfd and timeout_ms is a valid c_int.
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -948,14 +951,25 @@ impl PipeProgress {
     }
 }
 
+struct UnparkOnDrop(Option<std::thread::Thread>);
+
+impl Drop for UnparkOnDrop {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            thread.unpark();
+        }
+    }
+}
+
 fn spawn_pipe_reader(
     pipe: impl Read + PipeHandle + Send + 'static,
     kind: PipeKind,
     budget: usize,
     progress: Arc<Mutex<PipeProgress>>,
     stop_reading: CancellationToken,
+    notify: Option<std::thread::Thread>,
 ) -> JoinHandle<io::Result<PipeCapture>> {
-    std::thread::spawn(move || read_pipe(pipe, kind, budget, progress, stop_reading))
+    std::thread::spawn(move || read_pipe(pipe, kind, budget, progress, stop_reading, notify))
 }
 
 fn read_pipe(
@@ -964,7 +978,9 @@ fn read_pipe(
     budget: usize,
     progress: Arc<Mutex<PipeProgress>>,
     stop_reading: CancellationToken,
+    notify: Option<std::thread::Thread>,
 ) -> io::Result<PipeCapture> {
+    let _unpark_on_exit = UnparkOnDrop(notify);
     #[cfg(all(test, windows))]
     performance::mark(match kind {
         PipeKind::Stdout => "stdout_start",
@@ -985,6 +1001,20 @@ fn read_pipe(
                 break;
             }
         }
+        #[cfg(unix)]
+        let available = {
+            let timeout_ms = if drain_deadline.is_some() {
+                0
+            } else {
+                CANCELLATION_POLL_INTERVAL.as_millis() as libc::c_int
+            };
+            match ready_bytes(&pipe, timeout_ms) {
+                Ok(available) => available,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        #[cfg(not(unix))]
         let available = match ready_bytes(&pipe) {
             Ok(available) => available,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -996,7 +1026,7 @@ fn read_pipe(
             }
             #[cfg(windows)]
             std::thread::park_timeout(CANCELLATION_POLL_INTERVAL);
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(unix)))]
             std::thread::sleep(CANCELLATION_POLL_INTERVAL);
             continue;
         }
@@ -1242,6 +1272,7 @@ mod tests {
             1024,
             Arc::new(Mutex::new(PipeProgress::default())),
             stop,
+            None,
         );
         let _ = child.kill();
         let _ = child.wait();
@@ -1254,6 +1285,37 @@ mod tests {
                 .any(|window| window == b"pipe-marker-before-cancel"),
             "already-written marker was lost"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_pipe_drains_buffered_bytes_on_hup_and_unparks_caller() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf 'hello-hup\\n'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn writer");
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let status = child.wait().expect("wait writer");
+        assert!(status.success());
+
+        // Spawn reader on a separate thread after writer closed (POLLIN | POLLHUP);
+        // verify it drains buffered bytes and unparks this thread via its Drop guard.
+        let started = Instant::now();
+        let reader = spawn_pipe_reader(
+            stdout,
+            PipeKind::Stdout,
+            1024,
+            Arc::new(Mutex::new(PipeProgress::default())),
+            CancellationToken::new(),
+            Some(std::thread::current()),
+        );
+        while !reader.is_finished() && started.elapsed() < Duration::from_secs(2) {
+            std::thread::park_timeout(Duration::from_secs(1));
+        }
+        assert!(reader.is_finished(), "reader did not unpark/finish in time");
+        let capture = reader.join().expect("join").expect("pipe capture");
+        assert_eq!(capture.bytes, b"hello-hup\n");
     }
 
     #[test]

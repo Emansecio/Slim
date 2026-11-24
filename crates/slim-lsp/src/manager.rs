@@ -662,8 +662,6 @@ impl LspCodeIntelligence {
         let path = documents.resolve_path(path)?;
         if let Some((version, content)) = instance.document_content_snapshot_async(&path).await {
             if content.stamp_matches_path(&path) {
-                #[cfg(test)]
-                crate::document::read_metrics::store_hit();
                 documents.remember(path.clone(), Arc::clone(&content));
                 return Some(SyncedDocument {
                     path,
@@ -696,8 +694,6 @@ impl LspCodeIntelligence {
         }
         if let Some((_version, content)) = instance.document_content_snapshot_async(&path).await {
             if content.stamp_matches_path(&path) {
-                #[cfg(test)]
-                crate::document::read_metrics::store_hit();
                 documents.remember(path.clone(), Arc::clone(&content));
                 return Some((path, content));
             }
@@ -1026,6 +1022,39 @@ impl CodeIntelligence for LspCodeIntelligence {
             ),
             payload: json!({"servers":servers,"summary":if stopped {"language servers shut down"} else {"native language servers start automatically on semantic queries; configured does not mean running"}}),
         }
+    }
+
+    async fn prewarm_file(
+        &self,
+        workspace: &Path,
+        path: &Path,
+        allow_spawn: bool,
+        cancellation: Option<slim_core::runtime::CancellationToken>,
+    ) {
+        if cancellation
+            .as_ref()
+            .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+        {
+            return;
+        }
+        let Ok(resolved) = self.resolve(workspace, Some(path), None) else {
+            return;
+        };
+        let instance: Arc<crate::instance::LspServerInstance> = if allow_spawn {
+            let Ok(acq) = self.acquire(resolved, cancellation.as_ref()).await else {
+                return;
+            };
+            Arc::clone(acq.lease.instance())
+        } else {
+            let Some(lease) = self.acquire_warm(&resolved).await else {
+                return;
+            };
+            Arc::clone(lease.instance())
+        };
+        let root = instance.root().to_path_buf();
+        let rev = self.workspace_revision(&root, &instance.spec().id);
+        let mut docs = OperationDocuments::new(&root, rev);
+        let _ = Self::ensure_document(&instance, &mut docs, path).await;
     }
 
     async fn definition(&self, query: &CodeIntelPositionQuery) -> CodeIntelOutcome {
@@ -2585,180 +2614,5 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(second.text(), "fn first() {}\n");
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    #[ignore = "manual release measurement; build slim-lsp-mock first; no network"]
-    async fn measure_existing_references_utility() {
-        use slim_core::provider::{
-            OpenAiCodexAdapter, ProviderAdapter, ProviderConfig, ProviderMessage,
-        };
-        let binary = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("slim-lsp-mock{}", std::env::consts::EXE_SUFFIX));
-        assert!(
-            binary.is_file(),
-            "build the slim-lsp-mock binary in the same profile first"
-        );
-        let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
-            "http://127.0.0.1:1",
-            "fixture-model",
-            "fixture-token",
-            "fixture-account",
-        ))
-        .unwrap();
-        for count in [3_usize, 50, 300] {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "slim-reference-utility-{}-{nonce}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(root.join("src")).unwrap();
-            let root = std::fs::canonicalize(root).unwrap();
-            std::fs::write(
-                root.join("Cargo.toml"),
-                "[package]\nname='ref-utility'\nversion='0.1.0'\nedition='2021'\n",
-            )
-            .unwrap();
-            let source = root.join("src/lib.rs");
-            std::fs::write(&source, "pub fn target(value: usize) {}\n").unwrap();
-            let file_count = count.min(5);
-            let mut texts = vec![String::new(); file_count];
-            let paths = (0..file_count)
-                .map(|i| root.join(format!("src/use_{i}.rs")))
-                .collect::<Vec<_>>();
-            let mut locations = Vec::new();
-            for i in 0..count {
-                let file = i % file_count;
-                let line = (i / file_count) as u32;
-                let text = format!("fn caller_{i}() {{ target({i}); }}\r\n");
-                let column = text.find("target").unwrap();
-                texts[file].push_str(&text);
-                locations.push(json!({"uri":url::Url::from_file_path(&paths[file]).unwrap().as_str(),
-                    "range":{"start":{"line":line,"character":column},"end":{"line":line,"character":column+6}}}));
-            }
-            for (path, text) in paths.iter().zip(&texts) {
-                std::fs::write(path, text).unwrap();
-            }
-            let log = root.join("wire.jsonl");
-            let manager = LspCodeIntelligence::from_config(LspManagerConfig {
-                idle_shutdown: None,
-                servers: [(RUST_ANALYZER.into(), ServerOptions {path:Some(binary.clone()), initialization_options:Some(json!({"mock":{"logPath":log,"responses":{"textDocument/references":locations}}})), ..Default::default()})].into_iter().collect(),
-                ..Default::default()
-            });
-            let resolved = manager.resolve(&root, None, Some(RUST_ANALYZER)).unwrap();
-            drop(manager.acquire(resolved, None).await.unwrap());
-            let query = CodeIntelPositionQuery {
-                workspace: root.clone(),
-                path: source,
-                line: 1,
-                column: 8,
-                max_results: 100,
-                offset: 0,
-                revision: None,
-                symbol: Some("target".into()),
-                cancellation: None,
-            };
-            crate::document::read_metrics::take();
-            let start = Instant::now();
-            let cold = manager.references(&query).await;
-            let cold_us = start.elapsed().as_micros();
-            let (opens, bytes, hits) = crate::document::read_metrics::take();
-            assert_eq!(opens, file_count + 1);
-            assert_eq!(cold.payload["shown"], count.min(100));
-            assert_eq!(cold.payload["has_more"], count > 100);
-            println!("references_existing count={count} phase=cold_documents source_opens={opens} source_bytes={bytes} store_hits={hits} local_us={cold_us}");
-            // Open the target files through the existing document-symbol path.
-            // This setup is outside both the timing and IO measurement window.
-            for path in &paths {
-                manager
-                    .symbols(&CodeIntelSymbolQuery {
-                        workspace: root.clone(),
-                        path: Some(path.clone()),
-                        max_results: 1,
-                        ..Default::default()
-                    })
-                    .await;
-            }
-            let mut elapsed = Vec::new();
-            let mut render_times = Vec::new();
-            let mut prepare_times = Vec::new();
-            let mut result_bytes = 0;
-            let mut next_bytes = 0;
-            for _ in 0..7 {
-                crate::document::read_metrics::take();
-                let start = Instant::now();
-                let outcome = manager.references(&query).await;
-                elapsed.push(start.elapsed().as_micros());
-                let (opens, bytes, hits) = crate::document::read_metrics::take();
-                assert_eq!((opens, bytes, hits), (0, 0, file_count + 1));
-                assert!(!outcome.meta.stale);
-                let start = Instant::now();
-                let rendered = slim_core::tools::render_code_intel("references", &outcome);
-                render_times.push(start.elapsed().as_nanos());
-                for i in 0..count.min(100) {
-                    assert!(
-                        rendered.contains(&format!("target({i});")),
-                        "context must contain the observed call argument"
-                    );
-                }
-                result_bytes = rendered.len();
-                let messages = vec![ProviderMessage::user("Inspect the call arguments at the returned references."),
-                    ProviderMessage::assistant("",vec![slim_core::provider::ProviderToolCall {
-                        id:"references".into(),name:"code_intel".into(),arguments:r#"{"action":"references","path":"src/lib.rs","line":1,"column":8,"max_results":100}"#.into()
-                    }]),ProviderMessage::tool("code_intel","references",rendered)];
-                let start = Instant::now();
-                let prepared = adapter
-                    .prepare_messages_request_with_tools_checked(&messages, &[])
-                    .unwrap();
-                prepare_times.push(start.elapsed().as_nanos());
-                next_bytes = prepared.body().len();
-            }
-            manager.shutdown().await;
-            let logs = std::fs::read_to_string(&log)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                .collect::<Vec<_>>();
-            let mut server = Vec::new();
-            for request in logs
-                .iter()
-                .filter(|row| {
-                    row["direction"] == "client_to_server"
-                        && row["message"]["method"] == "textDocument/references"
-                })
-                .skip(1)
-            {
-                let response = logs
-                    .iter()
-                    .find(|row| {
-                        row["direction"] == "server_to_client"
-                            && row["message"]["id"] == request["message"]["id"]
-                    })
-                    .unwrap();
-                server.push(u128::from(
-                    response["elapsed_us"].as_u64().unwrap()
-                        - request["elapsed_us"].as_u64().unwrap(),
-                ));
-            }
-            let stats = |values: &mut Vec<u128>| {
-                values.sort_unstable();
-                format!(
-                    "{}[{}..{}]",
-                    values[values.len() / 2],
-                    values[0],
-                    values[values.len() - 1]
-                )
-            };
-            println!("references_existing count={count} phase=warm n=7 invocations=1 lsp_requests=1 shown={} source_opens=0 source_bytes=0 store_hits={} result_bytes={result_bytes} next_request_bytes={next_bytes} local_us={} mock_request_to_response_us={} render_ns={} prepare_ns={}",count.min(100),file_count+1,stats(&mut elapsed),stats(&mut server),stats(&mut render_times),stats(&mut prepare_times));
-            std::fs::remove_dir_all(&root).unwrap();
-        }
     }
 }

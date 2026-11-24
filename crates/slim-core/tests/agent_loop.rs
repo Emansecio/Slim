@@ -1197,10 +1197,7 @@ fn repeated_failed_tool_call_stops_the_multi_turn_loop() {
     let (listener, address) = bind_listener();
     let server = thread::spawn(move || {
         for _ in 0..2 {
-            let mut stream = accept_with_deadline(&listener);
-            let mut request = [0_u8; 16 * 1024];
-            let size = stream.read(&mut request).expect("request");
-            let request = String::from_utf8_lossy(&request[..size]);
+            let (mut stream, request) = accept_request(&listener);
             assert!(request.contains("\"tools\""));
             assert!(request.contains("\"name\":\"read\""));
             assert!(request.contains("\"name\":\"shell\""));
@@ -2031,6 +2028,10 @@ fn content_filter_stop_is_not_reported_as_provider_success() {
     assert_eq!(result.stop, AgentLoopStop::ProviderFiltered);
     assert!(result.tool_results.is_empty());
     assert!(!runtime
+        .conversation()
+        .iter()
+        .any(|message| message.role == "assistant" && message.content.is_empty()));
+    assert!(!runtime
         .app
         .events()
         .iter()
@@ -2511,10 +2512,7 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
 fn context_below_threshold_sends_only_the_normal_request() {
     let (listener, address) = bind_listener();
     let server = thread::spawn(move || {
-        let mut stream = accept_with_deadline(&listener);
-        let mut request = [0_u8; 16 * 1024];
-        let size = stream.read(&mut request).expect("request");
-        let body = String::from_utf8_lossy(&request[..size]).into_owned();
+        let (mut stream, body) = accept_request(&listener);
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -3541,20 +3539,6 @@ fn validation_shell_is_serialized_as_a_workspace_boundary() {
     assert_eq!(ordered_names, ["read", "shell", "read"]);
     assert!(result.tool_results[0].output.contains("alpha"));
     assert!(result.tool_results[2].output.contains("bravo"));
-}
-
-#[test]
-fn default_max_result_bytes_is_sixteen_kib() {
-    assert_eq!(test_loop_config().max_result_bytes, 16 * 1024);
-}
-
-#[test]
-fn turns_are_uncapped_unless_configured() {
-    assert_eq!(
-        test_loop_config().max_turns,
-        AgentLoopConfig::DEFAULT_MAX_TURNS
-    );
-    assert_eq!(AgentLoopConfig::DEFAULT_MAX_TURNS, usize::MAX);
 }
 
 #[test]
@@ -4805,7 +4789,7 @@ fn eliding_a_superseded_read_in_the_loop_drops_the_usage_anchor() {
     let root = TempRoot::new("anchor-elision");
     std::fs::write(
         root.join("fixture.txt"),
-        "a line of a file the model will overwrite\n".repeat(400),
+        "a line of a file the model will overwrite\n".repeat(250),
     )
     .expect("fixture");
     let (listener, address) = bind_listener();
@@ -7525,9 +7509,9 @@ fn global_recovery_tally_stops_after_six_recoveries_without_progress() {
         )
     };
     let mut responses = Vec::new();
-    for index in 0..7 {
+    for index in 0..9 {
         responses.push((503, "failed".into()));
-        if index < 6 {
+        if index < 8 {
             responses.push((200, tool(index)));
         }
     }
@@ -7545,9 +7529,9 @@ fn global_recovery_tally_stops_after_six_recoveries_without_progress() {
         },
     );
     let _ = done.send(());
-    assert_eq!(server.join().unwrap().len(), 13);
+    assert_eq!(server.join().unwrap().len(), 17);
     assert!(matches!(result, Err(ProviderError::Http { message, .. })
-        if message.contains("global automatic recovery limit reached") && message.contains("automatic recoveries=6/6")));
+        if message.contains("global automatic recovery limit reached") && message.contains("automatic recoveries=8/8")));
     std::fs::remove_dir(root).unwrap();
 }
 
@@ -7560,8 +7544,12 @@ fn empty_recovery_counts_toward_consecutive_provider_limit() {
             (200, empty.into()),
             (503, "failed".into()),
             (503, "failed".into()),
+            (503, "failed".into()),
+            (503, "failed".into()),
         ],
         vec![
+            (503, "failed".into()),
+            (503, "failed".into()),
             (503, "failed".into()),
             (503, "failed".into()),
             (200, empty.into()),
@@ -7581,11 +7569,11 @@ fn empty_recovery_counts_toward_consecutive_provider_limit() {
             },
         );
         let _ = done.send(());
-        assert_eq!(server.join().unwrap().len(), 3);
+        assert_eq!(server.join().unwrap().len(), 5);
         assert!(matches!(result,
             Err(ProviderError::Http { message, .. } | ProviderError::InvalidResponse { message })
             if message.contains("consecutive provider recovery limit reached")
-                && message.contains("provider attempts=3")));
+                && message.contains("provider attempts=5")));
     }
 }
 
@@ -7652,6 +7640,8 @@ fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
         (503, "unavailable".into()),
         (503, "unavailable".into()),
         (503, "unavailable".into()),
+        (503, "unavailable".into()),
+        (503, "unavailable".into()),
         (200, final_answer.into()),
     ]);
     let retry = slim_core::runtime::ManualRetryHandle::default();
@@ -7688,8 +7678,8 @@ fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
     let requests = server.join().unwrap();
     let result = result.expect("explicit retry recovered");
     assert_eq!(
-        result.usage.retry_count, 3,
-        "two automatic retries plus one manual retry"
+        result.usage.retry_count, 5,
+        "four automatic retries plus one manual retry"
     );
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(result.tool_results.len(), 1);
@@ -7698,7 +7688,7 @@ fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
         std::fs::read_to_string(root.join("result.txt")).unwrap(),
         "saved once"
     );
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
     let bodies: Vec<_> = requests
         .iter()
         .map(|r| r.split_once("\r\n\r\n").unwrap().1)
@@ -7714,14 +7704,14 @@ fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
 #[test]
 fn provider_recovery_is_bounded_and_does_not_retry_permanent_errors() {
     for (status, max_turns, expected_requests) in [
-        (503, 10, 3),
-        (408, 10, 3),
+        (503, 10, 5),
+        (408, 10, 5),
         (401, 10, 1),
         (403, 10, 1),
         // Retries resend the current turn and do not consume the turn budget.
-        (503, 1, 3),
+        (503, 1, 5),
     ] {
-        let (client, done, server) = recovery_fixture(vec![(status, "failed".into()); 3]);
+        let (client, done, server) = recovery_fixture(vec![(status, "failed".into()); 5]);
         let mut runtime = Runtime::new();
         let config = AgentLoopConfig {
             max_turns,
@@ -8422,7 +8412,7 @@ fn foreground_compaction_backoff_is_cancellable_and_does_not_replace_history() {
 
 #[test]
 fn foreground_compaction_stops_after_two_retries_without_replacing_history() {
-    let (client, done, server) = recovery_fixture(vec![(503, "unavailable".into()); 4]);
+    let (client, done, server) = recovery_fixture(vec![(503, "unavailable".into()); 6]);
     let history = vec![
         ProviderMessage::user("original task"),
         ProviderMessage::assistant("prior evidence", Vec::new()),
@@ -8442,7 +8432,7 @@ fn foreground_compaction_stops_after_two_retries_without_replacing_history() {
         test_loop_config(),
     );
     let _ = done.send(());
-    assert_eq!(server.join().unwrap().len(), 3);
+    assert_eq!(server.join().unwrap().len(), 5);
     assert!(matches!(
         result,
         Err(ProviderError::Http { status: 503, .. })
@@ -9517,7 +9507,7 @@ fn tool_call_response(id: &str, tool: &str, arguments: Value) -> String {
 }
 
 #[test]
-fn run_guards_hold_a_failing_command_and_a_second_full_rewrite_once() {
+fn run_guards_hold_a_failing_command_and_note_every_full_rewrite() {
     let root = TempRoot::new("run-guards");
     let big = "x".repeat(4096);
     std::fs::write(root.join("big.txt"), &big).expect("big");
@@ -9579,11 +9569,11 @@ fn run_guards_hold_a_failing_command_and_a_second_full_rewrite_once() {
     assert!(!requests[3].contains(loop_hold), "the deliberate rerun ran");
     assert!(requests[4].contains(loop_hold), "the fourth try is held");
     assert!(requests[6].contains("You rewrote all of big.txt."));
-    assert!(requests[8].contains("big.txt exists; change it with patch"));
+    assert!(!requests[8].contains("big.txt exists; change it with patch"));
     assert_eq!(
         std::fs::read_to_string(root.join("big.txt")).expect("big"),
-        format!("{big}y"),
-        "the second rewrite was held"
+        format!("{big}z"),
+        "the second rewrite went through"
     );
 }
 
@@ -9679,5 +9669,491 @@ fn a_held_retry_does_not_hide_a_repeated_failure_from_the_loop_guard() {
         result.stop,
         AgentLoopStop::RepeatedFailedTool,
         "the rerun failed the same way"
+    );
+}
+
+#[test]
+fn in_place_compaction_aborts_open_tool_call_stream_early_and_falls_back() {
+    let started = Instant::now();
+    compact_on_a_cache_steering_provider(|listener| {
+        let (mut in_place, request) = accept_request(listener);
+        assert!(request.contains(IN_PLACE_MARKER));
+        // Deliberately leave the SSE socket open with no finish_reason or [DONE]
+        // after sending the tool_calls delta; early_abort must sever it immediately.
+        let partial = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Cache-Control: no-cache\r\n",
+            "\r\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"read-1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n"
+        );
+        in_place.write_all(partial.as_bytes()).expect("partial sse");
+        in_place.flush().expect("flush");
+
+        let (mut serialized, fallback_req) = accept_request(listener);
+        assert!(fallback_req.contains(SUMMARIZER_MARKER));
+        write_sse(&mut serialized, &text_response("## Goal\nfast-abort"));
+        drop(in_place);
+        "fast-abort"
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "early ToolCallStart abort should avoid waiting for the 5s socket timeout (elapsed={:?})",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn split_turn_executes_history_and_prefix_calls_in_parallel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (listener, address) = bind_listener();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight_server = Arc::clone(&max_in_flight);
+
+    let server = thread::spawn(move || {
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, req) = accept_request(&listener);
+            assert!(req.contains(SUMMARIZER_MARKER));
+            let cur_ref = Arc::clone(&in_flight);
+            let max_ref = Arc::clone(&max_in_flight_server);
+            workers.push(thread::spawn(move || {
+                let now = cur_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                max_ref.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(150));
+                if req.contains("[User]: first task") {
+                    write_sse(&mut stream, &text_response("## Goal\nparallel history"));
+                } else {
+                    assert!(req.contains("second task"));
+                    write_sse(&mut stream, &text_response("parallel prefix"));
+                }
+                cur_ref.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        let (mut turn, turn_req) = accept_request(&listener);
+        assert!(turn_req.contains(COMPACTED_MARKER));
+        assert!(turn_req.contains("parallel history"));
+        assert!(turn_req.contains("parallel prefix"));
+        write_sse(&mut turn, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 2_000,
+        ..eager_policy()
+    });
+    handle.request_manual("").expect("queue manual");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let messages = vec![
+        ProviderMessage::user("first task"),
+        ProviderMessage::assistant("first answer", Vec::new()),
+        ProviderMessage::user("second task"),
+        ProviderMessage::assistant("second answer", Vec::new()),
+    ];
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &messages,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        test_loop_config(),
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(
+        max_in_flight.load(Ordering::SeqCst),
+        2,
+        "history and turn_prefix summary calls must overlap concurrently"
+    );
+    assert_eq!(handle.take_commits().len(), 1);
+}
+
+#[test]
+fn chunked_map_reduce_runs_chunk_summaries_in_parallel_and_merges() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (listener, address) = bind_listener();
+    let in_flight_chunks = Arc::new(AtomicUsize::new(0));
+    let max_in_flight_chunks = Arc::new(AtomicUsize::new(0));
+    let seen_merge = Arc::new(AtomicBool::new(false));
+    let max_chunks_srv = Arc::clone(&max_in_flight_chunks);
+    let seen_merge_srv = Arc::clone(&seen_merge);
+
+    let server = thread::spawn(move || {
+        let mut workers = Vec::new();
+        let mut chunk_counter = 0usize;
+        loop {
+            let (mut stream, req) = accept_request(&listener);
+            if req.contains(COMPACTED_MARKER) {
+                assert!(req.contains("merged chunks"), "missing merged summary in {req}");
+                write_sse(&mut stream, &text_response("done"));
+                break;
+            }
+            if req.contains("### Chunk 1/") {
+                seen_merge_srv.store(true, Ordering::SeqCst);
+                assert!(req.contains("### Chunk 2/"));
+                assert!(req.contains("chunk summary"));
+                write_sse(&mut stream, &text_response("## Goal\nmerged chunks"));
+                continue;
+            }
+            assert!(req.contains(SUMMARIZER_MARKER));
+            chunk_counter += 1;
+            let idx = chunk_counter;
+            let cur_ref = Arc::clone(&in_flight_chunks);
+            let max_ref = Arc::clone(&max_chunks_srv);
+            workers.push(thread::spawn(move || {
+                let now = cur_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                max_ref.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(120));
+                write_sse(&mut stream, &text_response(&format!("chunk summary {idx}")));
+                cur_ref.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("chunk worker");
+        }
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let policy = CompactionPolicy {
+        reserve_tokens: 2_000,
+        keep_recent_tokens: 200,
+        ..CompactionPolicy::default()
+    };
+    let handle = CompactionHandle::new(policy);
+    handle.request_manual("").expect("queue manual");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+
+    let mut messages = Vec::new();
+    for i in 0..4 {
+        messages.push(ProviderMessage::user(format!("turn {i} {}", "u".repeat(8_000))));
+        messages.push(ProviderMessage::assistant(
+            format!("ans {i} {}", "a".repeat(8_000)),
+            Vec::new(),
+        ));
+    }
+    messages.push(ProviderMessage::user("final task"));
+    messages.push(ProviderMessage::assistant("final answer", Vec::new()));
+
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &messages,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            context_window_tokens: 12_000,
+            context_reserve_tokens: 2_000,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(
+        max_in_flight_chunks.load(Ordering::SeqCst) >= 2,
+        "chunked map phase must execute chunks concurrently (observed max={})",
+        max_in_flight_chunks.load(Ordering::SeqCst)
+    );
+    assert!(seen_merge.load(Ordering::SeqCst), "reduce merge request must run");
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert!(commits[0].summary.contains("merged chunks"));
+}
+
+#[test]
+fn speculative_compaction_exact_hit_and_partial_delta_reuse() {
+    // Keep the last turn intact (no mid-turn split) so each phase stays single-call.
+    let spec_policy = CompactionPolicy {
+        keep_recent_tokens: 100,
+        ..CompactionPolicy::default()
+    };
+    let mut history = vec![
+        ProviderMessage::user(format!("origin task {}", "o".repeat(400))),
+        ProviderMessage::assistant("origin reply", Vec::new()),
+        ProviderMessage::user(format!("recent task {}", "r".repeat(400))),
+        ProviderMessage::assistant("recent reply", Vec::new()),
+    ];
+
+    // 1. Pre-compute speculative summary in idle.
+    let (spec_listener, spec_addr) = bind_listener();
+    let spec_server = thread::spawn(move || {
+        let (mut stream, req) = accept_request(&spec_listener);
+        assert!(req.contains(SUMMARIZER_MARKER));
+        write_sse(&mut stream, &text_response("## Goal\nspeculative summary"));
+    });
+    let spec_client = fixture_client(format!("http://{spec_addr}"), Duration::from_secs(5));
+    let tokio_rt = tokio::runtime::Runtime::new().expect("tokio");
+    let mut spec_runtime = Runtime::new();
+    spec_runtime.set_compaction_handle(CompactionHandle::new(spec_policy.clone()));
+    let spec = tokio_rt
+        .block_on(spec_runtime.run_speculative_compaction(
+            &spec_client,
+            &history,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            test_loop_config(),
+        ))
+        .expect("speculative call")
+        .expect("speculative checkpoint");
+    spec_server.join().expect("spec server");
+    assert_eq!(spec.first_kept_index, 2);
+    assert!(spec.summary.contains("speculative summary"));
+
+    // 2. Exact hit: bare /compact uses stored speculative checkpoint with 0 summary HTTP calls.
+    let (exact_listener, exact_addr) = bind_listener();
+    let exact_server = thread::spawn(move || {
+        let (mut turn, req) = accept_request(&exact_listener);
+        assert!(req.contains(COMPACTED_MARKER));
+        assert!(req.contains("speculative summary"));
+        assert!(!req.contains(SUMMARIZER_MARKER));
+        write_sse(&mut turn, &text_response("done exact"));
+    });
+    let exact_client = fixture_client(format!("http://{exact_addr}"), Duration::from_secs(5));
+    let handle_exact = CompactionHandle::new(spec_policy.clone());
+    handle_exact.store_speculative(spec.clone());
+    handle_exact.request_manual("").expect("bare compact");
+    let mut runtime_exact = Runtime::new();
+    runtime_exact.set_compaction_handle(handle_exact.clone());
+    let res_exact = run_loop_with_messages(
+        &mut runtime_exact,
+        &exact_client,
+        &history,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        test_loop_config(),
+    )
+    .expect("exact hit loop");
+    exact_server.join().expect("exact server");
+    assert_eq!(res_exact.stop, AgentLoopStop::ProviderCompleted);
+    let exact_commits = handle_exact.take_commits();
+    assert_eq!(exact_commits.len(), 1);
+    assert!(exact_commits[0].duration_ms < 50);
+    assert!(exact_commits[0].summary.contains("speculative summary"));
+
+    // 3. Partial delta hit: extend history; summary call reuses previous_summary
+    //    and summarizes only the new delta without re-sending "origin task".
+    history.extend([
+        ProviderMessage::user("delta task"),
+        ProviderMessage::assistant("delta reply", Vec::new()),
+        ProviderMessage::user(format!("latest task {}", "l".repeat(400))),
+        ProviderMessage::assistant("latest reply", Vec::new()),
+    ]);
+    let (partial_listener, partial_addr) = bind_listener();
+    let partial_server = thread::spawn(move || {
+        let (mut sum_stream, sum_req) = accept_request(&partial_listener);
+        assert!(sum_req.contains(SUMMARIZER_MARKER));
+        assert!(sum_req.contains("<previous-summary>"));
+        assert!(sum_req.contains("speculative summary"));
+        assert!(sum_req.contains("delta task"));
+        assert!(
+            !sum_req.contains("origin task"),
+            "partial delta reuse must omit already-summarized origin history"
+        );
+        write_sse(&mut sum_stream, &text_response("## Goal\ndelta updated"));
+
+        let (mut turn_stream, turn_req) = accept_request(&partial_listener);
+        assert!(turn_req.contains(COMPACTED_MARKER));
+        assert!(turn_req.contains("delta updated"));
+        write_sse(&mut turn_stream, &text_response("done partial"));
+    });
+    let partial_client = fixture_client(format!("http://{partial_addr}"), Duration::from_secs(5));
+    let handle_partial = CompactionHandle::new(spec_policy);
+    handle_partial.store_speculative(spec);
+    handle_partial.request_manual("").expect("bare compact");
+    let mut runtime_partial = Runtime::new();
+    runtime_partial.set_compaction_handle(handle_partial.clone());
+    let res_partial = run_loop_with_messages(
+        &mut runtime_partial,
+        &partial_client,
+        &history,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        test_loop_config(),
+    )
+    .expect("partial hit loop");
+    partial_server.join().expect("partial server");
+    assert_eq!(res_partial.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle_partial.take_commits().len(), 1);
+}
+
+#[test]
+fn threshold_takes_an_older_speculative_checkpoint_without_a_summarizer_call() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, request) = accept_request(&listener);
+        assert!(!request.contains(SUMMARIZER_MARKER));
+        assert!(request.contains(COMPACTED_MARKER));
+        assert!(request.contains("speculative summary"));
+        // What follows the checkpoint's own cut stays verbatim.
+        assert!(request.contains("middle task"));
+        write_sse(&mut stream, &text_response("done rolling"));
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let mut runtime = Runtime::new();
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 7_500,
+        keep_recent_tokens: 100,
+        ..CompactionPolicy::default()
+    });
+    runtime.set_compaction_handle(handle.clone());
+    let history = vec![
+        ProviderMessage::user(format!("origin task {}", "o".repeat(200_000))),
+        ProviderMessage::assistant("origin reply", Vec::new()),
+        ProviderMessage::user(format!("middle task {}", "m".repeat(400))),
+        ProviderMessage::assistant("middle reply", Vec::new()),
+        ProviderMessage::user(format!("latest task {}", "l".repeat(400))),
+    ];
+    handle.store_speculative(slim_core::context::SpeculativeCompaction {
+        canonical_prefix_fingerprint: slim_core::context::canonical_prefix_fingerprint(
+            &history[..2],
+        ),
+        first_kept_index: 2,
+        summary: "## Goal\nspeculative summary".into(),
+        read_files: Vec::new(),
+        modified_files: Vec::new(),
+        tokens_before: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        created_at_unix_secs: 0,
+    });
+    let tools = runtime.advertised_tool_definitions(OperatingMode::Auto);
+    let pre_tokens = slim_core::context::estimate_text_tokens_from_chars(
+        client
+            .adapter()
+            .build_messages_request_with_tools_checked(&history, &tools)
+            .expect("pre request")
+            .body
+            .chars()
+            .count() as u64,
+    );
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &history,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            context_window_tokens: pre_tokens * 9 / 10,
+            context_reserve_tokens: 400,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].first_kept_index, 2);
+}
+
+#[test]
+fn pre_threshold_micro_prune_saves_window_without_llm_call() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, request) = accept_request(&listener);
+        assert!(
+            !request.contains(SUMMARIZER_MARKER),
+            "micro-pruning must handle threshold without an LLM compaction call"
+        );
+        assert!(
+            request.contains("[pruned old read output"),
+            "old large reads must be collapsed on the wire"
+        );
+        write_sse(&mut stream, &text_response("done pruned"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let mut runtime = Runtime::new();
+    let policy = CompactionPolicy {
+        reserve_tokens: 7_500,
+        keep_recent_tokens: 200,
+        ..CompactionPolicy::default()
+    };
+    let handle = CompactionHandle::new(policy);
+    runtime.set_compaction_handle(handle.clone());
+
+    let history = vec![
+        ProviderMessage::user("start"),
+        ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        ProviderMessage::tool("read", "c1", "A".repeat(24_000)),
+        ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "c2".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        ProviderMessage::tool("read", "c2", "B".repeat(24_000)),
+        ProviderMessage::user(format!("interim question {}", "q".repeat(1_000))),
+        ProviderMessage::assistant("interim reply", Vec::new()),
+        ProviderMessage::user("next step"),
+    ];
+    let tools = runtime.advertised_tool_definitions(OperatingMode::Auto);
+    let pre_tokens = slim_core::context::estimate_text_tokens_from_chars(
+        client
+            .adapter()
+            .build_messages_request_with_tools_checked(&history, &tools)
+            .expect("pre request")
+            .body
+            .chars()
+            .count() as u64,
+    );
+
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &history,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            context_window_tokens: pre_tokens + 5_000,
+            context_reserve_tokens: 400,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(
+        handle.take_commits().is_empty(),
+        "micro-pruning avoids creating a full compaction commit"
+    );
+    assert!(
+        runtime.app.events().iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ProviderPhase {
+                phase: ProviderPhase::Compacting,
+                detail: Some(detail),
+                ..
+            } if detail.contains("pruned 2 old read outputs")
+        )),
+        "expected context-trimmed event for pre-threshold micro-prune: {:?}",
+        runtime.app.events()
     );
 }

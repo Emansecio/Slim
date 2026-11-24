@@ -120,7 +120,7 @@ mod tests {
         );
         let description = patch["description"].as_str().unwrap();
         for rule in [
-            "atomic ordered",
+            "ordered edits",
             "unique raw text",
             "read/search",
             "`N: `/`N- `",
@@ -128,7 +128,7 @@ mod tests {
             "[truncated]",
             "no complete read",
             "CRLF",
-            "unchanged",
+            "rejected",
             "recovery",
             "no confirmation read",
             "Independent paths",

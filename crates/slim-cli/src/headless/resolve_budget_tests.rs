@@ -134,14 +134,17 @@ fn defaults_apply_without_env_or_options() {
 }
 
 #[test]
-fn max_turns_hard_cap_clamps_options_and_env() {
+fn max_turns_is_not_hard_capped_for_options_and_env() {
     with_env(&[("SLIM_MAX_TURNS", Some("4096"))], || {
         assert_eq!(
-            resolve_max_turns(&ProviderRunOptions::default()).expect("env clamp"),
-            1024
+            resolve_max_turns(&ProviderRunOptions::default()).expect("env uncapped"),
+            4096
         );
         let options = ProviderRunOptions::default().with_max_turns(2048);
-        assert_eq!(resolve_max_turns(&options).expect("options clamp"), 1024);
+        assert_eq!(
+            resolve_max_turns(&options).expect("options uncapped"),
+            2048
+        );
     });
 }
 

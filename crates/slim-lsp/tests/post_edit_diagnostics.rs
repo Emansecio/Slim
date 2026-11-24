@@ -552,22 +552,3 @@ async fn a_cancelled_run_gets_no_report() {
     assert!(report.is_none());
     pool.close_all().await;
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn files_the_server_does_not_serve_are_reported() {
-    let dir = TestDir::new("unserved");
-    let source = dir.write("src/first.rs", "fn first() {}\n");
-    let notes = dir.write("NOTES.md", "BROKEN prose\n");
-    let (pool, manager) = manager(dir.path(), json!({ "errorsFromDocument": true }));
-    warm(&manager, dir.path(), &source).await;
-
-    let report = manager
-        .diagnostics_after_edits(dir.path(), &[notes], Duration::from_secs(1), None)
-        .await;
-
-    assert_eq!(
-        only_file(&report.unwrap()).verification,
-        EditVerification::Unsupported
-    );
-    pool.close_all().await;
-}

@@ -67,14 +67,11 @@ impl CommandCodeCatalog {
         url: impl Into<String>,
         cache_path: impl Into<PathBuf>,
     ) -> Result<Self, slim_core::ProviderError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| slim_core::ProviderError::InvalidResponse {
+        let client = slim_core::provider::shared_http_client(Duration::from_secs(15)).map_err(
+            |_| slim_core::ProviderError::InvalidResponse {
                 message: "Command Code catalog request failed".into(),
-            })?;
+            },
+        )?;
         Ok(Self {
             url: url.into(),
             cache_path: cache_path.into(),
@@ -97,11 +94,15 @@ impl CommandCodeCatalog {
     }
 
     pub async fn refresh(&self) -> Result<CatalogSnapshot, slim_core::ProviderError> {
-        let mut response = self.client.get(&self.url).send().await.map_err(|_| {
-            slim_core::ProviderError::InvalidResponse {
+        let mut response = self
+            .client
+            .get(&self.url)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|_| slim_core::ProviderError::InvalidResponse {
                 message: "Command Code catalog request failed".into(),
-            }
-        })?;
+            })?;
         if !response.status().is_success()
             || response
                 .content_length()

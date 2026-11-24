@@ -1,12 +1,16 @@
 //! Shared runtime contracts for the Slim workspace.
 
+pub mod cache_db;
+pub mod checkpoint;
 pub mod codeintel;
 pub mod context;
 pub mod events;
 pub mod interaction;
 pub mod mcp;
+pub mod memory;
 pub mod model;
 pub mod process;
+pub mod project_index;
 pub mod protocol;
 pub mod provider;
 pub mod redaction;
@@ -48,6 +52,7 @@ pub use runtime::{
     AgentLoopStop, RequestUsage, Runtime, RuntimeCapabilityBridge, UsageTotals,
 };
 pub use workspace_files::{
-    is_sensitive_file_name, list_workspace_files, load_mention_file, mention_paths_in_prompt,
-    MentionError, MentionFile, WorkspaceListing,
+    is_sensitive_file_name, list_workspace_files, load_mention_file, load_mention_spec,
+    mention_paths_in_prompt, mention_specs_in_prompt, MentionError, MentionFile, MentionSelector,
+    MentionSpec, WorkspaceListing,
 };

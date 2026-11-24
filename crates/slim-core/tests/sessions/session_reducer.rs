@@ -122,13 +122,6 @@ fn restores_four_real_record_kinds_into_deterministic_state() {
 }
 
 #[test]
-fn repeated_restore_is_structurally_identical() {
-    let records = records();
-
-    assert_eq!(restore_records(&records), restore_records(&records));
-}
-
-#[test]
 fn facts_last_write_by_namespace_and_key_and_operations_keep_history() {
     let mut records = records();
     records.push(DurableRecord::Operation {

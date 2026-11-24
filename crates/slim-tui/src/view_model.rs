@@ -208,7 +208,7 @@ fn external_activity_label(label: &str) -> String {
 
 fn live_tool_names(state: &AppState) -> Vec<&str> {
     state
-        .blocks()
+        .active_turn_blocks()
         .iter()
         .filter(|block| {
             matches!(

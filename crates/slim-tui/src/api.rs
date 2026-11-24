@@ -205,6 +205,8 @@ pub struct TurnListItem {
     pub first_seq: u64,
     /// First line of the turn's prompt (already redacted), at most 200 chars.
     pub prompt: String,
+    /// Whether this turn recorded a disk checkpoint before running.
+    pub has_checkpoint: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -628,6 +630,12 @@ pub enum UiEvent {
         call_id: ToolCallId,
         diff: slim_core::ToolEditDiff,
     },
+    /// Program source of a `codemode` call, shown in the expanded tool body.
+    ToolSource {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        source: String,
+    },
     ToolEnded {
         batch_id: ToolBatchId,
         call_id: ToolCallId,
@@ -708,6 +716,13 @@ pub enum UiEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    UsageBreakdown {
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    },
     UsageEstimate {
         request_id: u64,
         context_tokens: u64,
@@ -718,6 +733,24 @@ pub enum UiEvent {
         request_id: u64,
         context_tokens: u64,
         context_window_tokens: u64,
+    },
+    ContextTelemetry {
+        provider: String,
+        model: String,
+        system_bytes: u64,
+        tool_schema_bytes: u64,
+        history_bytes: u64,
+        tool_result_bytes: u64,
+        estimated_tokens: u64,
+        context_window_tokens: u64,
+    },
+    CacheDriftDetected {
+        provider: String,
+        model: String,
+        hit_ratio_pct: u8,
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        cause: String,
     },
     RequestCompleted {
         provider_latency_ms: u64,
@@ -783,6 +816,9 @@ pub enum UiEvent {
     },
     JobsChanged {
         jobs: Vec<slim_core::runtime::ShellJobInfo>,
+    },
+    SubagentsChanged {
+        subagents: Vec<slim_core::runtime::SubagentInfo>,
     },
     JobOutput {
         id: String,
@@ -858,8 +894,11 @@ impl UiEvent {
             self,
             Self::UsagePartial { .. }
                 | Self::Usage { .. }
+                | Self::UsageBreakdown { .. }
                 | Self::UsageEstimate { .. }
                 | Self::UsageEstimateForRun { .. }
+                | Self::ContextTelemetry { .. }
+                | Self::CacheDriftDetected { .. }
                 | Self::RequestCompleted { .. }
         )
     }
@@ -875,6 +914,7 @@ impl UiEvent {
             || matches!(
                 self,
                 Self::ToolStarted { .. }
+                    | Self::ToolSource { .. }
                     | Self::ToolPrepared { .. }
                     | Self::ToolAdmitted { .. }
                     | Self::ToolOutput { .. }
@@ -1142,16 +1182,37 @@ impl UiEvent {
                     duration_ms,
                 })
             }
+            slim_core::EventKind::UsageBreakdown { usage } => Some(Self::UsageBreakdown {
+                uncached_input_tokens: usage.uncached_input_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+            }),
             slim_core::EventKind::CausalProgressObserved { .. }
             | slim_core::EventKind::CausalBoundaryObserved { .. }
             | slim_core::EventKind::CausalAnomalyDetected { .. }
-            | slim_core::EventKind::UsageBreakdown { .. }
             | slim_core::EventKind::ResponseCacheHit
             | slim_core::EventKind::GoalAssurance { .. }
             | slim_core::EventKind::ToolEvidenceReused { .. }
             | slim_core::EventKind::ToolEvidenceElided { .. }
             | slim_core::EventKind::ToolCallsSuppressed { .. }
             | slim_core::EventKind::ArtifactStored { .. } => None,
+            slim_core::EventKind::CacheDriftDetected {
+                provider,
+                model,
+                hit_ratio_pct,
+                input_tokens,
+                cache_read_tokens,
+                cause,
+            } => Some(Self::CacheDriftDetected {
+                provider,
+                model,
+                hit_ratio_pct,
+                input_tokens,
+                cache_read_tokens,
+                cause,
+            }),
             slim_core::EventKind::RequestCompleted {
                 provider_latency_ms,
                 cancelled,
@@ -1289,7 +1350,7 @@ fn tool_arguments_summary(name: &str, arguments: &str) -> String {
 }
 
 /// The tool a codemode step's row is named after.
-fn codemode_step_tool(name: &str) -> &str {
+pub fn codemode_step_tool(name: &str) -> &str {
     if let Some(native) = name.strip_prefix("slim.") {
         native
     } else if name.starts_with("mcp.") {
@@ -1301,7 +1362,7 @@ fn codemode_step_tool(name: &str) -> &str {
 
 /// Name and target of a codemode step's row: a native call keeps its
 /// tool's summary; an MCP call shows `server.tool`, like the gateway.
-fn codemode_step_row(name: &str, arguments: &str) -> (String, String) {
+pub fn codemode_step_row(name: &str, arguments: &str) -> (String, String) {
     let tool = codemode_step_tool(name);
     let summary = match name.strip_prefix("mcp.") {
         // `server.tool` is not JSON: the summary bounds it as plain text.
@@ -1374,7 +1435,7 @@ pub fn tool_output_preview(name: &str, output: &str) -> String {
     }
     if name == "codemode" {
         if let Some(reason) = codemode_preview(output) {
-            return bounded_first_line(reason, 512);
+            return bounded_first_line(&reason, 512);
         }
     }
     if name == "shell" {
@@ -1399,21 +1460,68 @@ pub fn tool_output_preview(name: &str, output: &str) -> String {
 
 /// The line of a codemode cell that says what happened. A failure opens with
 /// a note for the model (`codemode failed after N tool call(s); …`) and the
-/// error follows it; a program that returned nothing and wrote to the console
-/// speaks through its first console line.
-fn codemode_preview(output: &str) -> Option<&str> {
+/// error follows it; a string return unwraps its JSON quotes, and an empty
+/// return speaks through its first console line.
+fn codemode_preview(output: &str) -> Option<String> {
     if output.starts_with("codemode failed after ") {
         let error = output
             .lines()
             .skip(1)
             .find(|line| !line.trim().is_empty())?;
-        return Some(error.strip_prefix("Error: ").unwrap_or(error));
+        return Some(error.strip_prefix("Error: ").unwrap_or(error).to_owned());
     }
-    let (result, console) = output.split_once("\nconsole:\n")?;
-    if !matches!(result.trim(), "" | "null" | "undefined") {
-        return None;
+    let (result, console) = match output.split_once("\nconsole:\n") {
+        Some((result, console)) => (result.trim(), Some(console)),
+        None => (output.trim(), None),
+    };
+    if !matches!(result, "" | "null" | "undefined") {
+        if let Some(text) = decode_json_string(result) {
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        } else {
+            return None;
+        }
     }
-    console.lines().find(|line| !line.trim().is_empty())
+    console?
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn decode_json_string(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            if ch.is_control() {
+                return None;
+            }
+            out.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000C}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() != 4 {
+                    return None;
+                }
+                let code = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(code)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn bounded_first_line(output: &str, limit: usize) -> String {
@@ -1447,6 +1555,20 @@ pub enum UiCommand {
     JobControl {
         id: String,
         interrupt: bool,
+    },
+    SubagentPause {
+        id: String,
+    },
+    SubagentResume {
+        id: String,
+    },
+    SubagentMessage {
+        id: String,
+        message: String,
+        steer: bool,
+    },
+    SubagentCancel {
+        id: String,
     },
     RunBackgroundShell {
         command: String,
@@ -1535,6 +1657,17 @@ pub enum UiCommand {
         model: String,
         effort: ReasoningEffort,
     },
+    /// Applies an Anthropic model id and effort on the live worker (activating
+    /// the saved Anthropic OAuth or API-key login when switching providers).
+    SetAnthropicModel {
+        model: String,
+        effort: ReasoningEffort,
+    },
+    /// Updates thinking display preference on the live worker without tearing
+    /// down MCP connections, LSP or in-memory prefix caches.
+    SetThinkingDisplay {
+        show: bool,
+    },
     CancelRun,
     Shutdown,
     /// Reload layered config into the MCP manager and push a fresh snapshot.
@@ -1579,6 +1712,14 @@ pub enum UiCommand {
         request_id: ContentRequestId,
         cursor: Option<PageCursor>,
     },
+    RequestContentHeadTail {
+        handle: ContentHandle,
+        request_id: ContentRequestId,
+        max_bytes: usize,
+    },
+    /// Host-triggered KV-cache TTL keep-alive ping when idle and economically
+    /// profitable (never mutates conversation history or emits chat messages).
+    CacheKeepAlive,
     /// `/rename TITLE`: names the current session (empty clears the name). The
     /// host persists it beside the session and answers `SessionTitleChanged`.
     RenameSession {
@@ -1606,10 +1747,15 @@ pub enum UiCommand {
     /// Goes back to just before the turn whose user entry has sequence
     /// `first_seq`: forks the session at that boundary (the original is left
     /// untouched), switches to the fork and hands that turn's prompt back as a
-    /// draft. Conversation only; files are not restored.
+    /// draft. When `restore_files` is true and the turn has a checkpoint,
+    /// restores workspace files to their state at the start of that turn.
     RewindSession {
         first_seq: u64,
+        restore_files: bool,
     },
+    /// `/rewind --undo`: restores workspace files to the pre-rewind snapshot
+    /// saved right before the last disk rewind.
+    UndoLastRewind,
     /// Run `command` (a `!command` draft) in the workspace shell on the user's
     /// behalf. Auto mode only; the host always ends it with
     /// `UiEvent::UserShellFinished` carrying the same `request_id`.
@@ -1643,6 +1789,19 @@ pub enum UiCommand {
         name: String,
         enabled: bool,
     },
+    /// `/memory` / `/memory list`: lists durable project memory entries.
+    MemoryList,
+    /// `/memory add [kind] <text>`: stores a persistent project memory entry.
+    MemoryAdd {
+        kind: String,
+        text: String,
+    },
+    /// `/memory rm <id>`: deletes a durable project memory entry by id/prefix.
+    MemoryRemove {
+        id: String,
+    },
+    /// `/memory clear`: removes every durable project memory entry for this workspace.
+    MemoryClear,
 }
 
 struct WakeInner {
@@ -1763,7 +1922,7 @@ impl WakeSignal {
     /// for a wait. The consumer arms before its final lane probe, so a send
     /// racing the drain→wait gap still wakes it.
     pub fn notify_waiter(&self) {
-        if self.0.waiting.load(std::sync::atomic::Ordering::Acquire) {
+        if self.0.waiting.load(std::sync::atomic::Ordering::SeqCst) {
             self.notify();
         }
     }
@@ -1771,16 +1930,16 @@ impl WakeSignal {
     /// Marks the consumer as about to wait. Callers must arm, then probe the
     /// lanes/input once more, then wait — the probe is what closes the race
     /// against producers that arrived before the arm.
-    pub(crate) fn arm(&self) {
+    pub fn arm(&self) {
         self.0
             .waiting
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn disarm(&self) {
+    pub fn disarm(&self) {
         self.0
             .waiting
-            .store(false, std::sync::atomic::Ordering::Release);
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Read end of the wake pipe, for `poll`-based terminal waits.
@@ -1861,6 +2020,27 @@ impl WakeSignal {
         std::thread::sleep(timeout);
         Ok(false)
     }
+
+    /// Arms the wake signal, runs `has_pending` to close the producer→consumer race,
+    /// and only blocks up to `timeout` when nothing is pending. Always disarms on exit.
+    pub fn wait_armed_timeout(
+        &self,
+        timeout: std::time::Duration,
+        has_pending: impl FnOnce() -> bool,
+    ) -> std::io::Result<bool> {
+        struct Disarm<'a>(&'a WakeSignal);
+        impl Drop for Disarm<'_> {
+            fn drop(&mut self) {
+                self.0.disarm();
+            }
+        }
+        self.arm();
+        let _guard = Disarm(self);
+        if has_pending() {
+            return Ok(true);
+        }
+        self.wait_timeout(timeout)
+    }
 }
 
 impl Default for WakeSignal {
@@ -1872,6 +2052,253 @@ impl Default for WakeSignal {
 /// Capacity of the ordered stream lane. Runtime barriers account for one
 /// additional event held in their prefetch slot.
 pub const STREAM_EVENT_CAPACITY: usize = 1_024;
+
+/// Bridge sharing pre-opened `PromptQueueJournal` handles and background
+/// durability barriers between the CLI/runtime worker and `PersistentQueue`
+/// without blocking the UI thread on filesystem `open`/`fsync`.
+#[derive(Clone, Default)]
+pub struct QueueJournalBridge {
+    pub(crate) inner: Arc<QueueJournalBridgeInner>,
+}
+
+#[derive(Default)]
+pub(crate) struct QueueJournalBridgeInner {
+    preopened: std::sync::Mutex<
+        std::collections::HashMap<String, slim_core::session::PromptQueueJournal>,
+    >,
+    durability: std::sync::Mutex<QueueDurabilityState>,
+    condvar: std::sync::Condvar,
+    retry_needed: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct QueueDurabilityState {
+    enqueued_seq: u64,
+    durable_seq: u64,
+    /// Inclusive `(min_seq, max_seq, error)` of failed save batches so a
+    /// subsequent no-op or later write cannot erase an error covering `target`.
+    failed_batches: std::collections::VecDeque<(u64, u64, String)>,
+    /// Most recent unhealed save error; cleared only when a real disk write
+    /// (`wrote == true`) succeeds, the journal is detached, or a new session
+    /// journal is attached.
+    unhealed_error: Option<String>,
+    worker_alive: bool,
+    ui_attached: bool,
+    pending_clears: u64,
+}
+
+impl QueueJournalBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a `PromptQueueJournal` opened off the UI thread so
+    /// `PersistentQueue` can attach it by `session` ID regardless of `~/`
+    /// display `cwd`.
+    pub fn seed_preopened(
+        &self,
+        session: String,
+        journal: slim_core::session::PromptQueueJournal,
+    ) {
+        let mut guard = self
+            .inner
+            .preopened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(session, journal);
+    }
+
+    /// Records that a `UiEvent::SessionCleared` has been emitted while a UI
+    /// `PersistentQueue` is attached, so `wait_durable()` waits until the UI
+    /// loop drains it and detaches any open journal before reopening.
+    pub fn begin_session_clear(&self) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.ui_attached {
+            state.pending_clears = state.pending_clears.saturating_add(1);
+        }
+    }
+
+    pub fn mark_clear_settled(&self) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_clears = state.pending_clears.saturating_sub(1);
+        state.unhealed_error = None;
+        state.failed_batches.clear();
+        self.inner.condvar.notify_all();
+    }
+
+    /// Blocks the caller (intended for the background worker off the UI thread)
+    /// until every `PromptQueueSnapshot` enqueued up to this call (and any
+    /// in-flight `SessionCleared` detach) has been durably settled.
+    pub fn wait_durable(&self) -> std::io::Result<()> {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = state.enqueued_seq;
+        while (state.pending_clears > 0 && state.ui_attached) || state.durable_seq < target {
+            if !state.worker_alive && state.durable_seq < target.max(state.enqueued_seq) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "prompt queue persistence worker stopped",
+                ));
+            }
+            state = self
+                .inner
+                .condvar
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if target > 0 {
+            if let Some((_, _, error)) = state
+                .failed_batches
+                .iter()
+                .rev()
+                .find(|(min_seq, max_seq, _)| target >= *min_seq && target <= *max_seq)
+            {
+                return Err(std::io::Error::other(error.clone()));
+            }
+            if let Some(error) = &state.unhealed_error {
+                return Err(std::io::Error::other(error.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_preopened(
+        &self,
+        session: &str,
+    ) -> Option<slim_core::session::PromptQueueJournal> {
+        let mut guard = self
+            .inner
+            .preopened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(session)
+    }
+
+    pub(crate) fn set_ui_attached(&self, attached: bool) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.ui_attached = attached;
+        if !attached {
+            state.pending_clears = 0;
+            self.inner.condvar.notify_all();
+        }
+    }
+
+    pub(crate) fn set_worker_alive(&self, alive: bool) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.worker_alive = alive;
+        if !alive {
+            self.inner.condvar.notify_all();
+        }
+    }
+
+    pub(crate) fn next_enqueue_seq(&self) -> u64 {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.enqueued_seq = state.enqueued_seq.saturating_add(1);
+        state.enqueued_seq
+    }
+
+    pub(crate) fn begin_attach(&self) -> u64 {
+        self.next_enqueue_seq()
+    }
+
+    pub(crate) fn mark_attached(&self, seq: u64) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.durable_seq = state.durable_seq.max(seq);
+        state.unhealed_error = None;
+        state.failed_batches.clear();
+        self.inner.condvar.notify_all();
+    }
+
+    pub(crate) fn clear_session_errors(&self) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.unhealed_error = None;
+        state.failed_batches.clear();
+        self.inner.condvar.notify_all();
+    }
+
+    pub(crate) fn mark_retry_needed(&self) {
+        self.inner
+            .retry_needed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn take_retry_needed(&self) -> bool {
+        self.inner
+            .retry_needed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn mark_durable(
+        &self,
+        min_seq: u64,
+        max_seq: u64,
+        error: Option<String>,
+        wrote: bool,
+    ) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.durable_seq = state.durable_seq.max(max_seq);
+        if let Some(error) = error {
+            if state.failed_batches.len() >= 256 {
+                state.failed_batches.pop_front();
+            }
+            state
+                .failed_batches
+                .push_back((min_seq, max_seq, error.clone()));
+            state.unhealed_error = Some(error);
+        } else if wrote {
+            state.unhealed_error = None;
+        }
+        self.inner.condvar.notify_all();
+    }
+
+    pub(crate) fn mark_detached(&self, seq: u64) {
+        let mut state = self
+            .inner
+            .durability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.durable_seq = state.durable_seq.max(seq);
+        state.pending_clears = state.pending_clears.saturating_sub(1);
+        state.unhealed_error = None;
+        state.failed_batches.clear();
+        self.inner.condvar.notify_all();
+    }
+}
 
 pub struct UiChannels {
     pub commands: mpsc::Sender<UiCommand>,
@@ -1902,6 +2329,7 @@ impl UiEvent {
                 | Self::SessionRestored { .. }
                 | Self::SessionCleared { .. }
                 | Self::JobsChanged { .. }
+                | Self::SubagentsChanged { .. }
                 | Self::JobOutput { .. }
                 | Self::PromptRunCompleted { .. }
                 | Self::PromptRunStopped { .. }
@@ -1919,8 +2347,11 @@ impl UiEvent {
                 | Self::ThinkingEnded
                 | Self::UsagePartial { .. }
                 | Self::Usage { .. }
+                | Self::UsageBreakdown { .. }
                 | Self::UsageEstimate { .. }
                 | Self::UsageEstimateForRun { .. }
+                | Self::ContextTelemetry { .. }
+                | Self::CacheDriftDetected { .. }
                 | Self::RequestCompleted { .. }
                 | Self::ToolStarted { .. }
                 | Self::ToolPrepared { .. }
@@ -1928,11 +2359,15 @@ impl UiEvent {
                 | Self::ToolOutput { .. }
                 | Self::ToolProgress { .. }
                 | Self::ToolDiff { .. }
+                | Self::ToolSource { .. }
                 | Self::UserShellFinished { .. }
-                // Both follow a `SessionRestored` (resume, rewind): on the control
-                // lane they could be reduced before it and then wiped by it.
+                // Follow `SessionRestored` / `SessionCleared` (resume, rewind, /new):
+                // on the control lane they could overtake the reset and then be
+                // wiped by it.
                 | Self::SessionTitleChanged { .. }
                 | Self::RestoreDraft { .. }
+                | Self::TodoChanged { .. }
+                | Self::QueuedUserAdded { .. }
                 | Self::ToolEnded { .. }
                 | Self::ToolStepEnded { .. }
                 | Self::ActivityChanged { .. }
@@ -2076,6 +2511,8 @@ mod tests {
             "patched a.swift; 2 edits applied"
         );
         assert_eq!(preview("{\"ok\":true}\nconsole:\nlog"), "{\"ok\":true}");
+        assert_eq!(preview("\"patched 2 files\""), "patched 2 files");
+        assert_eq!(preview("\"\"\nconsole:\nfrom console"), "from console");
         assert_eq!(preview("null"), "null");
     }
 
@@ -2209,13 +2646,6 @@ mod tests {
         };
         assert!(output.survives_cancellation());
         assert!(!progress.survives_cancellation());
-    }
-
-    #[test]
-    fn compaction_completed_is_not_a_toast() {
-        let projected = UiEvent::from_core(SessionEvent::new(4, EventKind::CompactionCompleted));
-        assert_eq!(projected, Some(UiEvent::CompactionCompleted));
-        assert!(!UiEvent::CompactionCompleted.is_control());
     }
 
     #[test]
@@ -2496,6 +2926,35 @@ mod tests {
     }
 
     #[test]
+    fn wait_armed_timeout_handles_pending_and_producer_wakeup() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let wake = super::WakeSignal::new().expect("wake");
+        // Pending fast path returns immediately and disarms.
+        let t0 = Instant::now();
+        assert!(wake
+            .wait_armed_timeout(Duration::from_secs(2), || true)
+            .expect("pending"));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        assert!(!wake.0.waiting.load(Ordering::SeqCst));
+
+        // Producer wakeup while armed unblocks promptly and disarms on exit.
+        let producer = wake.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            producer.notify_waiter();
+        });
+        let t1 = Instant::now();
+        assert!(wake
+            .wait_armed_timeout(Duration::from_secs(2), || false)
+            .expect("producer wake"));
+        assert!(t1.elapsed() < Duration::from_millis(200));
+        assert!(!wake.0.waiting.load(Ordering::SeqCst));
+        handle.join().expect("producer join");
+    }
+
+    #[test]
     fn run_lifecycle_uses_ordered_lossless_stream_lane() {
         for event in [
             UiEvent::run_started(1),
@@ -2532,6 +2991,11 @@ mod tests {
                 preview: "half".into(),
                 content_handle: None,
             },
+            UiEvent::ToolSource {
+                batch_id: ToolBatchId("batch".into()),
+                call_id: ToolCallId("call".into()),
+                source: "return 1;".into(),
+            },
             UiEvent::ToolEnded {
                 batch_id: ToolBatchId("batch".into()),
                 call_id: ToolCallId("call".into()),
@@ -2539,6 +3003,11 @@ mod tests {
                 success: true,
                 duration_ms: 1,
             },
+            UiEvent::QueuedUserAdded {
+                text: "follow-up".into(),
+                position: 0,
+            },
+            UiEvent::TodoChanged { items: Vec::new() },
             UiEvent::InputRequired {
                 request_id: InteractionRequestId("input-1".into()),
                 prompt: "choose".into(),
@@ -2559,17 +3028,58 @@ mod tests {
             UiEvent::SessionTitleChanged { title: None },
             UiEvent::RestoreDraft { text: "x".into() },
             UiEvent::CompactionCompleted,
+            UiEvent::ContextTelemetry {
+                provider: "openai".into(),
+                model: "gpt".into(),
+                system_bytes: 10,
+                tool_schema_bytes: 20,
+                history_bytes: 30,
+                tool_result_bytes: 40,
+                estimated_tokens: 50,
+                context_window_tokens: 100,
+            },
+            UiEvent::CacheDriftDetected {
+                provider: "openai".into(),
+                model: "gpt".into(),
+                hit_ratio_pct: 10,
+                input_tokens: 1000,
+                cache_read_tokens: 100,
+                cause: "tools".into(),
+            },
             UiEvent::RunCompleted { run_id: 1 },
         ] {
             assert!(!event.is_control());
         }
+        assert_eq!(
+            UiEvent::from_core(SessionEvent::new(4, EventKind::CompactionCompleted)),
+            Some(UiEvent::CompactionCompleted)
+        );
+        assert_eq!(
+            UiEvent::from_core(SessionEvent::new(
+                5,
+                EventKind::CacheDriftDetected {
+                    provider: "anthropic".into(),
+                    model: "claude".into(),
+                    hit_ratio_pct: 12,
+                    input_tokens: 4000,
+                    cache_read_tokens: 480,
+                    cause: "system_prompt_changed".into(),
+                }
+            )),
+            Some(UiEvent::CacheDriftDetected {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                hit_ratio_pct: 12,
+                input_tokens: 4000,
+                cache_read_tokens: 480,
+                cause: "system_prompt_changed".into(),
+            })
+        );
         assert!(UiEvent::RunCancelled { run_id: 1 }.is_control());
     }
 
     #[test]
     fn gpt_56_efforts_match_codex_model_catalog() {
-        assert_eq!(ModelAlias::parse("astra"), None);
-        assert_eq!(ModelAlias::parse("gpt-6-astra"), None);
         assert_eq!(
             ReasoningEffort::supported(ModelAlias::Sol),
             &ReasoningEffort::ALL

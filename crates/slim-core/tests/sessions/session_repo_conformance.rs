@@ -55,32 +55,6 @@ fn cleanup(path: &Path) {
     std::fs::remove_dir_all(parent).expect("remove test directory");
 }
 
-#[test]
-fn memory_repo_appends_and_reads() {
-    let header = DurableSessionHeader::new("session-1", "now", "D:\\Slim", None, None);
-    let mut repo = MemoryRepo::new(header.clone());
-    assert!(repo.records().is_empty());
-    let record = DurableRecord::Entry {
-        seq: 0,
-        entry: DurableEntry {
-            entry_id: "entry-1".into(),
-            role: DurableEntryRole::User,
-            content: "hello".into(),
-            parent_entry_id: None,
-            operation_id: "op-1".into(),
-            tool_call_id: None,
-            tool_calls: Vec::new(),
-            content_blocks: Vec::new(),
-        },
-    };
-
-    repo.append(record.clone()).expect("append");
-
-    assert_eq!(repo.header(), &header);
-    assert_eq!(repo.records(), std::slice::from_ref(&record));
-    assert_eq!(repo.read_prefix(0), vec![record]);
-}
-
 fn assert_common_contract<R: DurableRepo>(mut repo: R) {
     assert!(repo.records().is_empty());
     assert!(repo.read_prefix(0).is_empty());

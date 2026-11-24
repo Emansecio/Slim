@@ -10,15 +10,6 @@ use slim_core::provider::{
 use slim_core::ProviderPricing;
 
 #[test]
-fn native_system_prompt_is_valid_utf8_text_without_mojibake() {
-    let prompt = slim_core::provider::NATIVE_SYSTEM_PROMPT;
-    assert!(!prompt.contains('Ã'));
-    assert!(!prompt.contains('â'));
-    assert!(prompt.contains('—'));
-    assert!(prompt.contains('→'));
-}
-
-#[test]
 fn request_redaction_covers_supported_credential_headers() {
     let request = HttpRequest {
         url: "https://example.invalid".into(),

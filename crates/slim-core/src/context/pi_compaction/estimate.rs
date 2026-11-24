@@ -38,6 +38,25 @@ pub fn estimate_tokens(message: &ProviderMessage) -> u64 {
     if let Some(reasoning) = &message.chat_reasoning {
         chars += reasoning.content.chars().count() as u64;
     }
+    for reasoning in &message.responses_reasoning {
+        if let Some(thinking) = reasoning
+            .item
+            .get("thinking")
+            .and_then(serde_json::Value::as_str)
+        {
+            chars += thinking.chars().count() as u64;
+        } else if let Some(summary) = reasoning
+            .item
+            .get("summary")
+            .and_then(serde_json::Value::as_array)
+        {
+            for part in summary {
+                if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                    chars += text.chars().count() as u64;
+                }
+            }
+        }
+    }
     chars.div_ceil(4)
 }
 
@@ -308,6 +327,7 @@ mod tests {
         message.chat_reasoning = Some(crate::provider::ChatReasoning {
             scope_id: 1,
             model: "m".into(),
+            provenance: 0,
             content: "efghijkl".into(),
             details: Vec::new(),
         });

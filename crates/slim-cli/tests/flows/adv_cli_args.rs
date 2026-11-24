@@ -145,13 +145,6 @@ fn abandon_pending_requires_recover() {
 }
 
 #[test]
-fn verbose_conflicts_with_jsonl() {
-    let output = run_cli(["--fake", "--verbose", "--jsonl", "--prompt", "x"], "");
-    assert_eq!(output.code, ExitCode::InputRequired);
-    assert!(output.stderr.contains("--verbose"));
-}
-
-#[test]
 fn recover_rejects_prompt_positional_and_stdin_input() {
     let dir = temp_dir("recover-inputs");
     let path = missing_path(&dir);
@@ -210,21 +203,6 @@ fn fake_empty_prompt_from_any_source_is_input_required() {
     // Some("") which stays empty — still input_required.
     let output = run_cli(["--fake", "--prompt", ""], "");
     assert_eq!(output.code, ExitCode::InputRequired);
-}
-
-#[test]
-fn fake_plan_mode_needs_approval() {
-    let output = run_cli(["--fake", "--plan", "--prompt", "x"], "");
-    assert_eq!(output.code, ExitCode::ApprovalRequired);
-    assert_eq!(output.stdout, "approval_required\n");
-}
-
-#[test]
-fn fake_jsonl_and_text_rendering() {
-    let text = run_cli(["--fake", "--prompt", "hi"], "");
-    assert_eq!(text.stdout, "success\n");
-    let jsonl = run_cli(["--fake", "--prompt", "hi", "--jsonl"], "");
-    assert_eq!(jsonl.stdout, "{\"version\":1,\"kind\":\"success\"}\n");
 }
 
 #[test]

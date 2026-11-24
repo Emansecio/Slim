@@ -46,6 +46,9 @@ fn tool(name: &str, description: &str) -> McpToolSummary {
         description: Some(description.into()),
         schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
         output_schema: None,
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
     }
 }
 

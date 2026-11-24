@@ -15,6 +15,13 @@ use super::{prepare_tui, spawn_tui_session, TuiStartup};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn command_code_catalog_refresh_preserves_effort_capabilities() {
     for source in [
@@ -418,9 +425,17 @@ fn esc_cancels_blocked_oauth_preparation_without_starting_a_provider_run() {
 
 #[test]
 fn deepseek_flash_catalog_displays_v4_1_with_canonical_selection_id() {
+    let specs = vec![
+        slim_core::provider::OpenCodeModelSpec::from(
+            slim_core::provider::open_code_model("deepseek-v4.1-flash").expect("v4.1 flash"),
+        ),
+        slim_core::provider::OpenCodeModelSpec::from(
+            slim_core::provider::open_code_model("deepseek-v4-flash").expect("v4 flash"),
+        ),
+    ];
     let super::UiEvent::OpenCodeCatalogLoaded { models, source } =
         super::open_code_catalog_event(super::CatalogSnapshot {
-            model_ids: vec!["deepseek-flash".into(), "deepseek-v4-flash".into()],
+            models: specs,
             source: super::CatalogSource::Live,
         })
     else {
@@ -428,7 +443,7 @@ fn deepseek_flash_catalog_displays_v4_1_with_canonical_selection_id() {
     };
     assert_eq!(source, super::OpenCodeCatalogSource::Live);
     assert_eq!(models.len(), 2);
-    assert_eq!(models[0].id, "deepseek-flash");
+    assert_eq!(models[0].id, "deepseek-v4.1-flash");
     assert_eq!(models[0].name, "DeepSeek V4.1 Flash");
     assert_eq!(models[1].id, "deepseek-v4-flash");
     assert_eq!(models[1].name, "DeepSeek V4 Flash");
@@ -436,12 +451,17 @@ fn deepseek_flash_catalog_displays_v4_1_with_canonical_selection_id() {
 
 #[test]
 fn muse_catalog_offers_efforts_through_xhigh() {
+    let specs = vec![
+        slim_core::provider::OpenCodeModelSpec::from(
+            slim_core::provider::open_code_model("muse-spark-1.2-contributor").expect("1.2"),
+        ),
+        slim_core::provider::OpenCodeModelSpec::from(
+            slim_core::provider::open_code_model("muse-spark-1.3-contributor").expect("1.3"),
+        ),
+    ];
     let super::UiEvent::OpenCodeCatalogLoaded { models, .. } =
         super::open_code_catalog_event(super::CatalogSnapshot {
-            model_ids: vec![
-                "muse-spark-1.2-contributor".into(),
-                "muse-spark-1.3-contributor".into(),
-            ],
+            models: specs,
             source: super::CatalogSource::Live,
         })
     else {
@@ -787,6 +807,10 @@ fn text_only_model_restores_prompt_when_attachment_is_pending() {
         endpoint_override: None,
         model_override: None,
         timeout: std::time::Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
     channels
@@ -1490,6 +1514,10 @@ fn selecting_codex_model_activates_saved_login_from_opencode() {
         endpoint_override: None,
         model_override: None,
         timeout: std::time::Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
     channels
@@ -1601,6 +1629,10 @@ fn model_overlay_switches_across_all_saved_provider_groups() {
         endpoint_override: None,
         model_override: None,
         timeout: std::time::Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
 
@@ -1749,11 +1781,16 @@ fn provider_command_startup(request: Option<crate::ProviderRequest>) -> TuiStart
         endpoint_override: None,
         model_override: None,
         timeout: Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     }
 }
 
 fn connected_request(kind: slim_core::provider::ProviderKind) -> crate::ProviderRequest {
-    let (endpoint, model) = super::defaults_for_test(kind);
+    let endpoint = crate::cli::default_provider_endpoint(kind);
+    let model = crate::cli::default_provider_model(kind);
     crate::ProviderRequest {
         prompt: String::new(),
         mode: slim_core::OperatingMode::Auto,

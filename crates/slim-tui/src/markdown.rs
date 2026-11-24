@@ -100,6 +100,8 @@ pub(crate) struct LogicalLine {
     /// Cells left blank before every row after the first: a wrapped list
     /// item continues under its text, not under its marker.
     hang: usize,
+    /// Whether this logical line belongs to an open list (`!list_stack.is_empty()`).
+    in_list: bool,
 }
 
 /// Cells of a row of a logical line: the first row and the ones after it
@@ -270,6 +272,7 @@ impl Projection {
                 self.current.indent = hang;
                 self.current.hang = hang;
             }
+            self.current.in_list = !self.list_stack.is_empty();
             self.current.kind = match self.block_tone {
                 BlockTone::Code { diff: false } => LineKind::Code,
                 BlockTone::Code { diff: true } => classify_diff_line(&self.current),
@@ -466,7 +469,7 @@ impl Projection {
     }
 }
 
-fn pad_cells(text: &str, width: usize) -> String {
+pub(crate) fn pad_cells(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
@@ -502,6 +505,27 @@ pub(crate) fn project_markdown(source: &str, width: u16) -> Vec<LogicalLine> {
     project(source, width.max(1) as usize)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StableListState {
+    None,
+    Unordered(u8),
+    Ordered,
+}
+
+fn is_ordered_list_item(line: &str) -> bool {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return false;
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if !(1..=9).contains(&digits) {
+        return false;
+    }
+    let after = &trimmed.as_bytes()[digits..];
+    matches!(after.first(), Some(b'.' | b')'))
+        && matches!(after.get(1), None | Some(b' ' | b'\t' | b'\r' | b'\n'))
+}
+
 /// Byte length of the longest prefix of `source` a streaming body can keep
 /// projected while its tail grows: it ends at a blank line outside any
 /// fenced code block, and the line after it opens a block that parses the
@@ -513,8 +537,11 @@ pub(crate) fn stable_prefix_len(source: &str) -> usize {
     let mut fence: Option<(u8, usize)> = None;
     let mut stable = 0;
     let mut previous_blank = false;
+    let mut list_state = StableListState::None;
     let mut offset = 0;
     for line in source.split_inclusive('\n') {
+        let indented = line.starts_with([' ', '\t']);
+        let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
         let trimmed = line.trim_start_matches([' ', '\t']);
         let run = trimmed
             .bytes()
@@ -522,12 +549,26 @@ pub(crate) fn stable_prefix_len(source: &str) -> usize {
             .filter(|byte| matches!(byte, b'`' | b'~'))
             .map(|byte| (byte, trimmed.bytes().take_while(|b| *b == byte).count()))
             .filter(|(_, length)| *length >= 3);
+        let list_marker = if fence.is_none() {
+            unordered_list_item_marker(line)
+        } else {
+            None
+        };
+        let ordered_item = fence.is_none() && list_marker.is_none() && is_ordered_list_item(line);
         if fence.is_none() && previous_blank {
-            let opens_block = run.is_some()
+            let opens_root_fence = run.is_some()
+                && !line.starts_with('\t')
+                && leading_spaces <= 3
+                && !(list_state != StableListState::None && indented);
+            let opens_block = opens_root_fence
                 || line
                     .chars()
                     .next()
-                    .is_some_and(|first| first.is_alphabetic() || first == '#');
+                    .is_some_and(|first| first.is_alphabetic() || first == '#')
+                || matches!(
+                    (list_marker, list_state),
+                    (Some(marker), StableListState::Unordered(open)) if marker == open
+                );
             if opens_block {
                 stable = offset;
             }
@@ -537,8 +578,25 @@ pub(crate) fn stable_prefix_len(source: &str) -> usize {
                 if byte == open && count >= length && trimmed[count..].trim().is_empty() =>
             {
                 fence = None;
+                if !indented {
+                    list_state = StableListState::None;
+                }
             }
-            (None, Some(opened)) => fence = Some(opened),
+            (None, Some(opened)) => {
+                fence = Some(opened);
+                if !indented {
+                    list_state = StableListState::None;
+                }
+            }
+            (None, None) => {
+                if let Some(marker) = list_marker {
+                    list_state = StableListState::Unordered(marker);
+                } else if ordered_item && !indented {
+                    list_state = StableListState::Ordered;
+                } else if !line.trim().is_empty() && !indented {
+                    list_state = StableListState::None;
+                }
+            }
             _ => {}
         }
         previous_blank = fence.is_none() && line.trim().is_empty();
@@ -547,13 +605,163 @@ pub(crate) fn stable_prefix_len(source: &str) -> usize {
     stable
 }
 
+fn unordered_list_item_marker(line: &str) -> Option<u8> {
+    let bytes = line.as_bytes();
+    let marker = *bytes.first()?;
+    if !matches!(marker, b'-' | b'*' | b'+') || !matches!(bytes.get(1), Some(b' ' | b'\t')) {
+        return None;
+    }
+    if marker != b'+' {
+        let rest = line.trim_end_matches(['\r', '\n']);
+        let same_count = rest
+            .bytes()
+            .filter(|byte| !matches!(byte, b' ' | b'\t'))
+            .take_while(|byte| *byte == marker)
+            .count();
+        if same_count >= 3
+            && rest
+                .bytes()
+                .all(|byte| byte == marker || matches!(byte, b' ' | b'\t'))
+        {
+            return None;
+        }
+    }
+    Some(marker)
+}
+
+pub(crate) struct OpenFenceStart {
+    pub header_len: usize,
+    pub marker: (u8, usize),
+    pub indent: usize,
+    pub diff: bool,
+    pub label: Option<String>,
+}
+
+pub(crate) fn parse_open_fence_start(tail: &str) -> Option<OpenFenceStart> {
+    let newline = tail.find('\n')?;
+    let header_len = newline + 1;
+    let line = tail[..newline].strip_suffix('\r').unwrap_or(&tail[..newline]);
+    let spaces = line.bytes().take_while(|&byte| byte == b' ').count();
+    if spaces > 3 {
+        return None;
+    }
+    let trimmed = &line[spaces..];
+    let byte = *trimmed.as_bytes().first()?;
+    if !matches!(byte, b'`' | b'~') {
+        return None;
+    }
+    let count = trimmed.bytes().take_while(|&b| b == byte).count();
+    if count < 3 {
+        return None;
+    }
+    let info = &trimmed[count..];
+    if byte == b'`' && info.contains('`') {
+        return None;
+    }
+    let safe_info = sanitize_terminal_text_cow(info);
+    let diff = matches!(
+        safe_info.trim().to_ascii_lowercase().as_str(),
+        "diff" | "patch"
+    );
+    let label = code_label(&safe_info);
+    Some(OpenFenceStart {
+        header_len,
+        marker: (byte, count),
+        indent: spaces,
+        diff,
+        label,
+    })
+}
+
+pub(crate) fn is_closing_fence_line(line: &str, marker: (u8, usize)) -> bool {
+    let line = line
+        .strip_suffix('\n')
+        .unwrap_or(line)
+        .strip_suffix('\r')
+        .unwrap_or(line.strip_suffix('\n').unwrap_or(line));
+    let spaces = line.bytes().take_while(|&byte| byte == b' ').count();
+    if spaces > 3 {
+        return false;
+    }
+    let trimmed = &line[spaces..];
+    let count = trimmed.bytes().take_while(|&b| b == marker.0).count();
+    count >= marker.1 && trimmed[count..].trim().is_empty()
+}
+
+pub(crate) fn code_label_line(label: &str) -> LogicalLine {
+    let mut line = LogicalLine {
+        kind: LineKind::CodeLabel,
+        ..LogicalLine::default()
+    };
+    line.push(label, Tone::CodeLabel, Modifier::empty());
+    line
+}
+
+pub(crate) fn project_open_fence_line(raw_line: &str, indent: usize, diff: bool) -> LogicalLine {
+    let trimmed = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+    let safe = sanitize_terminal_text_cow(trimmed);
+    let strip = safe
+        .bytes()
+        .take(indent)
+        .take_while(|&byte| byte == b' ')
+        .count();
+    let mut line = LogicalLine::default();
+    line.push(&safe[strip..], Tone::CodeBlock, Modifier::empty());
+    line.kind = if diff {
+        classify_diff_line(&line)
+    } else {
+        LineKind::Code
+    };
+    line
+}
+
+pub(crate) fn is_potential_closing_fence_prefix(tail: &str, _marker: (u8, usize)) -> bool {
+    let trimmed = tail.strip_suffix('\r').unwrap_or(tail);
+    trimmed.len() <= 3 && trimmed.bytes().all(|byte| byte == b' ')
+}
+
+pub(crate) fn project_open_fence_tail(
+    tail: &str,
+    indent: usize,
+    diff: bool,
+    marker: (u8, usize),
+) -> Vec<LogicalLine> {
+    if tail.is_empty() || is_potential_closing_fence_prefix(tail, marker) {
+        return Vec::new();
+    }
+    tail.split_inclusive('\n')
+        .map(|segment| project_open_fence_line(segment, indent, diff))
+        .collect()
+}
+
 /// Appends `tail`, projected on its own, after `lines` the way the whole
-/// projection would: a gap row separates the two blocks.
+/// projection would: a gap row separates distinct root blocks.
 pub(crate) fn append_projection(lines: &mut Vec<LogicalLine>, tail: Vec<LogicalLine>) {
-    if !tail.is_empty() && lines.last().is_some_and(|line| !is_gap(line)) {
+    if needs_gap_between(lines, &tail) {
         lines.push(LogicalLine::default());
     }
     lines.extend(tail);
+}
+
+pub(crate) fn needs_gap_between(prefix: &[LogicalLine], tail: &[LogicalLine]) -> bool {
+    let Some(last) = prefix.last() else {
+        return false;
+    };
+    let Some(first) = tail.first() else {
+        return false;
+    };
+    if is_gap(last) || is_gap(first) {
+        return false;
+    }
+    let prefix_in_list = last.in_list;
+    let tail_starts_unordered_item = first.in_list
+        && first.indent == 0
+        && first.hang == 2
+        && first
+            .pieces
+            .first()
+            .is_some_and(|piece| piece.text.starts_with("• "));
+    !(prefix_in_list && tail_starts_unordered_item)
 }
 
 pub(crate) fn projected_row_count(lines: &[LogicalLine], width: u16) -> usize {
@@ -772,6 +980,7 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                 if projection.quote_has_text {
                     projection.lines.push(LogicalLine {
                         kind: LineKind::Quote,
+                        in_list: !projection.list_stack.is_empty(),
                         ..LogicalLine::default()
                     });
                 }
@@ -907,6 +1116,7 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                 projection.gap_before_block();
                 projection.lines.push(LogicalLine {
                     kind: LineKind::Rule,
+                    in_list: !projection.list_stack.is_empty(),
                     ..LogicalLine::default()
                 });
             }
@@ -1522,7 +1732,7 @@ mod tests {
     };
     use unicode_width::UnicodeWidthStr;
 
-    const STREAMED_SAMPLE: &str = "# Title\n\nFirst paragraph with `code` and **bold**.\n\n- item one\n- item two\n\n  continued item\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n> quoted\n> more\n\nSecond paragraph.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n1. one\n2. two\n\nÚltimo parágrafo acentuado.\n\n~~~\nplain\n\nfence\n~~~\n\n---\n- after a rule\n\n**Label**\n- under its label\n\n1. Run:\n   ```bash\n   cargo test\n   ```\n2. Then check.\n\nTail text";
+    const STREAMED_SAMPLE: &str = "# Title\n\nFirst paragraph with `code` and **bold**.\n\n- item one\n- item two\n\n  continued item\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n> quoted\n> more\n\nSecond paragraph.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n1. one\n2. two\n\nÚltimo parágrafo acentuado.\n\n~~~\nplain\n\nfence\n~~~\n\n---\n- after a rule\n\n**Label**\n- under its label\n\n1. Run:\n   ```bash\n   cargo test\n   ```\n2. Then check.\n\n- loose a\n\n- loose b\n\n- loose c\n\n- item\n\n  ```rust\n  code\n  ```\n\n- a\n\n  ---\n\n- b\n\n- c\n\n  # heading\n\n- d\n\nPara\n\n  ```rust\n  code\n  ```\n\n  ```diff\n  +added\n  -removed\n  ```\n\n ```rust\n one\n ```\n\n   ~~~\n   three\n   ~~~\n\n  ```rust\n\tcode\n  ```\n\n   ```rust\n \tcode\n   ```\n\n  ```rust\n  \tcode\n  ```\n\n  ```rust\n  code\tmore\n  ```\n\n  ```diff\n\t+added\n  ```\n\nTail text";
 
     #[test]
     fn stable_prefix_ends_at_a_blank_line_before_a_root_block_outside_fences() {
@@ -1532,8 +1742,18 @@ mod tests {
         assert_eq!(stable_prefix_len("para\n\nnext"), 6);
         assert_eq!(stable_prefix_len("para\n\n# head"), 6);
         assert_eq!(stable_prefix_len("para\n\n```\ncode"), 6);
-        // A list item's continuation, a quote, a table row or a marker do not
-        // open a block on their own.
+        // Blank-line-separated unordered top-level list items advance once the
+        // list is already open with the same bullet marker.
+        assert_eq!(stable_prefix_len("- a\n\n- b"), 5);
+        assert_eq!(stable_prefix_len("- a\n\n- b\n\n- c"), 10);
+        assert_eq!(stable_prefix_len("* a\n\n* b"), 5);
+        assert_eq!(stable_prefix_len("- a\n\n* b"), 0);
+        assert_eq!(stable_prefix_len("- a\n\n- - -"), 0);
+        // Indented fences or continuations inside a list item do not split at root.
+        assert_eq!(stable_prefix_len("- item\n\n  ```rust\n  code\n  ```"), 0);
+        assert_eq!(stable_prefix_len("1. item\n\n   ```rust\n   code\n   ```"), 0);
+        // A list item's continuation, a quote, a table row or a marker after
+        // prose do not open a block on their own.
         assert_eq!(stable_prefix_len("- a\n\n  b"), 0);
         assert_eq!(stable_prefix_len("para\n\n> q"), 0);
         assert_eq!(stable_prefix_len("para\n\n| a |"), 0);
@@ -1544,6 +1764,27 @@ mod tests {
         assert_eq!(stable_prefix_len("  ```\na\n\nb\n  ```\n\nafter"), 18);
         assert_eq!(stable_prefix_len("```\na\n\nb"), 0);
         assert_eq!(stable_prefix_len("a\n\nb\n\nc"), 6);
+    }
+
+    #[test]
+    fn indented_blocks_inside_list_items_stream_identically_to_whole_projection() {
+        use super::{append_projection, project_markdown, render_projected, stable_prefix_len};
+        let sample = "- item\n\n  ```rust\n  code\n  ```\n\n- a\n\n  ---\n\n- b\n\n- c\n\n  # heading\n\n- d\n\n- e\n\n  > quote\n\n- f\n\n- g\n\n  | h |\n  |---|\n  | 1 |\n\n- h";
+        let width = 40;
+        for end in (0..=sample.len()).filter(|end| sample.is_char_boundary(*end)) {
+            let text = &sample[..end];
+            let split = stable_prefix_len(text);
+            let mut split_projection = project_markdown(&text[..split], width);
+            append_projection(
+                &mut split_projection,
+                project_markdown(&text[split..], width),
+            );
+            assert_eq!(
+                render_projected(&split_projection, width, styles()),
+                render_projected(&project_markdown(text, width), width, styles()),
+                "prefix of {end} bytes split at {split}"
+            );
+        }
     }
 
     #[test]
@@ -1905,6 +2146,42 @@ mod tests {
             sanitize_terminal_text("safe\u{9d}52;secret\u{9c}tail"),
             "safetail"
         );
+    }
+
+    #[test]
+    fn open_fence_strips_up_to_opening_indent_spaces() {
+        use super::{
+            parse_open_fence_start, project_open_fence_line, project_open_fence_tail, LineKind,
+        };
+        let two_sp = parse_open_fence_start("  ```diff\n  +added\n").expect("open diff fence");
+        assert_eq!(two_sp.indent, 2);
+        assert!(two_sp.diff);
+        let added = project_open_fence_line("  +added\n", two_sp.indent, two_sp.diff);
+        assert_eq!(added.kind, LineKind::DiffAdd);
+        assert_eq!(added.pieces[0].text, "+added");
+
+        let partial = project_open_fence_tail("  -rem", two_sp.indent, two_sp.diff, two_sp.marker);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].kind, LineKind::DiffRemove);
+        assert_eq!(partial[0].pieces[0].text, "-rem");
+
+        // Expand tabs at 4-column stops before stripping up to `indent` spaces
+        // (matching `project()` / CommonMark §2.2).
+        let tabbed = project_open_fence_line("\tindented\n", 3, false);
+        assert_eq!(tabbed.pieces[0].text, " indented");
+        let space_then_tab = project_open_fence_line(" \tindented\n", 3, false);
+        assert_eq!(space_then_tab.pieces[0].text, " indented");
+        let two_spaces_then_tab_3 = project_open_fence_line("  \tindented\n", 3, false);
+        assert_eq!(two_spaces_then_tab_3.pieces[0].text, " indented");
+        let two_spaces_then_tab_2 = project_open_fence_line("  \tindented\n", 2, false);
+        assert_eq!(two_spaces_then_tab_2.pieces[0].text, "  indented");
+        let mid_tab = project_open_fence_line("  code\tmore\n", 2, false);
+        assert_eq!(mid_tab.pieces[0].text, "code  more");
+        let diff_tab = project_open_fence_line("\t+added\n", 2, true);
+        assert_eq!(diff_tab.kind, LineKind::DiffContext);
+        assert_eq!(diff_tab.pieces[0].text, "  +added");
+        let extra = project_open_fence_line("   three\n", 1, false);
+        assert_eq!(extra.pieces[0].text, "  three");
     }
 
     #[test]

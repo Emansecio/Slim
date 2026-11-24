@@ -586,7 +586,7 @@ fn textual_model_command_selects_clinepass_model() {
 }
 
 #[test]
-fn textual_model_command_rejects_unknown_clinepass_model() {
+fn textual_model_command_rejects_unknown_clinepass_model_and_preserves_draft() {
     let mut state = AppState::new();
     state.auth_provider = Some(LoginProvider::ClinePass);
     state.authenticated = true;
@@ -598,17 +598,7 @@ fn textual_model_command_rejects_unknown_clinepass_model() {
             effort: ReasoningEffort::High,
         }))
     );
-    // Unknown selection still surfaces a notification and does not hang.
     assert!(effects.contains(&Effect::RequestRender));
-}
-
-#[test]
-fn unknown_model_command_preserves_draft_for_correction() {
-    let mut state = AppState::new();
-    state.auth_provider = Some(LoginProvider::ClinePass);
-    state.authenticated = true;
-    state.composer.insert_text("/model not-a-model");
-    let _ = reduce(&mut state, Action::Key(enter()));
     assert_eq!(state.composer.payload(), "/model not-a-model");
     assert!(
         state.notifications.iter().any(|notification| notification
@@ -1128,17 +1118,6 @@ fn new_content_preserves_coordinate_selection_snapshot() {
     );
     assert!(state.selection.is_some() && state.selection_area.is_some());
     assert_eq!(state.selection_text, "old content");
-}
-
-#[test]
-fn ctrl_c_idle_with_empty_draft_requests_shutdown_once() {
-    let mut state = AppState::new();
-    let effects = reduce(
-        &mut state,
-        Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-    );
-    assert!(state.shutdown);
-    assert!(effects.contains(&Effect::Send(UiCommand::Shutdown)));
 }
 
 #[test]

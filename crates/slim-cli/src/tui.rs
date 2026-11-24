@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use slim_core::mcp::{McpManager, McpServerStatus};
 use slim_core::provider::{
     clinepass_model, fetch_clinepass_catalog, is_clinepass_model_id, is_command_code_model_id,
-    is_devin_model_id, is_open_design_model_id, is_xai_model_id, open_code_model, zen_model,
+    is_devin_model_id, is_open_design_model_id, is_xai_model_id, zen_model,
     ProviderKind, CLINEPASS_BASE_URL, CLINEPASS_DEFAULT_MODEL, COMMANDCODE_BASE_URL,
     COMMANDCODE_DEFAULT_MODEL, DEVIN_DEFAULT_BASE_URL, DEVIN_DEFAULT_MODEL,
     OPENCODE_GO_BASE_URL, OPENCODE_GO_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL,
@@ -49,7 +49,7 @@ use crate::oauth::{
 use crate::open_design_catalog::OpenDesignCatalog;
 use crate::opencode_go_catalog::{CatalogSnapshot, CatalogSource, OpenCodeCatalog};
 use crate::opencode_zen_catalog::OpenCodeZenCatalog;
-use crate::{delete_api_key, load_local_images, resolve_provider_credential, save_api_key};
+use crate::{delete_api_key, load_local_images, save_api_key};
 
 pub struct TuiRuntimeHandle {
     shutdown: Option<mpsc::Sender<UiCommand>>,
@@ -145,6 +145,11 @@ struct TuiStartup {
     endpoint_override: Option<String>,
     model_override: Option<String>,
     timeout: Duration,
+    layered_config: Option<crate::config::LayeredConfig>,
+    lsp_trust_notice: Option<String>,
+    cached_project_trust:
+        Option<(PathBuf, Result<Option<crate::mcp::trust::TrustDecision>, String>)>,
+    queue_bridge: Option<slim_tui::QueueJournalBridge>,
 }
 
 static NEXT_TUI_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -152,6 +157,36 @@ static NEXT_TUI_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 struct SelectedTuiSession {
     preflight: SessionPreflight,
     history: Vec<ProviderMessage>,
+}
+
+fn sync_watched_jobs(
+    watcher_jobs: &slim_core::runtime::ShellJobs,
+    seen_jobs: &mut Vec<slim_core::runtime::ShellJobInfo>,
+    warning_sink: &EventSink,
+) -> bool {
+    let mut emitted = false;
+    let snapshot = watcher_jobs.list();
+    let mut signature = snapshot.clone();
+    for job in &mut signature {
+        if matches!(
+            job.state.as_str(),
+            "running" | "interrupting" | "cancelling"
+        ) {
+            job.elapsed_ms = 0;
+        }
+    }
+    if signature != *seen_jobs {
+        *seen_jobs = signature;
+        warning_sink.send(UiEvent::JobsChanged { jobs: snapshot });
+        emitted = true;
+    }
+    for job in watcher_jobs.take_notifications() {
+        warning_sink.send(UiEvent::Notification {
+            message: job_finished_notice(&job),
+        });
+        emitted = true;
+    }
+    emitted
 }
 
 /// Toast for a job that ended: `shell-67 · concluído · 5s`. The exit code is
@@ -334,7 +369,52 @@ fn tui_session_id(timestamp: u128) -> String {
     format!("tui-{timestamp}-{}-{suffix}", std::process::id())
 }
 
-fn create_tui_session(startup: &mut TuiStartup) -> Result<Option<(String, String)>, String> {
+struct CreatedTuiSession {
+    id: String,
+    cwd: String,
+    workspace: PathBuf,
+}
+
+async fn preopen_queue_journal(
+    bridge: Option<slim_tui::QueueJournalBridge>,
+    workspace: PathBuf,
+    session_id: String,
+    initial_in_flight: Option<String>,
+) -> Result<(), String> {
+    let Some(bridge) = bridge else {
+        return Ok(());
+    };
+    let (session_id, journal) = tokio::task::spawn_blocking(move || {
+        let mut journal = slim_core::session::PromptQueueJournal::open(&workspace, &session_id)
+            .map_err(|error| format!("prompt queue open failed: {error}"))?;
+        if let Some(prompt) = initial_in_flight {
+            journal
+                .save(slim_core::session::PromptQueueSnapshot {
+                    pending: Vec::new(),
+                    in_flight: Some(prompt),
+                    recovery_draft: None,
+                })
+                .map_err(|error| format!("prompt queue persistence failed: {error}"))?;
+        }
+        Ok::<_, String>((session_id, journal))
+    })
+    .await
+    .map_err(|error| format!("prompt queue open task failed: {error}"))??;
+    bridge.seed_preopened(session_id, journal);
+    Ok(())
+}
+
+async fn await_queue_durable(bridge: Option<slim_tui::QueueJournalBridge>) -> Result<(), String> {
+    let Some(bridge) = bridge else {
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || bridge.wait_durable())
+        .await
+        .map_err(|error| format!("prompt queue durability task failed: {error}"))?
+        .map_err(|error| format!("prompt queue persistence failed: {error}"))
+}
+
+fn create_tui_session(startup: &mut TuiStartup) -> Result<Option<CreatedTuiSession>, String> {
     if !startup.persist_sessions || startup.resume_path.is_some() {
         return Ok(None);
     }
@@ -362,20 +442,47 @@ fn create_tui_session(startup: &mut TuiStartup) -> Result<Option<(String, String
         let header = DurableSessionHeader::new(&id, timestamp.to_string(), &cwd, None, None);
         match JsonlRepo::create(&path, header) {
             Ok(repo) => {
+                let preflight = SessionPreflight::from_open_repo(&repo);
                 drop(repo);
-                let preflight = slim_core::session::preflight_session(&path)
-                    .map_err(|error| format!("session preflight: {error}"))?;
                 super::headless::ensure_resume_preflight(&preflight)
                     .map_err(|error| format!("session preflight: {error}"))?;
                 startup.resume_path = Some(preflight.path.clone());
                 startup.resume_preflight = Some(preflight);
-                return Ok(Some((id, display_workspace_path(&canonical_workspace))));
+                return Ok(Some(CreatedTuiSession {
+                    id,
+                    cwd: display_workspace_path(&canonical_workspace),
+                    workspace: canonical_workspace,
+                }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("create session: {error}")),
         }
     }
     Err("could not allocate a unique session file".into())
+}
+
+async fn create_tui_session_with_queue(
+    startup: &mut TuiStartup,
+    initial_in_flight: Option<String>,
+) -> Result<Option<(String, String)>, String> {
+    let Some(created) = create_tui_session(startup)? else {
+        return Ok(None);
+    };
+    if let Err(error) = preopen_queue_journal(
+        startup.queue_bridge.clone(),
+        created.workspace,
+        created.id.clone(),
+        initial_in_flight,
+    )
+    .await
+    {
+        if let Some(path) = startup.resume_path.take() {
+            let _ = fs::remove_file(path);
+        }
+        startup.resume_preflight = None;
+        return Err(error);
+    }
+    Ok(Some((created.id, created.cwd)))
 }
 
 fn system_time_nanos(time: SystemTime) -> u128 {
@@ -461,7 +568,147 @@ fn read_session_header(path: &Path) -> Option<DurableSessionHeader> {
     serde_json::from_slice(&first_line).ok()
 }
 
+#[derive(Default)]
+struct CodemodeStepRecord {
+    key: String,
+    parent_call_id: String,
+    batch_prefix: String,
+    name: String,
+    arguments: String,
+    status: String,
+    duration_ms: Option<u64>,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+    error_bytes: Option<u64>,
+}
+
+impl CodemodeStepRecord {
+    fn summary_text(&self) -> String {
+        let mut lines = Vec::new();
+        let status = if self.status.is_empty() {
+            "unknown"
+        } else {
+            self.status.as_str()
+        };
+        let duration = self
+            .duration_ms
+            .map(|ms| format!(" ({ms}ms)"))
+            .unwrap_or_default();
+        lines.push(format!("status: {status}{duration}"));
+        if let Some(error) = &self.error {
+            let truncated = self
+                .error_bytes
+                .is_some_and(|total| total as usize > error.len());
+            if truncated {
+                lines.push(format!("error: {error}…"));
+            } else {
+                lines.push(format!("error: {error}"));
+            }
+        } else if let Some(result) = &self.result {
+            if !result.is_null() {
+                lines.push(format!("result: {result}"));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn codemode_steps_by_parent(
+    records: &[slim_core::session::DurableRecord],
+) -> std::collections::HashMap<String, std::collections::VecDeque<Vec<CodemodeStepRecord>>> {
+    let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ordered: Vec<CodemodeStepRecord> = Vec::new();
+    for record in records {
+        let slim_core::session::DurableRecord::Fact { fact, .. } = record else {
+            continue;
+        };
+        if fact.namespace != "codemode.call.v1" {
+            continue;
+        }
+        let Some(parent_call_id) = fact
+            .value
+            .get("parent_call_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let index = *by_key.entry(fact.key.clone()).or_insert_with(|| {
+            let batch_prefix = fact
+                .key
+                .rsplit_once(':')
+                .map_or(fact.key.as_str(), |(prefix, _)| prefix)
+                .to_owned();
+            ordered.push(CodemodeStepRecord {
+                key: fact.key.clone(),
+                parent_call_id: parent_call_id.to_owned(),
+                batch_prefix,
+                ..CodemodeStepRecord::default()
+            });
+            ordered.len() - 1
+        });
+        let step = &mut ordered[index];
+        if let Some(name) = fact.value.get("name").and_then(serde_json::Value::as_str) {
+            step.name = name.to_owned();
+        }
+        if let Some(arguments) = fact.value.get("arguments") {
+            step.arguments = arguments.to_string();
+        }
+        if let Some(status) = fact.value.get("status").and_then(serde_json::Value::as_str) {
+            step.status = status.to_owned();
+        }
+        if let Some(duration_ms) = fact
+            .value
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64)
+        {
+            step.duration_ms = Some(duration_ms);
+        }
+        if let Some(result) = fact.value.get("result") {
+            step.result = Some(result.clone());
+        }
+        if let Some(error) = fact.value.get("error").and_then(serde_json::Value::as_str) {
+            step.error = Some(error.to_owned());
+        }
+        if let Some(error_bytes) = fact
+            .value
+            .get("error_bytes")
+            .and_then(serde_json::Value::as_u64)
+        {
+            step.error_bytes = Some(error_bytes);
+        }
+    }
+    let mut grouped: std::collections::HashMap<
+        String,
+        std::collections::VecDeque<Vec<CodemodeStepRecord>>,
+    > = std::collections::HashMap::new();
+    for step in ordered {
+        let queue = grouped.entry(step.parent_call_id.clone()).or_default();
+        let same_batch = queue
+            .back()
+            .and_then(|group| group.last())
+            .is_some_and(|last| last.batch_prefix == step.batch_prefix);
+        if same_batch {
+            queue.back_mut().unwrap().push(step);
+        } else {
+            queue.push_back(vec![step]);
+        }
+    }
+    grouped
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn transcript_messages(history: &[ProviderMessage]) -> Vec<TranscriptMessage> {
+    let mut empty = std::collections::HashMap::new();
+    transcript_messages_with_steps(history, &mut empty)
+}
+
+fn transcript_messages_with_steps(
+    history: &[ProviderMessage],
+    steps_by_parent: &mut std::collections::HashMap<
+        String,
+        std::collections::VecDeque<Vec<CodemodeStepRecord>>,
+    >,
+) -> Vec<TranscriptMessage> {
     let mut restored = Vec::new();
     let mut pending = std::collections::BTreeMap::new();
     for (index, message) in history.iter().enumerate() {
@@ -479,15 +726,44 @@ fn transcript_messages(history: &[ProviderMessage]) -> Vec<TranscriptMessage> {
                 }
                 for call in &message.tool_calls {
                     pending.insert(call.id.as_str(), restored.len());
+                    let batch_id = ToolBatchId(format!("history-batch-{index}").into());
                     restored.push(TranscriptMessage {
                         role: TranscriptRole::Tool {
-                            batch_id: ToolBatchId(format!("history-batch-{index}").into()),
+                            batch_id: batch_id.clone(),
                             call_id: ToolCallId(format!("history-{index}:{}", call.id).into()),
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
                         },
                         text: String::new(),
                     });
+                    if call.name == "codemode" {
+                        if let Some(steps) = steps_by_parent
+                            .get_mut(&call.id)
+                            .and_then(std::collections::VecDeque::pop_front)
+                        {
+                            for step in steps {
+                                let name =
+                                    slim_tui::api::codemode_step_tool(&step.name).to_owned();
+                                let arguments = match step.name.strip_prefix("mcp.") {
+                                    Some(target) if step.arguments.is_empty() => target.to_owned(),
+                                    Some(target) => format!("{target} {}", step.arguments),
+                                    None => step.arguments.clone(),
+                                };
+                                let text = step.summary_text();
+                                restored.push(TranscriptMessage {
+                                    role: TranscriptRole::Tool {
+                                        batch_id: batch_id.clone(),
+                                        call_id: ToolCallId(
+                                            format!("history-{index}:{}", step.key).into(),
+                                        ),
+                                        name,
+                                        arguments,
+                                    },
+                                    text,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             "tool" => {
@@ -505,10 +781,17 @@ fn transcript_messages(history: &[ProviderMessage]) -> Vec<TranscriptMessage> {
     restored
 }
 
-fn session_transcript(preflight: &SessionPreflight) -> Result<Vec<TranscriptMessage>, String> {
+fn session_transcript(
+    preflight: &SessionPreflight,
+    skip: bool,
+) -> Result<Vec<TranscriptMessage>, String> {
     let history = slim_core::session::provider_messages_from_records(preflight.records.iter())
         .map_err(str::to_owned)?;
-    Ok(transcript_messages(&history))
+    if skip {
+        return Ok(Vec::new());
+    }
+    let mut steps = codemode_steps_by_parent(&preflight.records);
+    Ok(transcript_messages_with_steps(&history, &mut steps))
 }
 
 /// Persists a `/rename` made before the session file existed, then tells the
@@ -551,7 +834,7 @@ fn session_job_metadata(preflight: &SessionPreflight) -> Vec<slim_core::runtime:
     jobs.into_values().collect()
 }
 
-fn switch_session(
+async fn switch_session(
     startup: &mut TuiStartup,
     sink: &EventSink,
     skill_memo: &mut SkillNameMemo,
@@ -570,7 +853,10 @@ fn switch_session(
         .clone()
         .unwrap_or_else(|| "unknown".into());
     let cwd = display_workspace_path(&workspace);
-    let messages = match session_transcript(&selected.preflight) {
+    let messages = match session_transcript(
+        &selected.preflight,
+        startup.options.skip_restored_transcript,
+    ) {
         Ok(messages) => messages,
         Err(message) => {
             sink.send(UiEvent::RunFailed {
@@ -591,6 +877,24 @@ fn switch_session(
         }
     };
     if !leave_session(startup, sink) {
+        return false;
+    }
+    if let Err(message) = await_queue_durable(startup.queue_bridge.clone()).await {
+        let _ = sink.send(UiEvent::Notification { message });
+    }
+    let canonical_workspace = fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+    if let Err(message) = preopen_queue_journal(
+        startup.queue_bridge.clone(),
+        canonical_workspace,
+        session_id.clone(),
+        None,
+    )
+    .await
+    {
+        sink.send(UiEvent::RunFailed {
+            run_id: None,
+            message,
+        });
         return false;
     }
     if let Some(jobs) = &startup.options.shell_jobs {
@@ -690,6 +994,9 @@ fn start_new_session(
     user_shell_context.clear();
     let cwd = display_workspace_path(&workspace);
     let skill_names = skill_memo.names(Some(workspace));
+    if let Some(bridge) = &startup.queue_bridge {
+        bridge.begin_session_clear();
+    }
     let _ = sink.send(UiEvent::SessionCleared { cwd, skill_names });
     if let Some(jobs) = &startup.options.shell_jobs {
         sink.send(UiEvent::JobsChanged { jobs: jobs.list() });
@@ -707,11 +1014,17 @@ fn start_new_session(
 pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
     let oauth = OAuthService::production()
         .map_err(|error| TuiError::new(ExitCode::Auth, error.to_string()))?;
-    let startup = prepare_tui(args, &oauth)?;
+    let mut startup = prepare_tui(args, &oauth)?;
     let initial_prompt = startup.initial_prompt.clone();
+    let queue_bridge = slim_tui::QueueJournalBridge::new();
+    startup.queue_bridge = Some(queue_bridge.clone());
     let (runtime, channels) = spawn_tui_session(startup, oauth).map_err(tui_provider_error)?;
-    let result = slim_tui::run_app_with_initial_prompt(channels, initial_prompt)
-        .map_err(|error| TuiError::new(ExitCode::Internal, error.to_string()));
+    let result = slim_tui::run_app_with_initial_prompt_and_bridge(
+        channels,
+        initial_prompt,
+        queue_bridge,
+    )
+    .map_err(|error| TuiError::new(ExitCode::Internal, error.to_string()));
     let worker_result = runtime.finish();
     if let Ok(warnings) = &worker_result {
         for warning in warnings {
@@ -781,12 +1094,15 @@ fn prepare_tui_in(
     // The project slim.toml comes from the workspace (the process directory
     // when none is given); its LSP launch overrides follow the project MCP
     // trust decision.
-    let lsp_trust = crate::code_intel::project_trust(
+    let trust_workspace = workspace
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let mut cached_trust = None;
+    let lsp_trust = crate::code_intel::project_trust_with_cached(
         &layered_config.lsp,
-        &workspace
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        &trust_workspace,
         parsed.trust_project,
+        &mut cached_trust,
     );
     let application_code_intelligence =
         crate::code_intel::build_code_intelligence(&layered_config.lsp, lsp_trust.trusted);
@@ -806,14 +1122,16 @@ fn prepare_tui_in(
     let endpoint_override = parsed
         .endpoint
         .or_else(|| std::env::var("SLIM_ENDPOINT").ok())
-        .or(layered_config.endpoint);
+        .or_else(|| layered_config.endpoint.clone());
     let explicit_model = parsed.model.or_else(|| std::env::var("SLIM_MODEL").ok());
-    let model_override = explicit_model.clone().or(layered_config.model);
+    let model_override = explicit_model
+        .clone()
+        .or_else(|| layered_config.model.clone());
     let configured_effort = parsed
         .effort
         .or_else(|| std::env::var("SLIM_EFFORT").ok())
         .filter(|value| !value.is_empty())
-        .or(layered_config.effort)
+        .or_else(|| layered_config.effort.clone())
         .filter(|value| !value.is_empty())
         .map(|value| {
             ReasoningEffort::parse(&value).ok_or_else(|| {
@@ -829,15 +1147,16 @@ fn prepare_tui_in(
         .provider
         .or_else(|| std::env::var("SLIM_PROVIDER").ok());
 
+    let mut auth_resolver = StartupAuthResolver::new(oauth);
     let (mut request, oauth_session) = if let Some(provider_name) = explicit_provider {
         let kind = provider_kind(&provider_name)?;
-        request_for_kind(
+        auth_resolver.request_for_kind(
             kind,
             parsed.mode,
             endpoint_override.as_deref(),
             model_override.as_deref(),
-            || {
-                let active = oauth.active().map_err(tui_auth_error)?;
+            |resolver| {
+                let active = resolver.active_oauth()?;
                 // An embedded host runs several conversations at once, each
                 // naming its provider: the stored login of that provider is
                 // used even when another conversation made a different one
@@ -845,12 +1164,10 @@ fn prepare_tui_in(
                 if workspace.is_none() {
                     return Ok(active);
                 }
-                oauth_session_for_kind(kind, active, |provider| {
-                    oauth.credential(provider).map_err(tui_auth_error)
-                })
+                oauth_session_for_kind(kind, active, |provider| resolver.oauth_credential(provider))
             },
         )?
-    } else if let Some(request) = api_key_request(
+    } else if let Some(request) = auth_resolver.api_key_request(
         ProviderKind::OpenAiCompatible,
         parsed.mode,
         endpoint_override.as_deref(),
@@ -858,16 +1175,16 @@ fn prepare_tui_in(
     )? {
         (Some(request), None)
     } else {
-        let active_provider = oauth.active_provider_key().map_err(tui_auth_error)?;
-        let active_oauth = oauth.active().map_err(tui_auth_error)?;
+        let active_provider = auth_resolver.active_provider_key()?;
+        let active_oauth = auth_resolver.active_oauth()?;
         if let Some(provider_name) = active_provider {
             let kind = provider_kind(&provider_name)?;
-            request_for_kind(
+            auth_resolver.request_for_kind(
                 kind,
                 parsed.mode,
                 endpoint_override.as_deref(),
                 model_override.as_deref(),
-                || Ok(active_oauth),
+                |_| Ok(active_oauth),
             )?
         } else if let Some((provider, credential)) = active_oauth {
             let request = oauth_request(
@@ -913,14 +1230,17 @@ fn prepare_tui_in(
     if let Some(model) = request
         .as_ref()
         .filter(|request| request.kind == ProviderKind::OpenCodeGo)
-        .and_then(|request| open_code_model(&request.model))
+        .and_then(|request| crate::opencode_go_catalog::resolve_model(&request.model))
     {
-        fit_effort_to_levels(
-            &mut effort,
-            model.reasoning_levels,
-            configured_effort.is_some(),
-            "OpenCode Go",
-        )?;
+        if !model.reasoning_levels.is_empty() {
+            let levels: Vec<&str> = model.reasoning_levels.iter().map(String::as_str).collect();
+            fit_effort_to_levels(
+                &mut effort,
+                &levels,
+                configured_effort.is_some(),
+                "OpenCode Go",
+            )?;
+        }
     }
     if let Some(model) = request
         .as_ref()
@@ -956,7 +1276,7 @@ fn prepare_tui_in(
             .with_content_blocks(content_blocks)
             .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy)),
     );
-    options.shell_job_limits = layered_config.shell_jobs;
+    options.shell_job_limits = layered_config.shell_jobs.clone();
     options
         .shell_job_limits
         .validate()
@@ -982,6 +1302,9 @@ fn prepare_tui_in(
     if let Some(display) = parsed.thinking_display {
         options = options.with_thinking_display(display);
     }
+    if let Some(adaptive) = parsed.adaptive_reasoning {
+        options = options.with_adaptive_reasoning(adaptive);
+    }
     Ok(TuiStartup {
         request,
         oauth_session,
@@ -997,6 +1320,10 @@ fn prepare_tui_in(
         endpoint_override,
         model_override,
         timeout,
+        layered_config: Some(layered_config),
+        lsp_trust_notice: lsp_trust.notice,
+        cached_project_trust: cached_trust.map(|decision| (trust_workspace, decision)),
+        queue_bridge: None,
     })
 }
 
@@ -1030,14 +1357,6 @@ fn provider_kind(name: &str) -> Result<ProviderKind, TuiError> {
         .map_err(|message| TuiError::new(ExitCode::Provider, message))
 }
 
-#[cfg(test)]
-pub(crate) fn defaults_for_test(kind: ProviderKind) -> (&'static str, &'static str) {
-    (
-        crate::cli::default_provider_endpoint(kind),
-        crate::cli::default_provider_model(kind),
-    )
-}
-
 /// What differs between the API-key providers; `/login`, model switching and
 /// `/logout` are one flow parameterised by this.
 struct ApiKeyProviderSpec {
@@ -1058,7 +1377,7 @@ struct ApiKeyProviderSpec {
 const API_KEY_UNAVAILABLE: &str = "API-key login is unavailable for this provider.";
 
 fn is_open_code_go_model(id: &str) -> bool {
-    open_code_model(id).is_some()
+    crate::opencode_go_catalog::known_model(id)
 }
 
 fn is_open_code_zen_model(id: &str) -> bool {
@@ -1264,8 +1583,11 @@ fn model_switch_rejection(
     effort: ReasoningEffort,
 ) -> Option<String> {
     match spec.kind {
-        ProviderKind::OpenCodeGo => (!open_code_model(model)
-            .is_some_and(|model| model.reasoning_levels.contains(&effort.id())))
+        ProviderKind::OpenCodeGo => (!crate::opencode_go_catalog::resolve_model(model)
+            .is_some_and(|model| {
+                model.reasoning_levels.is_empty()
+                    || model.reasoning_levels.iter().any(|level| level == effort.id())
+            }))
         .then(|| format!("Unsupported {} model or reasoning effort", spec.label)),
         // Models without reasoning levels take any effort (none is sent).
         ProviderKind::OpenCodeZen => (!zen_model(model).is_some_and(|model| {
@@ -1286,15 +1608,18 @@ fn model_switch_rejection(
     }
 }
 
-/// Reasoning effort a switched session sends; `None` for Zen models that
+/// Reasoning effort a switched session sends; `None` for OpenCode models that
 /// expose no effort knob.
 fn switched_reasoning_effort(
     spec: &ApiKeyProviderSpec,
     model: &str,
     effort: ReasoningEffort,
 ) -> Option<String> {
-    let knobless = spec.kind == ProviderKind::OpenCodeZen
-        && zen_model(model).is_some_and(|model| model.reasoning_levels.is_empty());
+    let knobless = (spec.kind == ProviderKind::OpenCodeZen
+        && zen_model(model).is_some_and(|model| model.reasoning_levels.is_empty()))
+        || (spec.kind == ProviderKind::OpenCodeGo
+            && crate::opencode_go_catalog::resolve_model(model)
+                .is_some_and(|model| model.reasoning_levels.is_empty()));
     (!knobless).then(|| effort.id().into())
 }
 
@@ -1341,6 +1666,7 @@ fn switch_api_key_model(
     startup.model_override = Some(model.clone());
     startup.effort = effort;
     startup.options.reasoning_effort = switched_reasoning_effort(spec, &model, effort);
+    startup.options.context_window_tokens = None;
     let _ = sink.send(UiEvent::Notification {
         message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
     });
@@ -1422,25 +1748,156 @@ async fn logout_api_key_provider(
 
 type OAuthSession = (OAuthProvider, OAuthCredential);
 
-/// Request for `kind`: its API key first, else the active OAuth login when it
-/// belongs to that kind. `active_oauth` is only consulted without an API key.
-fn request_for_kind(
-    kind: ProviderKind,
-    mode: slim_core::OperatingMode,
-    endpoint: Option<&str>,
-    model: Option<&str>,
-    active_oauth: impl FnOnce() -> Result<Option<OAuthSession>, TuiError>,
-) -> Result<(Option<ProviderRequest>, Option<OAuthSession>), TuiError> {
-    if let Some(request) = api_key_request(kind, mode, endpoint, model)? {
-        return Ok((Some(request), None));
+struct StartupAuthResolver<'a> {
+    oauth: &'a OAuthService,
+    auth_path: Option<PathBuf>,
+    auth_snapshot: Option<crate::auth::AuthSnapshot>,
+    oauth_snapshot: Option<crate::auth::AuthSnapshot>,
+}
+
+impl<'a> StartupAuthResolver<'a> {
+    fn new(oauth: &'a OAuthService) -> Self {
+        Self {
+            oauth,
+            auth_path: None,
+            auth_snapshot: None,
+            oauth_snapshot: None,
+        }
     }
-    let Some((provider, credential)) =
-        active_oauth()?.filter(|(provider, _)| provider_kind_for_oauth(*provider) == kind)
-    else {
-        return Ok((None, None));
-    };
-    let request = oauth_request(provider, &credential, mode, endpoint, model)?;
-    Ok((Some(request), Some((provider, credential))))
+
+    fn load_auth_snapshot(&mut self) -> Result<&crate::auth::AuthSnapshot, TuiError> {
+        if self.auth_snapshot.is_none() {
+            let path = crate::auth::auth_file_path().map_err(tui_auth_error)?;
+            let snapshot = match path.as_deref() {
+                Some(path) => crate::auth::load_auth_snapshot_at(path).map_err(tui_auth_error)?,
+                None => crate::auth::load_auth_snapshot().map_err(tui_auth_error)?,
+            };
+            self.auth_path = path;
+            self.auth_snapshot = Some(snapshot);
+        }
+        Ok(self.auth_snapshot.as_ref().expect("auth snapshot loaded"))
+    }
+
+    fn load_oauth_snapshot(&mut self) -> Result<&crate::auth::AuthSnapshot, TuiError> {
+        if self.oauth_snapshot.is_none() {
+            if self.auth_snapshot.is_none() {
+                self.auth_path = crate::auth::auth_file_path().map_err(tui_auth_error)?;
+            }
+            let store_path = self.oauth.store_path();
+            if self.auth_path.as_deref() == Some(store_path) {
+                let _ = self.load_auth_snapshot()?;
+                return Ok(self.auth_snapshot.as_ref().expect("auth snapshot loaded"));
+            }
+            let snapshot =
+                crate::auth::load_auth_snapshot_at(store_path).map_err(tui_auth_error)?;
+            self.oauth_snapshot = Some(snapshot);
+        }
+        Ok(self.oauth_snapshot.as_ref().expect("oauth snapshot loaded"))
+    }
+
+    fn api_key_request(
+        &mut self,
+        kind: ProviderKind,
+        mode: slim_core::OperatingMode,
+        endpoint: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<ProviderRequest>, TuiError> {
+        let credential = if let Some(credential) = crate::auth::resolve_env_credential(kind) {
+            Some(credential)
+        } else {
+            self.load_auth_snapshot()?
+                .provider_credential(kind)
+                .map_err(tui_auth_error)?
+        };
+        let credential = match credential {
+            Some(credential) => credential,
+            // Zen's free tier answers the literal `public` bearer; the adapter
+            // still sends the required `x-opencode-session` header.
+            None if kind == ProviderKind::OpenCodeZen => crate::auth::ProviderCredential {
+                access: OPENCODE_ZEN_PUBLIC_KEY.into(),
+                account_id: None,
+                oauth: false,
+            },
+            None => return Ok(None),
+        };
+        if credential.oauth {
+            return Ok(None);
+        }
+        let api_key = credential.access;
+        let account_id = if kind == ProviderKind::OpenAiCodex {
+            Some(crate::oauth::codex_account_id(&api_key).map_err(tui_auth_error)?)
+        } else {
+            None
+        };
+        let default_endpoint = crate::cli::default_provider_endpoint(kind);
+        // G248: a configured model only applies when it belongs to this provider;
+        // otherwise the provider default is used (no cross-kind leakage).
+        let model = crate::cli::resolve_provider_model(kind, model);
+        Ok(Some(ProviderRequest {
+            prompt: String::new(),
+            mode,
+            kind,
+            endpoint: endpoint.unwrap_or(default_endpoint).into(),
+            model,
+            api_key,
+            account_id,
+            timeout: Duration::from_secs(120),
+        }))
+    }
+
+    fn active_provider_key(&mut self) -> Result<Option<String>, TuiError> {
+        Ok(self
+            .load_oauth_snapshot()?
+            .active_provider_key()
+            .map(str::to_owned))
+    }
+
+    fn active_oauth(&mut self) -> Result<Option<OAuthSession>, TuiError> {
+        let active = self
+            .load_oauth_snapshot()?
+            .active_oauth()
+            .map_err(tui_auth_error)?;
+        if let Some((provider, _)) = active.as_ref() {
+            self.oauth.note_store_credential_seen(*provider);
+        }
+        Ok(active)
+    }
+
+    fn oauth_credential(
+        &mut self,
+        provider: OAuthProvider,
+    ) -> Result<Option<OAuthCredential>, TuiError> {
+        let credential = self
+            .load_oauth_snapshot()?
+            .oauth_credential(provider)
+            .map_err(tui_auth_error)?;
+        if credential.is_some() {
+            self.oauth.note_store_credential_seen(provider);
+        }
+        Ok(credential)
+    }
+
+    /// Request for `kind`: its API key first, else the active OAuth login when it
+    /// belongs to that kind. `active_oauth` is only consulted without an API key.
+    fn request_for_kind(
+        &mut self,
+        kind: ProviderKind,
+        mode: slim_core::OperatingMode,
+        endpoint: Option<&str>,
+        model: Option<&str>,
+        active_oauth: impl FnOnce(&mut Self) -> Result<Option<OAuthSession>, TuiError>,
+    ) -> Result<(Option<ProviderRequest>, Option<OAuthSession>), TuiError> {
+        if let Some(request) = self.api_key_request(kind, mode, endpoint, model)? {
+            return Ok((Some(request), None));
+        }
+        let Some((provider, credential)) = active_oauth(self)?
+            .filter(|(provider, _)| provider_kind_for_oauth(*provider) == kind)
+        else {
+            return Ok((None, None));
+        };
+        let request = oauth_request(provider, &credential, mode, endpoint, model)?;
+        Ok((Some(request), Some((provider, credential))))
+    }
 }
 
 /// The OAuth login for `kind` when the host names its provider: the active
@@ -1467,48 +1924,6 @@ fn oauth_session_for_kind(
         return Ok(None);
     };
     Ok(stored(provider)?.map(|credential| (provider, credential)))
-}
-
-fn api_key_request(
-    kind: ProviderKind,
-    mode: slim_core::OperatingMode,
-    endpoint: Option<&str>,
-    model: Option<&str>,
-) -> Result<Option<ProviderRequest>, TuiError> {
-    let credential = match resolve_provider_credential(kind).map_err(tui_auth_error)? {
-        Some(credential) => credential,
-        // Zen's free tier answers the literal `public` bearer; the adapter
-        // still sends the required `x-opencode-session` header.
-        None if kind == ProviderKind::OpenCodeZen => crate::auth::ProviderCredential {
-            access: OPENCODE_ZEN_PUBLIC_KEY.into(),
-            account_id: None,
-            oauth: false,
-        },
-        None => return Ok(None),
-    };
-    if credential.oauth {
-        return Ok(None);
-    }
-    let api_key = credential.access;
-    let account_id = if kind == ProviderKind::OpenAiCodex {
-        Some(crate::oauth::codex_account_id(&api_key).map_err(tui_auth_error)?)
-    } else {
-        None
-    };
-    let default_endpoint = crate::cli::default_provider_endpoint(kind);
-    // G248: a configured model only applies when it belongs to this provider;
-    // otherwise the provider default is used (no cross-kind leakage).
-    let model = crate::cli::resolve_provider_model(kind, model);
-    Ok(Some(ProviderRequest {
-        prompt: String::new(),
-        mode,
-        kind,
-        endpoint: endpoint.unwrap_or(default_endpoint).into(),
-        model,
-        api_key,
-        account_id,
-        timeout: Duration::from_secs(120),
-    }))
 }
 
 fn tui_auth_error(error: impl fmt::Display) -> TuiError {
@@ -1646,6 +2061,10 @@ pub fn spawn_tui_runtime(
             endpoint_override: None,
             model_override: None,
             timeout,
+            layered_config: None,
+            lsp_trust_notice: None,
+            cached_project_trust: None,
+            queue_bridge: None,
         },
         oauth,
     )
@@ -1687,6 +2106,10 @@ pub fn spawn_tui_runtime_with_resume(
             endpoint_override: None,
             model_override: None,
             timeout,
+            layered_config: None,
+            lsp_trust_notice: None,
+            cached_project_trust: None,
+            queue_bridge: None,
         },
         oauth,
     )
@@ -1707,6 +2130,16 @@ pub fn spawn_embedded_runtime(
     let workspace_root = workspace_root.into();
     let mut startup = prepare_tui_in(args, &oauth, Some(&workspace_root))?;
     startup.options.workspace_root = Some(workspace_root);
+    if startup.options.adaptive_reasoning.is_none()
+        && std::env::var_os("SLIM_ADAPTIVE_REASONING").is_none()
+    {
+        startup.options.adaptive_reasoning = Some(true);
+    }
+    if startup.options.stable_tool_envelope.is_none()
+        && std::env::var_os("SLIM_STABLE_TOOL_ENVELOPE").is_none()
+    {
+        startup.options.stable_tool_envelope = Some(true);
+    }
     // The worker would otherwise create the session before the host can send
     // the prompt; `SendPrompt` creates it on the same path.
     let initial_prompt = startup.initial_prompt.take();
@@ -1715,6 +2148,74 @@ pub fn spawn_embedded_runtime(
         let _ = channels.commands.send(UiCommand::SendPrompt(prompt));
     }
     Ok((runtime, channels))
+}
+
+#[derive(Clone, Default)]
+pub struct EmbeddedRuntimeExtras {
+    pub in_process_mcp: Vec<crate::headless::InProcessMcpServer>,
+    pub readonly_mcp_allowlist: Vec<String>,
+    pub stable_tool_envelope: Option<bool>,
+    pub cache_keep_alive: Option<bool>,
+    pub shared_mcp: Option<crate::headless::McpHandle>,
+    pub shared_code_intelligence: Option<crate::headless::CodeIntelligenceHandle>,
+    pub skip_restored_transcript: bool,
+}
+
+/// Builds a shared project-scoped [`McpHandle`] (one per canonical checkout)
+/// that can be passed via [`EmbeddedRuntimeExtras::shared_mcp`].
+pub fn build_project_mcp_handle(
+    cwd: &Path,
+    trust_project: bool,
+    host_mcp: Option<&Path>,
+) -> Result<Option<crate::headless::McpHandle>, String> {
+    let load = crate::mcp::load_mcp(cwd, trust_project, host_mcp)?;
+    let Some(manager) = crate::mcp::build_mcp_manager(&load, cwd) else {
+        return Ok(None);
+    };
+    if let Ok(rt) = shared_tui_runtime() {
+        let _guard = rt.enter();
+        manager.start_background_connect();
+    }
+    Ok(Some(crate::headless::McpHandle::new(manager)))
+}
+
+/// Reconciles an existing shared [`McpHandle`] with fresh config on disk
+/// without tearing down unchanged servers or per-session overlays.
+pub fn reconcile_project_mcp_handle(
+    handle: &crate::headless::McpHandle,
+    cwd: &Path,
+    trust_project: bool,
+    host_mcp: Option<&Path>,
+) -> Result<(), String> {
+    let load = crate::mcp::load_mcp(cwd, trust_project, host_mcp)?;
+    handle.manager().reconcile(load.specs);
+    if let Ok(rt) = shared_tui_runtime() {
+        let _guard = rt.enter();
+        handle.manager().start_background_connect();
+    }
+    Ok(())
+}
+
+/// Builds a shared application-scoped [`CodeIntelligenceHandle`] (backed by a
+/// single `LspProcessPool` keyed per workspace root) for in-process hosts.
+pub fn build_project_code_intelligence(
+    cwd: &Path,
+    trust_project: bool,
+    max_servers_floor: usize,
+) -> Option<crate::headless::CodeIntelligenceHandle> {
+    let mut layered = crate::config::load_layered_for(cwd).ok()?;
+    if layered.lsp.max_servers < max_servers_floor {
+        layered.lsp.max_servers = max_servers_floor;
+    }
+    let trust = crate::code_intel::project_trust(&layered.lsp, cwd, trust_project);
+    crate::code_intel::build_code_intelligence(&layered.lsp, trust.trusted)
+        .map(crate::headless::CodeIntelligenceHandle::new)
+}
+
+/// Exposes the shared multi-threaded Tokio runtime for in-process desktop hosts
+/// (avoiding ephemeral per-call `tokio::runtime::Builder` instances).
+pub fn shared_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    shared_tui_runtime()
 }
 
 /// [`spawn_embedded_runtime`] for hosts that submit prompts themselves, the
@@ -1727,11 +2228,64 @@ pub fn spawn_embedded_runtime_deferred(
     args: Vec<String>,
     workspace_root: impl Into<PathBuf>,
 ) -> Result<(TuiRuntimeHandle, UiChannels, Option<String>), TuiError> {
+    spawn_embedded_runtime_deferred_with_extras(
+        args,
+        workspace_root,
+        EmbeddedRuntimeExtras::default(),
+    )
+}
+
+pub fn spawn_embedded_runtime_deferred_with_extras(
+    args: Vec<String>,
+    workspace_root: impl Into<PathBuf>,
+    extras: EmbeddedRuntimeExtras,
+) -> Result<(TuiRuntimeHandle, UiChannels, Option<String>), TuiError> {
     let oauth = OAuthService::production()
         .map_err(|error| TuiError::new(ExitCode::Auth, error.to_string()))?;
     let workspace_root = workspace_root.into();
     let mut startup = prepare_tui_in(args, &oauth, Some(&workspace_root))?;
     startup.options.workspace_root = Some(workspace_root);
+    if startup.options.adaptive_reasoning.is_none()
+        && std::env::var_os("SLIM_ADAPTIVE_REASONING").is_none()
+    {
+        startup.options.adaptive_reasoning = Some(true);
+    }
+    if startup.options.stable_tool_envelope.is_none()
+        && std::env::var_os("SLIM_STABLE_TOOL_ENVELOPE").is_none()
+    {
+        startup.options.stable_tool_envelope = Some(true);
+    }
+    if extras.stable_tool_envelope.is_some() {
+        startup.options.stable_tool_envelope = extras.stable_tool_envelope;
+    } else if startup.options.stable_tool_envelope.is_none()
+        && std::env::var_os("SLIM_STABLE_TOOL_ENVELOPE").is_none()
+    {
+        startup.options.stable_tool_envelope = Some(true);
+    }
+    if extras.cache_keep_alive.is_some() {
+        startup.options.cache_keep_alive = extras.cache_keep_alive;
+    }
+    if !extras.in_process_mcp.is_empty() {
+        startup
+            .options
+            .extra_mcp_connections
+            .extend(extras.in_process_mcp);
+    }
+    if !extras.readonly_mcp_allowlist.is_empty() {
+        startup
+            .options
+            .mcp_readonly_allowlist
+            .extend(extras.readonly_mcp_allowlist);
+    }
+    startup.options.skip_restored_transcript = extras.skip_restored_transcript;
+    if let Some(shared_mcp) = extras.shared_mcp {
+        startup.options.mcp = Some(shared_mcp);
+        startup.options.shared_mcp_external = true;
+    }
+    if let Some(shared_ci) = extras.shared_code_intelligence {
+        startup.options.code_intelligence = Some(shared_ci);
+        startup.options.shared_code_intelligence_external = true;
+    }
     let initial_prompt = startup.initial_prompt.take();
     let (runtime, channels) = spawn_tui_session(startup, oauth).map_err(tui_provider_error)?;
     Ok((runtime, channels, initial_prompt))
@@ -1770,8 +2324,6 @@ fn spawn_tui_session(
         data: Some(data_tx),
         wake: wake.clone(),
         lane_space: lane_space.clone(),
-        #[cfg(test)]
-        drop_probe: None,
     };
     let worker = thread::Builder::new()
         .name("slim-tui-runtime".into())
@@ -1798,8 +2350,14 @@ fn spawn_tui_session(
 fn image_model_error(request: Option<&ProviderRequest>) -> Option<String> {
     let request = request?;
     let (model, label) = match request.kind {
-        ProviderKind::OpenCodeGo => (open_code_model(&request.model)?, "OpenCode Go"),
-        ProviderKind::OpenCodeZen => (zen_model(&request.model)?, "OpenCode Zen"),
+        ProviderKind::OpenCodeGo => (
+            crate::opencode_go_catalog::resolve_model(&request.model)?,
+            "OpenCode Go",
+        ),
+        ProviderKind::OpenCodeZen => (
+            slim_core::provider::OpenCodeModelSpec::from(zen_model(&request.model)?),
+            "OpenCode Zen",
+        ),
         _ => return None,
     };
     if model.accepts_images {
@@ -1812,21 +2370,12 @@ fn image_model_error(request: Option<&ProviderRequest>) -> Option<String> {
 /// Routes events into the two bounded lanes (§10.1). Both sends block when
 /// full (lossless backpressure); the consumer coalesces data deltas through
 /// the runtime coalescer, so no event is dropped here.
-#[cfg(test)]
-#[derive(Clone)]
-struct DropProbe {
-    reached_pre_wake: std::sync::Arc<std::sync::Barrier>,
-    release_wake: std::sync::Arc<std::sync::Barrier>,
-}
-
 #[derive(Clone)]
 struct EventSink {
     control: Option<mpsc::SyncSender<UiEvent>>,
     data: Option<mpsc::SyncSender<UiEvent>>,
     wake: WakeSignal,
     lane_space: WakeSignal,
-    #[cfg(test)]
-    drop_probe: Option<DropProbe>,
 }
 
 impl EventSink {
@@ -1920,11 +2469,6 @@ impl Drop for EventSink {
         // senders first so the last-producer wake observes Disconnected.
         drop(self.control.take());
         drop(self.data.take());
-        #[cfg(test)]
-        if let Some(probe) = self.drop_probe.take() {
-            probe.reached_pre_wake.wait();
-            probe.release_wake.wait();
-        }
         self.wake.notify();
     }
 }
@@ -1935,6 +2479,7 @@ struct ActiveRun {
     cancellation_from_preparation: bool,
     task: tokio::task::JoinHandle<Result<ProviderExecution, ProviderError>>,
     projector: thread::JoinHandle<()>,
+    projector_done: Arc<tokio::sync::Notify>,
     cancellation: CancellationToken,
     durable: bool,
     content_store: SharedContentStore,
@@ -2101,7 +2646,8 @@ async fn persist_job_metadata(startup: &mut TuiStartup) -> Result<(), String> {
                 seq = seq.checked_add(1).ok_or("session sequence exhausted")?;
             }
             slim_core::session::DurableRepo::append_batch(&mut repo, records)
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(slim_core::session::SessionPreflight::from_open_repo(&repo))
         })();
         if result.is_err() {
             retry_jobs.return_metadata(retry);
@@ -2112,8 +2658,8 @@ async fn persist_job_metadata(startup: &mut TuiStartup) -> Result<(), String> {
     .map_err(|e| e.to_string())
     .and_then(|r| r);
     match result {
-        Ok(()) => {
-            startup.resume_preflight = None;
+        Ok(preflight) => {
+            startup.resume_preflight = Some(preflight);
             Ok(())
         }
         Err(error) => Err(format!("Metadados de jobs ainda não gravados: {error}")),
@@ -2124,15 +2670,51 @@ async fn receive_tui_command(
     startup: &mut TuiStartup,
     sink: &EventSink,
     idle: bool,
-    persist_at: tokio::time::Instant,
+    persist_at: &mut Option<tokio::time::Instant>,
 ) -> Option<UiCommand> {
+    let jobs_handle = startup.options.shell_jobs.clone();
     loop {
-        let command = tokio::select! {
-            command = rx.recv() => command?,
-            _ = tokio::time::sleep_until(persist_at), if idle => return Some(UiCommand::PersistJobs),
+        if idle
+            && persist_at.is_none()
+            && jobs_handle.as_ref().is_some_and(|jobs| jobs.is_dirty())
+        {
+            *persist_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        }
+        let arm_persist = idle && persist_at.is_some();
+        let persist_deadline = persist_at.unwrap_or_else(tokio::time::Instant::now);
+        let command = if idle && persist_at.is_none() && jobs_handle.is_some() {
+            let jobs = jobs_handle.as_ref().expect("checked");
+            let mut jobs_changed = std::pin::pin!(jobs.changed());
+            let mut checked = false;
+            let jobs_dirty = std::future::poll_fn(|cx| {
+                if jobs_changed.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(());
+                }
+                if !checked {
+                    checked = true;
+                    if jobs.is_dirty() {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            });
+            tokio::select! {
+                command = rx.recv() => command?,
+                _ = jobs_dirty => {
+                    if jobs.is_dirty() {
+                        *persist_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+                    }
+                    continue;
+                }
+            }
+        } else {
+            tokio::select! {
+                command = rx.recv() => command?,
+                _ = tokio::time::sleep_until(persist_deadline), if arm_persist => return Some(UiCommand::PersistJobs),
+            }
         };
         if matches!(command, UiCommand::RunBackgroundShell { .. }) {
-            match create_tui_session(startup) {
+            match create_tui_session_with_queue(startup, None).await {
                 Ok(Some((session_id, cwd))) => {
                     sink.send(UiEvent::SessionSnapshot {
                         session_id: slim_tui::api::SessionId(session_id.into()),
@@ -2148,10 +2730,37 @@ async fn receive_tui_command(
                 }
             }
         }
+        // Controle em tempo real de subagentes: funciona em qualquer fase (rodando ou parado).
+        if let Some(subagents) = startup.options.subagents.as_ref() {
+            let handled = match &command {
+                UiCommand::SubagentPause { id } => Some(subagents.pause(id)),
+                UiCommand::SubagentResume { id } => Some(subagents.resume(id)),
+                UiCommand::SubagentMessage { id, message, steer } => {
+                    let delivery = if *steer {
+                        slim_core::runtime::SubagentDelivery::Steer
+                    } else {
+                        slim_core::runtime::SubagentDelivery::Queue
+                    };
+                    Some(subagents.send_message(id, message.clone(), delivery))
+                }
+                UiCommand::SubagentCancel { id } => Some(subagents.cancel(id)),
+                _ => None,
+            };
+            if let Some(res) = handled {
+                if let Err(message) = res {
+                    sink.send(UiEvent::Notification { message });
+                }
+                continue;
+            }
+        }
         match JobCommandContext::from_startup(startup) {
             Some(context) => {
                 if let Some(command) = context.handle(command, sink) {
                     return Some(command);
+                }
+                if jobs_handle.as_ref().is_some_and(|jobs| jobs.is_dirty()) && persist_at.is_none()
+                {
+                    *persist_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
                 }
             }
             None => return Some(command),
@@ -2165,6 +2774,7 @@ struct PendingRun {
     admission: Option<PromptAdmission>,
     result: Option<Result<Result<ProviderExecution, ProviderError>, tokio::task::JoinError>>,
     projector: Option<thread::JoinHandle<()>>,
+    projector_done: Arc<tokio::sync::Notify>,
     delivery: VecDeque<UiEvent>,
     cancellation: CancellationToken,
     durable: bool,
@@ -2223,7 +2833,7 @@ async fn start_prompt_run(
         Some(root) => load_prompt_mentions(&root, &prompt)?,
         None => MentionAttachments::default(),
     };
-    match create_tui_session(startup) {
+    match create_tui_session_with_queue(startup, Some(prompt.clone())).await {
         Ok(Some((session_id, cwd))) => {
             let skill_names = skill_memo.names(startup.options.workspace_root.clone());
             let _ = sink.send(UiEvent::SessionSnapshot {
@@ -2324,7 +2934,7 @@ async fn start_prompt_run(
         .options
         .shell_jobs
         .as_ref()
-        .is_some_and(|j| !j.list().is_empty())
+        .is_some_and(|j| j.is_dirty())
     {
         startup.resume_preflight = None;
         None
@@ -2432,11 +3042,6 @@ impl ContentStore {
         }
     }
 
-    #[cfg(test)]
-    fn insert(&mut self, handle: ContentHandle, output: &str) {
-        self.insert_owned(handle, output.to_owned());
-    }
-
     fn page(
         &self,
         handle: &ContentHandle,
@@ -2461,12 +3066,39 @@ impl ContentStore {
             next_cursor: (end < entry.text.len()).then_some(PageCursor(end as u64)),
         })
     }
+
+    fn head_tail(&self, handle: &ContentHandle, max_bytes: usize) -> Result<String, String> {
+        let Some(entry) = self.entries.iter().find(|entry| &entry.handle == handle) else {
+            return Err("Tool output is no longer retained".into());
+        };
+        let text = entry.text.as_str();
+        if text.len() <= max_bytes {
+            return Ok(text.to_owned());
+        }
+        let half = max_bytes / 2;
+        let head_end = utf8_boundary_at_or_before(text, half);
+        let tail_start = utf8_boundary_at_or_after(text, text.len().saturating_sub(half)).max(head_end);
+        let omitted = text.len().saturating_sub(head_end + (text.len() - tail_start));
+        Ok(format!(
+            "{}\n… ({omitted} caracteres omitidos) …\n{}",
+            &text[..head_end],
+            &text[tail_start..]
+        ))
+    }
 }
 
 fn utf8_boundary_at_or_before(value: &str, mut index: usize) -> usize {
     index = index.min(value.len());
     while index > 0 && !value.is_char_boundary(index) {
         index -= 1;
+    }
+    index
+}
+
+fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
     }
     index
 }
@@ -2573,6 +3205,37 @@ fn refund_steers(options: &ProviderRunOptions, sink: &EventSink) {
     }
 }
 
+static SHARED_TUI_RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn shared_tui_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    SHARED_TUI_RUNTIME
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(4, 16);
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .thread_name("slim-tui-io")
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+pub fn prewarm_provider_endpoint(endpoint: &str) {
+    if let Ok(rt) = shared_tui_runtime() {
+        let _enter = rt.enter();
+        slim_core::provider::prewarm_connection(
+            endpoint,
+            slim_core::provider::PRODUCTION_CONNECT_TIMEOUT,
+        );
+    }
+}
+
 fn run_worker(
     mut startup: TuiStartup,
     oauth: OAuthService,
@@ -2588,13 +3251,9 @@ fn run_worker(
             }
         }
     });
-    // Two workers suffice: heavy work runs on spawn_blocking threads, and the
-    // async tasks (login, catalogs, provider driver) are IO-bound.
-    let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
+    // Share one Tokio reactor/threadpool across embedded runtimes so opening a
+    // conversation or switching providers does not pay multi-thread pool teardown.
+    let tokio_runtime = match shared_tui_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = sink.send(UiEvent::RunFailed {
@@ -2605,6 +3264,9 @@ fn run_worker(
         }
     };
     let warnings = tokio_runtime.block_on(async move {
+        tokio::task::spawn_blocking(|| {
+            let _ = crate::headless::executable_identity();
+        });
         // The first message reuses a connection opened while the user types.
         if let Some(request) = &startup.request {
             slim_core::provider::prewarm_connection(
@@ -2618,39 +3280,84 @@ fn run_worker(
         };
         if let Some(preflight) = &startup.resume_preflight { jobs.restore_lost(&session_job_metadata(preflight)); }
         startup.options.shell_jobs = Some(jobs.clone());
+        let subagents = slim_core::runtime::SubagentRegistry::new();
+        {
+            let sink_sub = sink.clone();
+            subagents.set_on_change(Arc::new(move |list| {
+                sink_sub.send(UiEvent::SubagentsChanged { subagents: list });
+            }));
+        }
+        startup.options.subagents = Some(subagents.clone());
         // One inbox for the whole worker: the shared handle is cloned into
         // every spawned run's options, so mid-run steers reach the live run.
         startup.options.steer_inbox = Some(slim_core::runtime::SteerInbox::default());
         let _job_scope = jobs.scope();
-        let mut job_persist_at=tokio::time::Instant::now()+Duration::from_secs(1);
+        let mut job_persist_at = jobs
+            .is_dirty()
+            .then(|| tokio::time::Instant::now() + Duration::from_secs(1));
         let watcher_jobs = jobs.clone();
         let (oauth_warning_stop, mut oauth_warning_stop_rx) = tokio::sync::watch::channel(false);
         let warning_oauth = oauth.clone();
+        let warning_notify = warning_oauth.warning_notify();
         let warning_sink = sink.clone();
         let oauth_warning_forwarder = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seen_jobs = Vec::new();
-            let mut ticks = 0;
+            let drain_warnings = || {
+                for message in warning_oauth.take_warnings() {
+                    let _ = warning_sink.send(UiEvent::Notification { message });
+                }
+            };
+            drain_warnings();
+            sync_watched_jobs(&watcher_jobs, &mut seen_jobs, &warning_sink);
             loop {
-                tokio::select! {
-                    _ = tick.tick() => {
-                        ticks += 1;
-                        if ticks % 5 == 0 {
-                            let snapshot = watcher_jobs.list();
-                            let mut signature = snapshot.clone();
-                            for job in &mut signature { if matches!(job.state.as_str(), "running" | "interrupting" | "cancelling") { job.elapsed_ms = 0; } }
-                            if signature != seen_jobs { seen_jobs = signature; warning_sink.send(UiEvent::JobsChanged { jobs: snapshot }); }
-                            for job in watcher_jobs.take_notifications() {
-                                warning_sink.send(UiEvent::Notification { message: job_finished_notice(&job) });
+                if watcher_jobs.running_count() > 0 {
+                    tokio::select! {
+                        _ = warning_notify.notified() => {
+                            drain_warnings();
+                        }
+                        _ = tick.tick() => {
+                            sync_watched_jobs(&watcher_jobs, &mut seen_jobs, &warning_sink);
+                        }
+                        _ = watcher_jobs.changed() => {
+                            sync_watched_jobs(&watcher_jobs, &mut seen_jobs, &warning_sink);
+                        }
+                        changed = oauth_warning_stop_rx.changed() => {
+                            if changed.is_err() || *oauth_warning_stop_rx.borrow() {
+                                break;
                             }
                         }
-                        for message in warning_oauth.take_warnings() {
-                            let _ = warning_sink.send(UiEvent::Notification { message });
-                        }
                     }
-                    changed = oauth_warning_stop_rx.changed() => {
-                        if changed.is_err() || *oauth_warning_stop_rx.borrow() {
-                            break;
+                } else {
+                    let mut jobs_changed = std::pin::pin!(watcher_jobs.changed());
+                    let mut checked = false;
+                    let jobs_ready = std::future::poll_fn(|cx| {
+                        if jobs_changed.as_mut().poll(cx).is_ready() {
+                            return std::task::Poll::Ready(());
+                        }
+                        if !checked {
+                            checked = true;
+                            if sync_watched_jobs(&watcher_jobs, &mut seen_jobs, &warning_sink)
+                                || watcher_jobs.running_count() > 0
+                            {
+                                return std::task::Poll::Ready(());
+                            }
+                        }
+                        std::task::Poll::Pending
+                    });
+                    tokio::select! {
+                        _ = warning_notify.notified() => {
+                            drain_warnings();
+                        }
+                        _ = jobs_ready => {
+                            sync_watched_jobs(&watcher_jobs, &mut seen_jobs, &warning_sink);
+                            tick.reset();
+                        }
+                        changed = oauth_warning_stop_rx.changed() => {
+                            if changed.is_err() || *oauth_warning_stop_rx.borrow() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2666,13 +3373,27 @@ fn run_worker(
         let skill_names = skill_memo.names(startup.options.workspace_root.clone());
         sink.send(UiEvent::WorkspaceChanged { cwd, skill_names });
         if let Some(preflight) = startup.resume_preflight.as_ref() {
-            match session_transcript(preflight) {
+            match session_transcript(preflight, startup.options.skip_restored_transcript) {
                 Ok(messages) => {
                     let todo_event = match restored_todo_event(preflight) {
                         Ok(event) => event,
                         Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return Vec::new(); }
                     };
                     if let Some(header) = preflight.header.as_ref() {
+                        if let Err(message) = preopen_queue_journal(
+                            startup.queue_bridge.clone(),
+                            PathBuf::from(&header.cwd),
+                            header.id.clone(),
+                            None,
+                        )
+                        .await
+                        {
+                            sink.send(UiEvent::RunFailed {
+                                run_id: None,
+                                message,
+                            });
+                            return Vec::new();
+                        }
                         let skill_names = skill_memo.names(Some(PathBuf::from(&header.cwd)));
                         sink.send(UiEvent::SessionRestored {
                             session_id: slim_tui::api::SessionId(header.id.clone().into()),
@@ -2688,7 +3409,7 @@ fn run_worker(
             }
         }
         if startup.initial_prompt.is_some() && startup.resume_path.is_none() {
-            match create_tui_session(&mut startup) {
+            match create_tui_session_with_queue(&mut startup, None).await {
                 Ok(Some((session_id, cwd))) => {
                     let skill_names = skill_memo.names(startup.options.workspace_root.clone());
                     sink.send(UiEvent::SessionSnapshot {
@@ -2744,27 +3465,24 @@ fn run_worker(
             });
         }
         let mut active: Option<ActiveRun> = None;
+        let mut speculative_job: Option<SpeculativeJob> = None;
         let mut user_shell: Option<UserShellRun> = None;
         let user_shell_context = UserShellContext::default();
         let mut preparing: Option<ActivePromptPreparation> = None;
         let mut ignored_prep_cancel = false;
         let mut pending: Option<PendingRun> = None;
+        let mut last_undo_checkpoint: Option<slim_core::checkpoint::TurnCheckpoint> = None;
         let mut last_esc_at: Option<Instant> = None;
         let mut login: Option<ActiveLogin> = None;
         let mut next_run_id = 1_u64;
         let content_store = SharedContentStore::default();
-        let open_code_catalog = OpenCodeCatalog::production().ok();
-        let codex_catalog = crate::codex_catalog::CodexCatalog::production().ok();
-        let zen_catalog = OpenCodeZenCatalog::production().ok();
-        let command_code_catalog = CommandCodeCatalog::production().ok();
-        let open_design_catalog = OpenDesignCatalog::production().ok();
-        let devin_catalog = crate::devin_catalog::DevinCatalog::production().ok();
-        // A client that cannot be built disables the ClinePass live refresh
-        // (announced when requested), like a missing catalog path does.
-        let cline_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .ok();
+        let mut open_code_catalog: Option<OpenCodeCatalog> = None;
+        let mut codex_catalog: Option<crate::codex_catalog::CodexCatalog> = None;
+        let mut zen_catalog: Option<OpenCodeZenCatalog> = None;
+        let mut command_code_catalog: Option<CommandCodeCatalog> = None;
+        let mut open_design_catalog: Option<OpenDesignCatalog> = None;
+        let mut devin_catalog: Option<crate::devin_catalog::DevinCatalog> = None;
+        let mut cline_client: Option<reqwest::Client> = None;
         let open_code_refresh = RefreshGate::default();
         let codex_refresh = RefreshGate::default();
         let zen_refresh = RefreshGate::default();
@@ -2774,28 +3492,76 @@ fn run_worker(
         let devin_refresh = RefreshGate::default();
         // Project LSP launch overrides held back by trust are announced once;
         // the manager was built at startup, so trusting takes a restart.
-        if let Some(notice) = project_lsp_trust_notice(
-            startup.options.workspace_root.as_deref(),
-            startup.options.trust_project,
-        ) {
+        if let Some(notice) = startup.lsp_trust_notice.take() {
             let _ = sink.send(UiEvent::Notification {
                 message: format!("{notice}; /mcp trust e reinicie o Slim para aplicar"),
             });
         }
         // Application-scoped MCP manager: built once from layered config,
         // never spawns a process until a server is actually exercised.
-        if startup.options.mcp.is_none() {
+        if let Some(shared_handle) = startup.options.mcp.clone() {
+            let manager = if startup.options.extra_mcp_connections.is_empty() {
+                shared_handle.manager().clone()
+            } else {
+                let overlay = McpManager::with_session_overlays(shared_handle.manager().clone());
+                for extra in &startup.options.extra_mcp_connections {
+                    overlay.insert_connection(
+                        extra.spec.clone(),
+                        Arc::clone(&extra.connection),
+                        extra.tools.clone(),
+                    );
+                }
+                overlay
+            };
+            manager.start_background_connect();
+            startup.options.mcp = Some(McpHandle::new(manager));
+        } else {
             let cwd = mcp_workspace(&startup);
             // Servers that cannot start (untrusted project, unresolved
             // values) stay listed in /mcp and are announced once here;
             // an unreadable config disables MCP loudly, never silently.
-            match crate::mcp::load_mcp(
-                &cwd,
-                startup.options.trust_project,
-                startup.options.host_mcp_config.as_deref(),
-            ) {
+            let load_result = match startup.layered_config.take() {
+                Some(mut layered) => {
+                    let host_result = if let Some(path) = startup.options.host_mcp_config.as_deref()
+                    {
+                        crate::config::merge_host_mcp(&mut layered, path)
+                    } else {
+                        Ok(())
+                    };
+                    host_result.map(|()| {
+                        let cached = startup
+                            .cached_project_trust
+                            .as_ref()
+                            .filter(|(cached_ws, _)| *cached_ws == cwd)
+                            .map(|(_, decision)| decision);
+                        crate::mcp::load_mcp_from_cached(
+                            &layered,
+                            &cwd,
+                            startup.options.trust_project,
+                            cached,
+                        )
+                    })
+                }
+                None => crate::mcp::load_mcp(
+                    &cwd,
+                    startup.options.trust_project,
+                    startup.options.host_mcp_config.as_deref(),
+                ),
+            };
+            match load_result {
                 Ok(load) => {
-                    if let Some(manager) = crate::mcp::build_mcp_manager(&load, &cwd) {
+                    let manager = crate::mcp::build_mcp_manager(&load, &cwd).or_else(|| {
+                        (!startup.options.extra_mcp_connections.is_empty())
+                            .then(|| crate::mcp::build_empty_mcp_manager(&cwd))
+                    });
+                    if let Some(manager) = manager {
+                        for extra in &startup.options.extra_mcp_connections {
+                            manager.insert_connection(
+                                extra.spec.clone(),
+                                Arc::clone(&extra.connection),
+                                extra.tools.clone(),
+                            );
+                        }
                         // Enabled, trusted, non-lazy servers connect while the
                         // session opens; nothing here waits for them. One
                         // notice lists what failed, needs a login or waits
@@ -2834,11 +3600,13 @@ fn run_worker(
         let wake_jobs = startup.options.shell_jobs.clone();
         let mcp_inflight = Arc::new(Mutex::new(HashSet::<String>::new()));
         let mcp_logins: mcp_login::McpLogins = Arc::default();
+        let delivery_space = Arc::new(tokio::sync::Notify::new());
+        let delivery_space_inflight = Arc::new(AtomicBool::new(false));
         loop {
             if let Some(mut prompt_prep) = preparing.take() {
                 let wake = tokio::select! {
                     biased;
-                    command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => PromptPreparationEvent::Command(command),
+                    command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, &mut job_persist_at) => PromptPreparationEvent::Command(command),
                     result = &mut prompt_prep.task => PromptPreparationEvent::Finished(result),
                 };
                 match wake {
@@ -2996,8 +3764,48 @@ fn run_worker(
             if let Some(mut run) = pending.take() {
                 run.jobs = JobCommandContext::from_startup(&startup);
                 if let Some(projector) = run.projector.take() {
-                    if projector.is_finished() {
+                    let finished = if projector.is_finished() {
                         let _ = projector.join();
+                        true
+                    } else {
+                        run.projector = Some(projector);
+                        let mut shutdown_requested = false;
+                        let mut projector_notified = false;
+                        tokio::select! {
+                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, &mut job_persist_at) => {
+                                shutdown_requested = dispatch_pending_command(
+                                    &mut run,
+                                    command,
+                                    &sink,
+                                    &mut mcp_watch,
+                                    &mcp_manager,
+                                    &mcp_logins,
+                                );
+                            }
+                            _ = run.projector_done.notified() => {
+                                projector_notified = true;
+                            }
+                        }
+                        if shutdown_requested {
+                            break;
+                        }
+                        if projector_notified {
+                            if let Some(projector) = run.projector.take() {
+                                if projector.is_finished() {
+                                    let _ = projector.join();
+                                } else {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = projector.join();
+                                    })
+                                    .await;
+                                }
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if finished {
                         let result = run.result.take().expect("pending result");
                         if run.cancel_requested {
                             send_cancel_result(run.run_id, run.admission, result, &sink);
@@ -3012,25 +3820,6 @@ fn run_worker(
                         );
                         run.delivery.extend(deferred);
                     } else {
-                        run.projector = Some(projector);
-                        // Wake on either the pacing tick or a command so
-                        // Cancel/Shutdown stays responsive while the provider
-                        // task unwinds.
-                        tokio::select! {
-                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => {
-                                if dispatch_pending_command(
-                                    &mut run,
-                                    command,
-                                    &sink,
-                                    &mut mcp_watch,
-                                    &mcp_manager,
-                                    &mcp_logins,
-                                ) {
-                                    break;
-                                }
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-                        }
                         pending = Some(run);
                         continue;
                     }
@@ -3046,10 +3835,18 @@ fn run_worker(
                 ) {
                     PendingDeliveryStep::Complete => {}
                     PendingDeliveryStep::Pending => {
-                        // Backpressure pacing plus command wake: a cancel no
-                        // longer waits for the drain to finish first.
+                        if !delivery_space_inflight.swap(true, Ordering::AcqRel) {
+                            let lane_space = sink.lane_space.clone();
+                            let space_notify = Arc::clone(&delivery_space);
+                            let inflight = Arc::clone(&delivery_space_inflight);
+                            tokio::task::spawn_blocking(move || {
+                                let _ = lane_space.wait_timeout(Duration::from_millis(50));
+                                inflight.store(false, Ordering::Release);
+                                space_notify.notify_one();
+                            });
+                        }
                         tokio::select! {
-                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => {
+                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, &mut job_persist_at) => {
                                 if dispatch_pending_command(
                                     &mut run,
                                     command,
@@ -3061,7 +3858,7 @@ fn run_worker(
                                     break;
                                 }
                             }
-                            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                            _ = delivery_space.notified() => {}
                         }
                         pending = Some(run);
                     }
@@ -3074,7 +3871,7 @@ fn run_worker(
                 let wake = {
                     let current = login.as_mut().expect("checked");
                     tokio::select! {
-                        command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => LoginEvent::Command(command),
+                        command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, &mut job_persist_at) => LoginEvent::Command(command),
                         result = &mut current.task => LoginEvent::Finished(result),
                     }
                 };
@@ -3185,14 +3982,14 @@ fn run_worker(
                                 Instant::now().saturating_duration_since(armed_at),
                             );
                             tokio::select! {
-                                command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => ActiveEvent::Command(command),
+                                command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, &mut job_persist_at) => ActiveEvent::Command(command),
                                 result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
                                 _ = tokio::time::sleep(grace) => ActiveEvent::CancelTimeout,
                                 _ = mcp_watch_tick.tick(), if mcp_watch => ActiveEvent::McpTick,
                             }
                         }
                         None => tokio::select! {
-                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => ActiveEvent::Command(command),
+                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, &mut job_persist_at) => ActiveEvent::Command(command),
                             result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
                             _ = mcp_watch_tick.tick(), if mcp_watch => ActiveEvent::McpTick,
                         },
@@ -3300,6 +4097,15 @@ fn run_worker(
                         let store = &active.as_ref().expect("active run").content_store;
                         serve_content_page(store, &sink, handle, request_id, cursor);
                     }
+                    ActiveEvent::Command(Some(UiCommand::RequestContentHeadTail {
+                        handle,
+                        request_id,
+                        max_bytes,
+                    })) => {
+                        let store = &active.as_ref().expect("active run").content_store;
+                        serve_content_head_tail(store, &sink, handle, request_id, max_bytes);
+                    }
+                    ActiveEvent::Command(Some(UiCommand::CacheKeepAlive)) => {}
                     ActiveEvent::Command(Some(UiCommand::RequestWorkspaceFiles {
                         request_id,
                     })) => {
@@ -3447,6 +4253,12 @@ fn run_worker(
                             }
                         }
                         let durable = active.as_ref().is_some_and(|run| run.durable);
+                        let should_speculate = !esc_cancelled
+                            && !active.as_ref().is_some_and(|run| run.idle_compaction.is_some())
+                            && matches!(
+                                &*result,
+                                Ok(Ok(execution)) if execution.result.code == ExitCode::Success
+                            );
                         if let Some(run) = active.take() {
                             if let Some(handle) = &run.idle_compaction {
                                 handle.clear_manual();
@@ -3458,6 +4270,7 @@ fn run_worker(
                                 admission: run.admission,
                                 result: Some(*result),
                                 projector: Some(run.projector),
+                                projector_done: run.projector_done,
                                 delivery: VecDeque::new(),
                                 cancellation: run.cancellation,
                                 durable,
@@ -3466,13 +4279,16 @@ fn run_worker(
                                 workspace_root: run.workspace_root,
                             });
                         }
+                        if should_speculate {
+                            maybe_spawn_speculative(&startup, &mut speculative_job);
+                        }
                     }
                 }
                 continue;
             }
 
             let command = tokio::select! {
-                command = receive_tui_command(&mut async_rx, &mut startup, &sink, true, job_persist_at) => command,
+                command = receive_tui_command(&mut async_rx, &mut startup, &sink, true, &mut job_persist_at) => command,
                 // Status polling only runs while the /mcp overlay is open; a
                 // revision counter keeps identical snapshots off the UI lane.
                 _ = mcp_watch_tick.tick(), if mcp_watch => {
@@ -3504,8 +4320,12 @@ fn run_worker(
                 }
             };
             let Some(command) = command else {
+                cancel_speculative(&mut speculative_job);
                 break;
             };
+            if cancels_speculative_job(&command) {
+                cancel_speculative(&mut speculative_job);
+            }
             match command {
                 UiCommand::PreparePrompt { prompt, admission }
                     if !prompt.trim().is_empty() =>
@@ -3538,7 +4358,7 @@ fn run_worker(
                     };
 
                     if startup.resume_path.is_none() {
-                        match create_tui_session(&mut startup) {
+                        match create_tui_session_with_queue(&mut startup, Some(prompt.clone())).await {
                             Ok(Some((session_id, cwd))) => {
                                 let skill_names =
                                     skill_memo.names(startup.options.workspace_root.clone());
@@ -3558,6 +4378,14 @@ fn run_worker(
                                 continue;
                             }
                         }
+                    }
+
+                    if let Err(message) = await_queue_durable(startup.queue_bridge.clone()).await {
+                        let _ = sink.send(UiEvent::PromptPreparationFailed {
+                            admission,
+                            message,
+                        });
+                        continue;
                     }
 
                     let Some((provider, credential)) = startup.oauth_session.clone() else {
@@ -3629,7 +4457,8 @@ fn run_worker(
                                 &user_shell_context,
                                 selected,
                                 "Previous session restored. Send a prompt to continue.",
-                            );
+                            )
+                            .await;
                         }
                         Ok(None) => {
                             let _ = sink.send(UiEvent::Notification {
@@ -3652,6 +4481,7 @@ fn run_worker(
                 }
                 UiCommand::ResumeSession { .. }
                 | UiCommand::RewindSession { .. }
+                | UiCommand::UndoLastRewind
                 | UiCommand::NewSession
                     if user_shell.as_ref().is_some_and(UserShellRun::is_running) =>
                 {
@@ -3660,25 +4490,38 @@ fn run_worker(
                     });
                 }
                 UiCommand::ResumeSession { id } => {
+                    subagents.reset();
                     sessions::resume_session_by_id(
                         &mut startup,
                         &sink,
                         &mut skill_memo,
                         &user_shell_context,
                         &id,
-                    );
+                    )
+                    .await;
                 }
                 UiCommand::NewSession => {
+                    subagents.reset();
                     start_new_session(&mut startup, &sink, &mut skill_memo, &user_shell_context);
                 }
-                UiCommand::RewindSession { first_seq } => {
+                UiCommand::RewindSession {
+                    first_seq,
+                    restore_files,
+                } => {
+                    subagents.reset();
                     sessions::rewind_current_session(
                         &mut startup,
                         &sink,
                         &mut skill_memo,
                         &user_shell_context,
                         first_seq,
-                    );
+                        restore_files,
+                        &mut last_undo_checkpoint,
+                    )
+                    .await;
+                }
+                UiCommand::UndoLastRewind => {
+                    sessions::undo_last_rewind(&startup, &sink, &mut last_undo_checkpoint);
                 }
                 UiCommand::StartLogin(provider) => {
                     if let Some(provider) = oauth_provider(provider) {
@@ -3706,14 +4549,18 @@ fn run_worker(
                 }
                 UiCommand::CancelLogin => {}
                 UiCommand::RefreshCodexModels => {
-                    let (Some(catalog), Some(request)) = (
-                        codex_catalog.clone(),
-                        startup
-                            .request
-                            .as_ref()
-                            .filter(|request| request.kind == ProviderKind::OpenAiCodex),
-                    ) else {
+                    let Some(request) = startup
+                        .request
+                        .as_ref()
+                        .filter(|request| request.kind == ProviderKind::OpenAiCodex)
+                    else {
                         // No Codex login: the bundled seed stays as the list.
+                        continue;
+                    };
+                    if codex_catalog.is_none() {
+                        codex_catalog = crate::codex_catalog::CodexCatalog::production().ok();
+                    }
+                    let Some(catalog) = codex_catalog.clone() else {
                         continue;
                     };
                     let endpoint = request.endpoint.clone();
@@ -3740,6 +4587,9 @@ fn run_worker(
                     );
                 }
                 UiCommand::RefreshOpenCodeModels => {
+                    if open_code_catalog.is_none() {
+                        open_code_catalog = OpenCodeCatalog::production().ok();
+                    }
                     let Some(catalog) = open_code_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "OpenCode Go catalog path is unavailable".into(),
@@ -3747,15 +4597,39 @@ fn run_worker(
                         continue;
                     };
                     let _ = sink.send(open_code_catalog_event(catalog.load_or_fallback()));
+                    let api_key = if startup.endpoint_override.is_some() {
+                        None
+                    } else {
+                        match startup
+                            .request
+                            .as_ref()
+                            .filter(|request| request.kind == ProviderKind::OpenCodeGo)
+                        {
+                            Some(request) => Some(request.api_key.clone()),
+                            None => tokio::task::spawn_blocking(|| {
+                                crate::auth::resolve_api_key(ProviderKind::OpenCodeGo)
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .flatten(),
+                        }
+                    };
                     let sink = sink.clone();
-                    open_code_refresh.spawn(async move { catalog.refresh().await }, move |result| {
-                        let _ = sink.send(match result {
-                            Ok(snapshot) => open_code_catalog_event(snapshot),
-                            Err(error) => live_catalog_unavailable("OpenCode Go", error),
-                        });
-                    });
+                    open_code_refresh.spawn(
+                        async move { catalog.refresh_with_key(api_key.as_deref()).await },
+                        move |result| {
+                            let _ = sink.send(match result {
+                                Ok(snapshot) => open_code_catalog_event(snapshot),
+                                Err(error) => live_catalog_unavailable("OpenCode Go", error),
+                            });
+                        },
+                    );
                 }
                 UiCommand::RefreshZenModels => {
+                    if zen_catalog.is_none() {
+                        zen_catalog = OpenCodeZenCatalog::production().ok();
+                    }
                     let Some(catalog) = zen_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "OpenCode Zen catalog path is unavailable".into(),
@@ -3772,6 +4646,10 @@ fn run_worker(
                     });
                 }
                 UiCommand::RefreshClinePassModels => {
+                    if cline_client.is_none() {
+                        cline_client =
+                            slim_core::provider::shared_http_client(Duration::from_secs(15)).ok();
+                    }
                     let Some(client) = cline_client.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "ClinePass catalog client is unavailable".into(),
@@ -3857,6 +4735,9 @@ fn run_worker(
                     );
                 }
                 UiCommand::RefreshOpenDesignModels => {
+                    if open_design_catalog.is_none() {
+                        open_design_catalog = OpenDesignCatalog::production().ok();
+                    }
                     let Some(catalog) = open_design_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "Open Design catalog path is unavailable".into(),
@@ -3903,6 +4784,9 @@ fn run_worker(
                     );
                 }
                 UiCommand::RefreshDevinModels => {
+                    if devin_catalog.is_none() {
+                        devin_catalog = crate::devin_catalog::DevinCatalog::production().ok();
+                    }
                     let Some(catalog) = devin_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "Devin catalog path is unavailable".into(),
@@ -3945,6 +4829,9 @@ fn run_worker(
                     );
                 }
                 UiCommand::RefreshCommandCodeModels => {
+                    if command_code_catalog.is_none() {
+                        command_code_catalog = CommandCodeCatalog::production().ok();
+                    }
                     let Some(catalog) = command_code_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "Command Code catalog path is unavailable".into(),
@@ -3994,7 +4881,128 @@ fn run_worker(
                 UiCommand::SetXaiModel { model, effort } => {
                     switch_api_key_model(LoginProvider::Xai, &mut startup, &oauth, &sink, model, effort);
                 }
-                UiCommand::PersistJobs => { if let Err(message)=persist_job_metadata(&mut startup).await {sink.send(UiEvent::Notification{message});} job_persist_at=tokio::time::Instant::now()+Duration::from_secs(1); }
+                UiCommand::SetAnthropicModel { model, effort } => {
+                    let resolved_model = if model.trim().is_empty() {
+                        crate::cli::resolve_provider_model(ProviderKind::Anthropic, None)
+                    } else {
+                        model.trim().to_owned()
+                    };
+                    let switching_provider = !startup
+                        .request
+                        .as_ref()
+                        .is_some_and(|request| request.kind == ProviderKind::Anthropic);
+                    if switching_provider {
+                        let activated = match oauth.credential(OAuthProvider::Anthropic) {
+                            Ok(Some(credential)) => {
+                                match oauth_request(
+                                    OAuthProvider::Anthropic,
+                                    &credential,
+                                    startup.mode,
+                                    None,
+                                    Some(&resolved_model),
+                                )
+                                .and_then(|request| {
+                                    oauth
+                                        .activate(OAuthProvider::Anthropic, &credential)
+                                        .map_err(|error| tui_auth_error(error))
+                                        .map(|()| (request, Some((OAuthProvider::Anthropic, credential))))
+                                }) {
+                                    Ok(pair) => Ok(pair),
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                            Ok(None) => match oauth.activate_api_key("anthropic") {
+                                Ok(Some(api_key)) => Ok((
+                                    ProviderRequest {
+                                        prompt: String::new(),
+                                        mode: startup.mode,
+                                        kind: ProviderKind::Anthropic,
+                                        endpoint: crate::cli::default_provider_endpoint(
+                                            ProviderKind::Anthropic,
+                                        )
+                                        .into(),
+                                        model: resolved_model.clone(),
+                                        api_key,
+                                        account_id: None,
+                                        timeout: Duration::from_secs(120),
+                                    },
+                                    None,
+                                )),
+                                Ok(None) => match std::env::var("ANTHROPIC_API_KEY")
+                                    .ok()
+                                    .filter(|v| !v.trim().is_empty())
+                                {
+                                    Some(api_key) => Ok((
+                                        ProviderRequest {
+                                            prompt: String::new(),
+                                            mode: startup.mode,
+                                            kind: ProviderKind::Anthropic,
+                                            endpoint: crate::cli::default_provider_endpoint(
+                                                ProviderKind::Anthropic,
+                                            )
+                                            .into(),
+                                            model: resolved_model.clone(),
+                                            api_key,
+                                            account_id: None,
+                                            timeout: Duration::from_secs(120),
+                                        },
+                                        None,
+                                    )),
+                                    None => Err("Anthropic login is not saved. Use /login.".into()),
+                                },
+                                Err(error) => Err(format!("Authentication: {error}")),
+                            },
+                            Err(error) => Err(format!("Authentication: {error}")),
+                        };
+                        match activated {
+                            Ok((request, oauth_session)) => {
+                                startup.request = Some(request);
+                                startup.oauth_session = oauth_session;
+                                let _ = sink.send(UiEvent::AuthStateChanged {
+                                    provider: Some(LoginProvider::Anthropic),
+                                    authenticated: true,
+                                });
+                                let _ = sink.send(UiEvent::Notification {
+                                    message: "Connected: Anthropic".into(),
+                                });
+                            }
+                            Err(message) => {
+                                let _ = sink.send(UiEvent::Notification { message });
+                                continue;
+                            }
+                        }
+                    }
+                    startup.model_override = Some(resolved_model.clone());
+                    startup.effort = effort;
+                    startup.options.reasoning_effort = Some(effort.id().into());
+                    startup.options.context_window_tokens = None;
+                    if let Some(request) = startup.request.as_mut() {
+                        request.model.clone_from(&resolved_model);
+                    }
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
+                    let _ = sink.send(UiEvent::ModelChanged { model: resolved_model });
+                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                }
+                UiCommand::SetThinkingDisplay { show } => {
+                    startup.options.thinking_display = Some(if show {
+                        slim_core::provider::ThinkingDisplay::Summarized
+                    } else {
+                        slim_core::provider::ThinkingDisplay::Omitted
+                    });
+                }
+                UiCommand::PersistJobs => {
+                    if let Err(message) = persist_job_metadata(&mut startup).await {
+                        sink.send(UiEvent::Notification { message });
+                    }
+                    job_persist_at = startup
+                        .options
+                        .shell_jobs
+                        .as_ref()
+                        .is_some_and(|jobs| jobs.is_dirty())
+                        .then(|| tokio::time::Instant::now() + Duration::from_secs(1));
+                }
                 UiCommand::Logout => {
                     if let Some(jobs) = &startup.options.shell_jobs {
                         if jobs.running() { sink.send(UiEvent::Notification { message: format!("Encerrando {} job(s) antes do logout", jobs.running_count()) }); }
@@ -4051,6 +5059,16 @@ fn run_worker(
                     let _ = sink.send(UiEvent::QueuedUserAdded { text, position: 0 });
                 }
                 UiCommand::SendPrompt(prompt) if !prompt.trim().is_empty() => {
+                    if let Err(message) = await_queue_durable(startup.queue_bridge.clone()).await {
+                        let _ = sink.send(UiEvent::RestoreDraft {
+                            text: prompt.clone(),
+                        });
+                        let _ = sink.send(UiEvent::RunFailed {
+                            run_id: None,
+                            message,
+                        });
+                        continue;
+                    }
                     let skill_instructions = match startup.options.workspace_root.as_deref() {
                         Some(workspace_root) => {
                             match resolve_slash_skill_command(workspace_root, &prompt) {
@@ -4149,7 +5167,7 @@ fn run_worker(
                             continue;
                         }
                     }
-                    match create_tui_session(&mut startup) {
+                    match create_tui_session_with_queue(&mut startup, Some(prompt.clone())).await {
                         Ok(Some((session_id, cwd))) => {
                             let skill_names =
                                 skill_memo.names(startup.options.workspace_root.clone());
@@ -4216,7 +5234,7 @@ fn run_worker(
                     }
                     let _ = sink.send(UiEvent::UserMessageAdded { text: display_prompt });
                     let run_options = startup.options.clone();
-                    let resume_preflight = if startup.options.shell_jobs.as_ref().is_some_and(|j| !j.list().is_empty()) { startup.resume_preflight = None; None } else { startup.resume_preflight.take() };
+                    let resume_preflight = if startup.options.shell_jobs.as_ref().is_some_and(|j| j.is_dirty()) { startup.resume_preflight = None; None } else { startup.resume_preflight.take() };
                     match start_active_run(
                         run_id,
                         None,
@@ -4285,6 +5303,21 @@ fn run_worker(
                     }
                 }
                 UiCommand::Compact { instructions } => {
+                    // If a speculative pre-compaction is already in flight and
+                    // no custom focus instructions were supplied, wait briefly
+                    // for it to land so /compact applies its result in < 5 ms.
+                    if instructions.trim().is_empty() {
+                        if let Some(mut job) = speculative_job.take() {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                &mut job.task,
+                            )
+                            .await;
+                            if !job.task.is_finished() {
+                                job.cancel();
+                            }
+                        }
+                    }
                     // Pi's /compact ignores `[compaction] enabled`, which gates
                     // only the automatic triggers.
                     let handle = startup.options.compaction.clone();
@@ -4293,12 +5326,30 @@ fn run_worker(
                         .map(slim_core::context::CompactionHandle::policy)
                         .unwrap_or_default();
                     let history = &startup.options.history;
+                    let usage_source = startup.request.as_ref().map(|request| {
+                        format!(
+                            "{}/{}",
+                            slim_core::provider::provider_kind_name(request.kind),
+                            request.model
+                        )
+                    });
                     let usage = slim_core::context::ContextUsage {
                         anchor: handle
                             .as_ref()
-                            .and_then(|handle| handle.usage_anchor(None, history)),
+                            .and_then(|handle| handle.usage_anchor(usage_source.as_deref(), history)),
                         fixed_tokens: 0,
                     };
+                    let window = startup
+                        .request
+                        .as_ref()
+                        .and_then(|request| {
+                            crate::headless::context_window_for_request(
+                                request,
+                                startup.options.context_window_tokens,
+                            )
+                        })
+                        .unwrap_or(0);
+                    let effective_settings = policy.effective_settings_for_window(window);
                     // Pi: a history that ends with the compaction is "Already
                     // compacted". Slim puts the summary first, so that is a
                     // history with nothing appended since the last compaction.
@@ -4308,8 +5359,12 @@ fn run_worker(
                         .as_ref()
                         .is_some_and(|handle| handle.is_already_compacted(history));
                     if already_compacted
-                        || slim_core::context::prepare_compaction(history, &policy.settings(), usage)
-                            .is_none()
+                        || slim_core::context::prepare_compaction(
+                            history,
+                            &effective_settings,
+                            usage,
+                        )
+                        .is_none()
                     {
                         let _ = sink.send(UiEvent::Notification {
                             message: if already_compacted {
@@ -4346,6 +5401,11 @@ fn run_worker(
                     effort,
                     fast,
                 } => {
+                    let model = if model.trim().is_empty() {
+                        crate::cli::resolve_provider_model(ProviderKind::OpenAiCodex, None)
+                    } else {
+                        model.trim().to_owned()
+                    };
                     // A slug the bundled list does not know is the account
                     // catalog's: the effort ladder came from it too.
                     if slim_core::provider::codex_model(&model)
@@ -4411,6 +5471,7 @@ fn run_worker(
                     startup.model_override = Some(model.clone());
                     startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
+                    startup.options.context_window_tokens = None;
                     if let Some(request) = startup.request.as_mut() {
                         request.model.clone_from(&model);
                     }
@@ -4696,26 +5757,74 @@ fn run_worker(
                 UiCommand::JobsRefresh | UiCommand::JobOutput { .. } | UiCommand::JobControl { .. } | UiCommand::RunBackgroundShell { .. } => {
                     sink.send(UiEvent::Notification { message: "Estado de jobs indisponível nesta sessão".into() });
                 }
+                UiCommand::SubagentPause { .. } | UiCommand::SubagentResume { .. } | UiCommand::SubagentMessage { .. } | UiCommand::SubagentCancel { .. } => {
+                    sink.send(UiEvent::Notification { message: "Subagentes indisponíveis nesta sessão".into() });
+                }
                 UiCommand::RequestContentPage {
                     handle,
                     request_id,
                     cursor,
                 } => serve_content_page(&content_store, &sink, handle, request_id, cursor),
+                UiCommand::RequestContentHeadTail {
+                    handle,
+                    request_id,
+                    max_bytes,
+                } => serve_content_head_tail(&content_store, &sink, handle, request_id, max_bytes),
+                UiCommand::CacheKeepAlive => {
+                    if let Some(req) = startup.request.clone() {
+                        let mut opts = startup.options.clone();
+                        if opts.history.is_empty() {
+                            if let Some(preflight) = startup.resume_preflight.as_ref() {
+                                opts.history = slim_core::session::provider_messages_from_records(&preflight.records).unwrap_or_default();
+                            } else if let Some(path) = startup.resume_path.as_deref() {
+                                if let Ok(preflight) = slim_core::session::preflight_session(path) {
+                                    opts.history = slim_core::session::provider_messages_from_records(&preflight.records).unwrap_or_default();
+                                }
+                            }
+                        }
+                        if !opts.history.is_empty() {
+                            let sink = sink.clone();
+                            tokio::spawn(async move {
+                                // A renovação só leu o cache se quase nada foi regravado.
+                                if let Ok((read, write)) = crate::headless::run_keep_alive_ping_with_options(req, opts).await {
+                                    if write > read {
+                                        sink.send(UiEvent::Notification { message: format!("Cache de prompt não renovado: {write} tokens regravados") });
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
                 UiCommand::RequestWorkspaceFiles { request_id } => serve_workspace_files(
                     startup.options.workspace_root.clone(),
                     &sink,
                     request_id,
                 ),
+                UiCommand::MemoryList
+                | UiCommand::MemoryAdd { .. }
+                | UiCommand::MemoryRemove { .. }
+                | UiCommand::MemoryClear => {
+                    let _ = handle_memory_command(
+                        startup.options.workspace_root.as_deref(),
+                        &sink,
+                        &command,
+                    );
+                }
             }
         }
+        subagents.cancel_all();
         jobs.shutdown().await;
         if let Err(message) = persist_job_metadata(&mut startup).await { sink.send(UiEvent::Notification { message }); }
         mcp_login::cancel_all(&mcp_logins);
         if let Some(manager) = mcp_manager.as_ref() {
-            manager.disconnect_all().await;
+            if !startup.options.shared_mcp_external || manager.has_shared_parent() {
+                manager.disconnect_all().await;
+            }
         }
-        if let Some(code_intelligence) = startup.options.code_intelligence.take() {
-            code_intelligence.shutdown().await;
+        if !startup.options.shared_code_intelligence_external {
+            if let Some(code_intelligence) = startup.options.code_intelligence.take() {
+                code_intelligence.shutdown().await;
+            }
         }
         let _ = oauth_warning_stop.send(true);
         let _ = oauth_warning_forwarder.await;
@@ -4729,23 +5838,6 @@ fn run_worker(
 /// configured MCP env/header value (a stderr tail can echo them).
 fn redact_mcp_text(manager: &McpManager, input: &str) -> String {
     crate::auth::redact_with_secrets(input, &manager.sensitive_values())
-}
-
-/// Workspace root MCP configuration, trust and server working directories
-/// are anchored to.
-/// The notice for project LSP launch overrides held back by trust, read
-/// like `prepare_tui_in` does: from the host's workspace when there is one
-/// (an embedded runtime), else from the process directory.
-fn project_lsp_trust_notice(workspace_root: Option<&Path>, trust_project: bool) -> Option<String> {
-    let layered = match workspace_root {
-        Some(root) => crate::config::load_layered_for(root),
-        None => crate::config::load_layered(),
-    }
-    .ok()?;
-    let workspace = workspace_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    crate::code_intel::project_trust(&layered.lsp, &workspace, trust_project).notice
 }
 
 fn mcp_workspace(startup: &TuiStartup) -> PathBuf {
@@ -4772,12 +5864,30 @@ fn reload_mcp(
     match mcp_manager.as_ref() {
         Some(manager) => {
             manager.reconcile(load.specs.clone());
+            for extra in &startup.options.extra_mcp_connections {
+                manager.insert_connection(
+                    extra.spec.clone(),
+                    Arc::clone(&extra.connection),
+                    extra.tools.clone(),
+                );
+            }
             manager.set_startup_wait(load.startup_wait);
             // New or newly trusted servers connect like those at session start.
             manager.start_background_connect();
         }
         None => {
-            if let Some(manager) = crate::mcp::build_mcp_manager(&load, &cwd) {
+            let manager = crate::mcp::build_mcp_manager(&load, &cwd).or_else(|| {
+                (!startup.options.extra_mcp_connections.is_empty())
+                    .then(|| crate::mcp::build_empty_mcp_manager(&cwd))
+            });
+            if let Some(manager) = manager {
+                for extra in &startup.options.extra_mcp_connections {
+                    manager.insert_connection(
+                        extra.spec.clone(),
+                        Arc::clone(&extra.connection),
+                        extra.tools.clone(),
+                    );
+                }
                 manager.start_background_connect();
                 startup.options.mcp = Some(McpHandle::new(manager.clone()));
                 *mcp_manager = Some(manager);
@@ -4907,34 +6017,35 @@ fn advance_pending_delivery(
     mcp_manager: &Option<Arc<McpManager>>,
     mcp_logins: &mcp_login::McpLogins,
 ) -> PendingDeliveryStep {
-    let Some(event) = run.delivery.pop_front() else {
-        return PendingDeliveryStep::Complete;
-    };
-    match sink.try_send(event) {
-        Ok(()) if run.delivery.is_empty() => PendingDeliveryStep::Complete,
-        Ok(()) => PendingDeliveryStep::Pending,
-        Err(mpsc::TrySendError::Full(event)) => {
-            run.delivery.push_front(event);
-            if service_pending_command(run, commands, sink, mcp_watch, mcp_manager, mcp_logins) {
-                return PendingDeliveryStep::Shutdown;
-            }
-            if run.cancel_requested {
-                if let Some(index) = run.delivery.iter().rposition(UiEvent::is_run_terminal) {
-                    let terminal = run.delivery.remove(index).expect("terminal index");
-                    sink.send_control(terminal);
-                }
-                for acknowledgement in std::mem::take(&mut run.delivery)
-                    .into_iter()
-                    .filter(|event| matches!(event, UiEvent::InteractionAcknowledged { .. }))
+    loop {
+        let Some(event) = run.delivery.pop_front() else {
+            return PendingDeliveryStep::Complete;
+        };
+        match sink.try_send(event) {
+            Ok(()) => continue,
+            Err(mpsc::TrySendError::Full(event)) => {
+                run.delivery.push_front(event);
+                if service_pending_command(run, commands, sink, mcp_watch, mcp_manager, mcp_logins)
                 {
-                    sink.send_control(acknowledgement);
+                    return PendingDeliveryStep::Shutdown;
                 }
-                PendingDeliveryStep::Complete
-            } else {
-                PendingDeliveryStep::Pending
+                if run.cancel_requested {
+                    if let Some(index) = run.delivery.iter().rposition(UiEvent::is_run_terminal) {
+                        let terminal = run.delivery.remove(index).expect("terminal index");
+                        sink.send_control(terminal);
+                    }
+                    for acknowledgement in std::mem::take(&mut run.delivery)
+                        .into_iter()
+                        .filter(|event| matches!(event, UiEvent::InteractionAcknowledged { .. }))
+                    {
+                        sink.send_control(acknowledgement);
+                    }
+                    return PendingDeliveryStep::Complete;
+                }
+                return PendingDeliveryStep::Pending;
             }
+            Err(mpsc::TrySendError::Disconnected(_)) => return PendingDeliveryStep::Disconnected,
         }
-        Err(mpsc::TrySendError::Disconnected(_)) => PendingDeliveryStep::Disconnected,
     }
 }
 
@@ -4973,6 +6084,12 @@ fn dispatch_pending_command(
             request_id,
             cursor,
         }) => serve_content_page(&run.content_store, sink, handle, request_id, cursor),
+        Some(UiCommand::RequestContentHeadTail {
+            handle,
+            request_id,
+            max_bytes,
+        }) => serve_content_head_tail(&run.content_store, sink, handle, request_id, max_bytes),
+        Some(UiCommand::CacheKeepAlive) => {}
         Some(UiCommand::RequestWorkspaceFiles { request_id }) => {
             serve_workspace_files(run.workspace_root.clone(), sink, request_id);
         }
@@ -5014,9 +6131,95 @@ fn dispatch_pending_command(
             sink.send_control(UiEvent::Shutdown);
             return true;
         }
+        Some(ref command)
+            if handle_memory_command(run.workspace_root.as_deref(), sink, command) => {}
         Some(_) => {}
     }
     false
+}
+
+fn handle_memory_command(
+    workspace_root: Option<&Path>,
+    sink: &EventSink,
+    command: &UiCommand,
+) -> bool {
+    let Some(cwd) = workspace_root else {
+        if matches!(
+            command,
+            UiCommand::MemoryList
+                | UiCommand::MemoryAdd { .. }
+                | UiCommand::MemoryRemove { .. }
+                | UiCommand::MemoryClear
+        ) {
+            let _ = sink.send(UiEvent::Notification {
+                message: "Workspace indisponível para memória do projeto.".into(),
+            });
+            return true;
+        }
+        return false;
+    };
+    let message = match command {
+        UiCommand::MemoryList => {
+            let mem = slim_core::memory::load_project_memory(cwd);
+            if mem.entries.is_empty() {
+                "Nenhuma memória salva para este projeto. Use /memory add TEXTO.".to_owned()
+            } else {
+                let mut lines = vec![format!(
+                    "Memória do projeto ({}/{}):",
+                    mem.entries.len(),
+                    slim_core::memory::MAX_MEMORY_ENTRIES
+                )];
+                for entry in mem.entries {
+                    let src = match entry.source {
+                        slim_core::memory::MemorySource::User => "manual",
+                        slim_core::memory::MemorySource::Auto => "auto",
+                    };
+                    lines.push(format!(
+                        "- [{}] {} ({}, {}x): {}",
+                        entry.id,
+                        entry.kind.as_str(),
+                        src,
+                        entry.hits,
+                        entry.text
+                    ));
+                }
+                lines.join("\n")
+            }
+        }
+        UiCommand::MemoryAdd { kind, text } => {
+            match slim_core::memory::MemoryKind::parse_str(kind) {
+                Some(parsed) => match slim_core::memory::add_memory_entry(
+                    cwd,
+                    parsed,
+                    text,
+                    slim_core::memory::MemorySource::User,
+                ) {
+                    Ok(entry) => format!(
+                        "Memória salva [{}] ({}): {}",
+                        entry.id,
+                        entry.kind.as_str(),
+                        entry.text
+                    ),
+                    Err(error) => format!("Não foi possível salvar memória: {error}"),
+                },
+                None => format!(
+                    "Tipo de memória desconhecido \"{kind}\". Use command, convention, architecture ou gotcha."
+                ),
+            }
+        }
+        UiCommand::MemoryRemove { id } => match slim_core::memory::remove_memory_entry(cwd, id) {
+            Ok(removed) => format!("Memória removida [{}]: {}", removed.id, removed.text),
+            Err(error) => error,
+        },
+        UiCommand::MemoryClear => match slim_core::memory::clear_project_memory(cwd) {
+            Ok(0) => "Nenhuma memória para limpar neste projeto.".to_owned(),
+            Ok(n) => format!("{n} memória(s) do projeto removida(s)."),
+            Err(error) => format!("Não foi possível limpar memória: {error}"),
+        },
+        _ => return false,
+    };
+    let _ = sink.send(UiEvent::Notification { message });
+    true
 }
 
 fn service_pending_command(
@@ -5154,12 +6357,11 @@ fn codex_catalog_event(
 
 fn open_code_catalog_event(snapshot: CatalogSnapshot) -> UiEvent {
     let models = snapshot
-        .model_ids
-        .iter()
-        .filter_map(|id| open_code_model(id))
+        .models
+        .into_iter()
         .map(|model| OpenCodeModelView {
-            id: model.id.to_owned(),
-            name: model.name.to_owned(),
+            id: model.id,
+            name: model.name,
             context_window_tokens: model.context_window.unwrap_or_default(),
             max_output_tokens: model.max_output_tokens.unwrap_or_default() as u64,
             reasoning_levels: model
@@ -5401,6 +6603,18 @@ fn namespace_projected_ids(event: UiEvent, scope: &str) -> UiEvent {
                 batch_id,
                 call_id,
                 diff,
+            }
+        }
+        UiEvent::ToolSource {
+            batch_id,
+            call_id,
+            source,
+        } => {
+            let (batch_id, call_id) = identity(batch_id, call_id);
+            UiEvent::ToolSource {
+                batch_id,
+                call_id,
+                source,
             }
         }
         UiEvent::ToolEnded {
@@ -5811,24 +7025,25 @@ fn format_mention_size(bytes: usize) -> String {
 /// (secret-looking, binary, outside the workspace) or a hit limit fails the
 /// whole prompt, so the model never sees a half-attached request.
 fn load_prompt_mentions(root: &Path, prompt: &str) -> Result<MentionAttachments, String> {
-    let paths = slim_core::mention_paths_in_prompt(root, prompt);
-    if paths.len() > MENTION_MAX_FILES {
+    let specs = slim_core::mention_specs_in_prompt(root, prompt);
+    if specs.len() > MENTION_MAX_FILES {
         return Err(format!(
             "Máximo de {MENTION_MAX_FILES} arquivos por prompt com @ (encontrados {})",
-            paths.len()
+            specs.len()
         ));
     }
     let mut attachments = MentionAttachments::default();
     let mut total = 0usize;
-    for path in paths {
+    for spec in specs {
         let budget = MENTION_FILE_BYTES.min(MENTION_TOTAL_BYTES - total);
         if budget == 0 {
             return Err(format!(
-                "Limite de {} de arquivos anexados por prompt excedido em @{path}",
-                format_mention_size(MENTION_TOTAL_BYTES)
+                "Limite de {} de arquivos anexados por prompt excedido em @{}",
+                format_mention_size(MENTION_TOTAL_BYTES),
+                spec.raw
             ));
         }
-        let file = slim_core::load_mention_file(root, &path, budget).map_err(|error| {
+        let file = slim_core::load_mention_spec(root, &spec, budget).map_err(|error| {
             let reason = match error {
                 slim_core::MentionError::Sensitive => {
                     "o nome parece conter segredos e não é anexado".to_owned()
@@ -5839,7 +7054,7 @@ fn load_prompt_mentions(root: &Path, prompt: &str) -> Result<MentionAttachments,
                 slim_core::MentionError::NotFound => "arquivo não encontrado".to_owned(),
                 other => other.to_string(),
             };
-            format!("@{path}: {reason}")
+            format!("@{}: {reason}", spec.raw)
         })?;
         total += file.bytes;
         let note = if file.truncated {
@@ -5890,6 +7105,88 @@ fn serve_content_page(
         },
     };
     sink.send(event);
+}
+
+fn serve_content_head_tail(
+    store: &SharedContentStore,
+    sink: &EventSink,
+    handle: ContentHandle,
+    request_id: ContentRequestId,
+    max_bytes: usize,
+) {
+    let result = store
+        .lock()
+        .map_err(|_| "Tool output store is unavailable".to_owned())
+        .and_then(|store| store.head_tail(&handle, max_bytes));
+    let event = match result {
+        Ok(text) => UiEvent::ContentPageLoaded {
+            handle,
+            request_id,
+            cursor: None,
+            text,
+            next_cursor: None,
+        },
+        Err(message) => UiEvent::ContentPageFailed {
+            handle,
+            request_id,
+            cursor: None,
+            message,
+        },
+    };
+    sink.send(event);
+}
+
+fn project_codemode_source(event: &SessionEvent) -> Option<UiEvent> {
+    let EventKind::ToolStarted {
+        batch_id,
+        call_id,
+        name,
+        arguments,
+    } = &event.kind
+    else {
+        return None;
+    };
+    if name != "codemode" || batch_id.is_empty() || call_id.is_empty() {
+        return None;
+    }
+    let code = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_str).map(str::to_owned))?;
+    if code.trim().is_empty() {
+        return None;
+    }
+    Some(UiEvent::ToolSource {
+        batch_id: ToolBatchId(batch_id.clone().into()),
+        call_id: ToolCallId(call_id.clone().into()),
+        source: code,
+    })
+}
+
+fn project_context_telemetry(event: &SessionEvent) -> Option<UiEvent> {
+    let EventKind::ContextSnapshot {
+        provider,
+        model,
+        system_bytes,
+        tool_schema_bytes,
+        history_bytes,
+        tool_result_bytes,
+        estimated_tokens,
+        context_window_tokens,
+        ..
+    } = &event.kind
+    else {
+        return None;
+    };
+    Some(UiEvent::ContextTelemetry {
+        provider: provider.clone(),
+        model: model.clone(),
+        system_bytes: *system_bytes,
+        tool_schema_bytes: *tool_schema_bytes,
+        history_bytes: *history_bytes,
+        tool_result_bytes: *tool_result_bytes,
+        estimated_tokens: *estimated_tokens,
+        context_window_tokens: *context_window_tokens,
+    })
 }
 
 fn project_core_event(
@@ -5966,6 +7263,138 @@ fn request_manual_compaction(options: &ProviderRunOptions, instructions: String,
         Err(error) => error.to_owned(),
     };
     let _ = sink.send(UiEvent::Notification { message });
+}
+
+struct SpeculativeJob {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SpeculativeJob {
+    fn cancel(self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}
+
+fn cancel_speculative(job: &mut Option<SpeculativeJob>) {
+    if let Some(current) = job.take() {
+        current.cancel();
+    }
+}
+
+fn cancels_speculative_job(command: &UiCommand) -> bool {
+    matches!(
+        command,
+        UiCommand::PreparePrompt { .. }
+            | UiCommand::SetMode(_)
+            | UiCommand::SetModel { .. }
+            | UiCommand::SetAnthropicModel { .. }
+            | UiCommand::SetOpenCodeModel { .. }
+            | UiCommand::SetZenModel { .. }
+            | UiCommand::SetClinePassModel { .. }
+            | UiCommand::SetCommandCodeModel { .. }
+            | UiCommand::SetOpenDesignModel { .. }
+            | UiCommand::SetDevinModel { .. }
+            | UiCommand::SetXaiModel { .. }
+            | UiCommand::SetThinkingDisplay { .. }
+            | UiCommand::ResumePrevious
+            | UiCommand::ResumeSession { .. }
+            | UiCommand::NewSession
+            | UiCommand::RewindSession { .. }
+            | UiCommand::UndoLastRewind
+            | UiCommand::Shutdown
+    ) || matches!(command, UiCommand::Compact { instructions } if !instructions.trim().is_empty())
+}
+
+fn maybe_spawn_speculative(startup: &TuiStartup, slot: &mut Option<SpeculativeJob>) {
+    if slot.is_some() {
+        return;
+    }
+    let Some(request) = startup.request.clone() else {
+        return;
+    };
+    let Some(handle) = startup.options.compaction.clone() else {
+        return;
+    };
+    let policy = handle.policy();
+    let history = &startup.options.history;
+    if !policy.enabled || !policy.speculative || history.len() < 4 {
+        return;
+    }
+    let already_compacted = history.last().is_some_and(|message| {
+        slim_core::context::compaction_summary_text(message).is_some()
+    }) || handle.is_already_compacted(history);
+    if already_compacted {
+        return;
+    }
+    let Some(window) = crate::headless::context_window_for_request(
+        &request,
+        startup.options.context_window_tokens,
+    ) else {
+        return;
+    };
+    if window == 0 {
+        return;
+    }
+    let source = format!(
+        "{}/{}",
+        slim_core::provider::provider_kind_name(request.kind),
+        request.model
+    );
+    let usage = slim_core::context::ContextUsage {
+        anchor: handle.usage_anchor(Some(&source), history),
+        fixed_tokens: 0,
+    };
+    let current_tokens = slim_core::context::estimate_context_tokens(history, usage).tokens;
+    let effective_settings = policy.effective_settings_for_window(window);
+    // Run only when >=68% full (before the threshold) so normal short
+    // conversations spend zero extra tokens.
+    if current_tokens.saturating_mul(100) < window.saturating_mul(68)
+        || slim_core::context::should_compact(current_tokens, window, &effective_settings)
+    {
+        return;
+    }
+    let Some(prep) =
+        slim_core::context::prepare_compaction(history, &effective_settings, usage)
+    else {
+        return;
+    };
+    let prefix_fp =
+        slim_core::context::canonical_prefix_fingerprint(&history[..prep.first_kept_index]);
+    if handle.has_speculative_for(&prefix_fp, prep.first_kept_index) {
+        return;
+    }
+    let cancel = CancellationToken::new();
+    let mut options = startup.options.clone();
+    options.cancellation = Some(cancel.clone());
+    options.manual_retry = None;
+    options.steer_inbox = None;
+    let job_cancel = cancel.clone();
+    let persist_path = startup.persist_sessions.then(|| startup.resume_path.clone()).flatten();
+    let task = tokio::spawn(async move {
+        if let Ok(Some(spec)) =
+            crate::headless::execute_speculative_compaction(request, options, job_cancel).await
+        {
+            if let Some(path) = persist_path {
+                use slim_core::session::DurableRepo as _;
+                if let Ok(mut repo) = slim_core::session::JsonlRepo::open(&path) {
+                    if let (Ok(value), Ok(seq)) = (serde_json::to_value(&spec), repo.next_seq()) {
+                        let _ = repo.append(slim_core::session::DurableRecord::Fact {
+                            seq,
+                            fact: slim_core::session::DurableFact {
+                                namespace: "compaction.speculative.v1".into(),
+                                key: "latest".into(),
+                                value,
+                            },
+                        });
+                    }
+                }
+            }
+            handle.store_speculative(spec);
+        }
+    });
+    *slot = Some(SpeculativeJob { cancel, task });
 }
 
 /// `/compact` typed while a run is active. A normal run takes it at its next
@@ -6046,7 +7475,7 @@ async fn maybe_start_job_wake(
         .options
         .shell_jobs
         .as_ref()
-        .is_some_and(|j| !j.list().is_empty())
+        .is_some_and(|j| j.is_dirty())
     {
         startup.resume_preflight = None;
         None
@@ -6179,7 +7608,7 @@ async fn start_idle_compaction(
         .options
         .shell_jobs
         .as_ref()
-        .is_some_and(|j| !j.list().is_empty())
+        .is_some_and(|j| j.is_dirty())
     {
         startup.resume_preflight = None;
         None
@@ -6230,26 +7659,50 @@ fn start_active_run(
     )?;
     options.workspace_root = Some(workspace_root.clone());
     let cwd_display = display_workspace_path(&workspace_root);
-    // Fresh discovery per run (off the UI thread): skills added mid-session
-    // appear on the next prompt.
-    let projector_skill_names = workspace_skill_names(&workspace_root, &mut String::new());
+    let projector_workspace_root = workspace_root.clone();
     let cancellation = CancellationToken::new();
     let notice_sink = sink.clone();
     let (core_tx, core_rx) = SessionEventSender::bounded(1_024, cancellation.clone());
     let projector_cancellation = cancellation.clone();
     let projector_content_store = content_store.clone();
+    let projector_done = Arc::new(tokio::sync::Notify::new());
+    let projector_done_tx = Arc::clone(&projector_done);
     let projector = thread::Builder::new()
         .name("slim-tui-projector".into())
         .spawn(move || {
+            struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
+            let _done = NotifyOnDrop(projector_done_tx);
             for event in core_rx {
+                let extra_source = project_codemode_source(&event);
+                let extra_telemetry = project_context_telemetry(&event);
                 if let Some(event) = project_core_event(event, run_id, &projector_content_store) {
                     let mut event = attach_workspace_to_snapshot(event, &cwd_display);
                     if let UiEvent::SessionSnapshot { skill_names, .. } = &mut event {
-                        skill_names.clone_from(&projector_skill_names);
+                        // Fresh discovery per run (off the UI thread): skills added
+                        // mid-session appear on the next prompt.
+                        *skill_names =
+                            workspace_skill_names(&projector_workspace_root, &mut String::new());
                     }
                     let event = associate_projected_run(event, run_id);
                     if !sink.send_projected(event, &projector_cancellation) {
                         break;
+                    }
+                    if let Some(source) = extra_source {
+                        let source = associate_projected_run(source, run_id);
+                        if !sink.send_projected(source, &projector_cancellation) {
+                            break;
+                        }
+                    }
+                    if let Some(telemetry) = extra_telemetry {
+                        let telemetry = associate_projected_run(telemetry, run_id);
+                        if !sink.send_projected(telemetry, &projector_cancellation) {
+                            break;
+                        }
                     }
                 }
             }
@@ -6330,6 +7783,7 @@ fn start_active_run(
         cancellation_from_preparation: false,
         task,
         projector,
+        projector_done,
         cancellation,
         durable,
         content_store,
@@ -6392,6 +7846,7 @@ async fn abort_active_with_grace(
             admission: run.admission,
             result: Some(result),
             projector: Some(run.projector),
+            projector_done: run.projector_done,
             delivery: VecDeque::new(),
             cancellation: run.cancellation,
             durable,

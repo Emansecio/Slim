@@ -69,6 +69,10 @@ fn harness(mode: slim_core::OperatingMode, label: &str) -> Harness {
         endpoint_override: None,
         model_override: None,
         timeout: Duration::from_secs(120),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
     Harness {
@@ -286,7 +290,6 @@ fn job_output_read_never_emits_a_metadata_echo() {
         data: Some(data_tx),
         wake: slim_tui::api::WakeSignal::new().unwrap(),
         lane_space: slim_tui::api::WakeSignal::new().unwrap(),
-        drop_probe: None,
     };
     assert!(context
         .handle(
@@ -361,6 +364,10 @@ async fn background_jobs_persist_start_and_idle_end_without_a_model_turn() {
         endpoint_override: None,
         model_override: None,
         timeout: Duration::from_secs(10),
+        layered_config: None,
+        lsp_trust_notice: None,
+        cached_project_trust: None,
+        queue_bridge: None,
     };
     startup.options.shell_jobs = Some(jobs.clone());
     startup.resume_path = Some(path.clone());
@@ -370,8 +377,8 @@ async fn background_jobs_persist_start_and_idle_end_without_a_model_turn() {
         data: None,
         wake: slim_tui::api::WakeSignal::new().unwrap(),
         lane_space: slim_tui::api::WakeSignal::new().unwrap(),
-        drop_probe: None,
     };
+    let mut persist_at = Some(tokio::time::Instant::now());
     let command = tokio::time::timeout(
         Duration::from_secs(1),
         super::receive_tui_command(
@@ -379,7 +386,7 @@ async fn background_jobs_persist_start_and_idle_end_without_a_model_turn() {
             &mut startup,
             &sink,
             true,
-            tokio::time::Instant::now(),
+            &mut persist_at,
         ),
     )
     .await

@@ -340,6 +340,20 @@ pub enum EventKind {
         #[serde(default)]
         count: u64,
     },
+    CacheDriftDetected {
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        hit_ratio_pct: u8,
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        cache_read_tokens: u64,
+        #[serde(default)]
+        cause: String,
+    },
     CausalProgressObserved {
         #[serde(default)]
         batch_id: Box<str>,

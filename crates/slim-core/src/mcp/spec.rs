@@ -220,6 +220,9 @@ pub struct McpToolSummary {
     pub description: Option<String>,
     pub schema: Value,
     pub output_schema: Option<Value>,
+    pub read_only_hint: bool,
+    pub destructive_hint: bool,
+    pub idempotent_hint: bool,
 }
 
 #[derive(Clone, Debug)]

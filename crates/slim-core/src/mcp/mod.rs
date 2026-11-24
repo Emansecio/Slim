@@ -16,11 +16,12 @@ pub use client::{
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use exposure::{
-    exposure_glob_matches, is_direct_tool_name, provider_input_schema, sanitized_provider_name,
-    AwarenessServer, DirectNames, McpDirectTool, DIRECT_TOOL_PREFIX, MAX_AWARENESS_BYTES,
+    compact_deferred_direct_list, exposure_glob_matches, is_direct_tool_name,
+    provider_input_schema, sanitized_provider_name, AwarenessServer, DirectNames, McpDirectTool,
+    DEFERRED_DIRECT_TOOLS_THRESHOLD, DIRECT_TOOL_PREFIX, MAX_AWARENESS_BYTES,
     MAX_AWARENESS_LINE_CHARS, MAX_DIRECT_TOOLS, MAX_PROVIDER_TOOL_NAME,
 };
-pub use manager::{McpManager, McpStartupWait};
+pub use manager::{read_only_cache_stats, McpManager, McpStartupWait};
 pub use oauth::{
     is_loopback_host, merge_scopes, parse_www_authenticate, pkce_challenge, step_up_scope,
     AuthServerMetadata, AuthorizationResponse, CallbackHint, Challenge, DiscoveryState,

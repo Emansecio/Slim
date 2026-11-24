@@ -110,15 +110,57 @@ impl Runtime {
                     .get(&(batch.id.to_owned(), call.id.clone()))
             })
             .collect::<Vec<_>>();
+        let (read_cap, result_cap, batch_cap) = effective_presentation_caps(
+            config,
+            self.read_presentation_bytes,
+            base_messages,
+        );
+        let effective_outputs: Vec<Option<String>> = calls
+            .iter()
+            .zip(results)
+            .map(|(call, result)| {
+                if result.name == "shell" {
+                    let cmd = serde_json::from_str::<Value>(&call.arguments)
+                        .ok()
+                        .and_then(|v| v.get("command").and_then(Value::as_str).map(str::to_owned));
+                    cmd.as_deref().and_then(|command| {
+                        super::shell_fold::fold_shell_output(command, &result.output, result.success)
+                    })
+                } else if matches!(result.name.as_str(), "codemode" | "batch_code")
+                    && result.success
+                {
+                    let (body, console_tail) = match result.output.split_once("\nconsole:\n") {
+                        Some((body, tail)) => (body, Some(tail)),
+                        None => (result.output.as_str(), None),
+                    };
+                    super::distill::distill_json_for_model(body).map(|d| match console_tail {
+                        Some(tail) => format!("{}\nconsole:\n{tail}", d.text),
+                        None => d.text,
+                    })
+                } else if result.name == "read"
+                    && result.success
+                    && result.media.is_empty()
+                    && result.output.len() >= 1024
+                {
+                    differential_read_output(base_messages, call, &result.output)
+                } else {
+                    None
+                }
+            })
+            .collect();
         let targets: Vec<usize> = results
             .iter()
             .zip(&sources)
-            .map(|(result, source)| {
+            .zip(&effective_outputs)
+            .map(|((result, source), effective)| {
                 let cap = if result.name == "read" {
-                    self.read_presentation_bytes
+                    read_cap
                 } else {
-                    config.max_result_bytes
+                    result_cap
                 };
+                if let Some(effective) = effective {
+                    return effective.len().min(cap);
+                }
                 // `result.output` is post-redaction while the presentation
                 // source holds the raw projection; a few bytes of divergence
                 // (e.g. "[REDACTED]" shorter than the secret) must not divert
@@ -158,9 +200,6 @@ impl Runtime {
                 }
             })
             .collect();
-        let batch_cap = AgentLoopConfig::DEFAULT_MAX_BATCH_RESULT_BYTES
-            .max(config.max_result_bytes)
-            .max(self.read_presentation_bytes);
         PresentationPlan {
             batch_limits: batch_limits(&needs, batch_cap),
             base_messages,
@@ -178,6 +217,7 @@ impl Runtime {
                 .map(|result| Self::artifact_reference(result, cwd))
                 .collect(),
             sources,
+            effective_outputs,
         }
     }
 
@@ -237,26 +277,41 @@ impl Runtime {
             .div_ceil(1000)
             .min(plan.batch_limits[index]);
         let body_budget = allowance.saturating_sub(suffix.map_or(0, String::len));
-        let mut presentation = plan.sources[index]
-            .map(|source| {
-                source.present(PresentationBudget {
+        let mut presentation = if let Some(effective) = plan.effective_outputs[index].as_deref() {
+            let mut p = present_unstructured(
+                &result.name,
+                effective,
+                PresentationBudget {
                     max_bytes: body_budget,
-                })
-            })
-            .unwrap_or_else(|| {
-                present_unstructured(
-                    &result.name,
-                    &result.output,
-                    PresentationBudget {
+                },
+            );
+            if !p.complete && p.text.len() >= effective.len() {
+                p = ToolPresentation::complete(effective.to_owned());
+            }
+            p
+        } else {
+            let mut p = plan.sources[index]
+                .map(|source| {
+                    source.present(PresentationBudget {
                         max_bytes: body_budget,
-                    },
-                )
-            });
-        // A cut result is never longer than the result it cuts: the notice a
-        // small result would gain costs more than the result is worth.
-        if !presentation.complete && presentation.text.len() >= result.output.len() {
-            presentation = ToolPresentation::complete(result.output.clone());
-        }
+                    })
+                })
+                .unwrap_or_else(|| {
+                    present_unstructured(
+                        &result.name,
+                        &result.output,
+                        PresentationBudget {
+                            max_bytes: body_budget,
+                        },
+                    )
+                });
+            // A cut result is never longer than the result it cuts: the notice a
+            // small result would gain costs more than the result is worth.
+            if !p.complete && p.text.len() >= result.output.len() {
+                p = ToolPresentation::complete(result.output.clone());
+            }
+            p
+        };
         if let Some(suffix) = suffix {
             if presentation.text.len().saturating_add(suffix.len()) <= allowance {
                 presentation.text.push_str(suffix);
@@ -363,6 +418,287 @@ pub(super) struct PresentationPlan<'a> {
     targets: Vec<usize>,
     suffixes: Vec<Option<String>>,
     sources: Vec<Option<&'a ToolPresentationSource>>,
+    effective_outputs: Vec<Option<String>>,
+}
+
+/// Scales `(read_cap, result_cap, batch_cap)` proportionally to context window
+/// size and remaining headroom before compaction.
+pub(super) fn effective_presentation_caps(
+    config: &AgentLoopConfig,
+    base_read_bytes: usize,
+    base_messages: &[ProviderMessage],
+) -> (usize, usize, usize) {
+    let default_read = base_read_bytes;
+    let default_result = config.max_result_bytes;
+    let default_batch = AgentLoopConfig::DEFAULT_MAX_BATCH_RESULT_BYTES
+        .max(default_result)
+        .max(default_read);
+    if config.context_window_tokens == 0 {
+        return (default_read, default_result, default_batch);
+    }
+    let window = config.context_window_tokens;
+    let window_bytes = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
+    let (mut read_cap, mut result_cap, mut batch_cap) =
+        (default_read, default_result, default_batch);
+    if window < 32_000 {
+        read_cap = read_cap.min((window_bytes / 6).max(4 * 1024));
+        result_cap = result_cap.min((window_bytes / 6).max(4 * 1024));
+        batch_cap = batch_cap.min((window_bytes / 4).max(8 * 1024));
+    }
+    let used_tokens: u64 = base_messages
+        .iter()
+        .map(crate::context::estimate_tokens)
+        .sum();
+    if used_tokens.saturating_mul(100) > window.saturating_mul(75) {
+        read_cap = (read_cap / 2).max(4 * 1024).min(default_read);
+        result_cap = (result_cap / 2).max(4 * 1024).min(default_result);
+        batch_cap = (batch_cap / 2).max(8 * 1024).min(default_batch);
+    } else if window >= 200_000 && used_tokens.saturating_mul(100) < window.saturating_mul(60) {
+        if base_read_bytes >= 64 * 1024 {
+            read_cap = read_cap.max(96 * 1024).min(window_bytes / 6);
+        }
+        batch_cap = batch_cap.max(128 * 1024).min(window_bytes / 4);
+    }
+    (read_cap, result_cap, batch_cap)
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ReadCallKey {
+    path: String,
+    offset: u64,
+    max_lines: Option<u64>,
+    raw: bool,
+    special_mode: bool,
+}
+
+fn parse_read_call_key(arguments: &str) -> Option<ReadCallKey> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)?
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+    let offset = value.get("offset").and_then(Value::as_u64).unwrap_or(1);
+    let max_lines = value
+        .get("max_lines")
+        .or_else(|| value.get("lines"))
+        .and_then(Value::as_u64);
+    let raw = value.get("raw").and_then(Value::as_bool).unwrap_or(false);
+    let special_mode = value.get("outline").and_then(Value::as_bool).unwrap_or(false)
+        || value.get("ranges").is_some_and(|v| !v.is_null())
+        || value.get("symbols").is_some_and(|v| !v.is_null());
+    Some(ReadCallKey {
+        path,
+        offset,
+        max_lines,
+        raw,
+        special_mode,
+    })
+}
+
+fn is_raw_read_content(content: &str) -> bool {
+    !content.is_empty()
+        && !content.starts_with(super::history_elision::DUPLICATE_POINTER_PREFIX)
+        && !content.starts_with("[diff vs earlier read")
+        && !content.starts_with("[pruned old ")
+        && !content.starts_with("[superseded ")
+}
+
+fn differential_read_output(
+    base_messages: &[ProviderMessage],
+    call: &ProviderToolCall,
+    new_output: &str,
+) -> Option<String> {
+    let target = parse_read_call_key(&call.arguments)?;
+    if target.raw || target.special_mode {
+        return None;
+    }
+    let mut earlier_id: Option<&str> = None;
+    for msg in base_messages.iter().rev() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        for prev in msg.tool_calls.iter().rev() {
+            if prev.name == "read" {
+                if let Some(prev_key) = parse_read_call_key(&prev.arguments) {
+                    if !prev_key.special_mode
+                        && prev_key.path == target.path
+                        && prev_key.offset == target.offset
+                        && prev_key.max_lines == target.max_lines
+                    {
+                        earlier_id = Some(prev.id.as_str());
+                        break;
+                    }
+                }
+            }
+        }
+        if earlier_id.is_some() {
+            break;
+        }
+    }
+    let earlier_id = earlier_id?;
+    let earlier_output = base_messages.iter().rev().find_map(|msg| {
+        (msg.role == "tool"
+            && msg.name.as_deref() == Some("read")
+            && msg.tool_call_id.as_deref() == Some(earlier_id))
+        .then_some(msg.content.as_str())
+    })?;
+    if !is_raw_read_content(earlier_output) || earlier_output == new_output {
+        return None;
+    }
+    let diff = compute_compact_diff(earlier_output, new_output)?;
+    let wrapped = format!(
+        "[diff vs earlier read of {} in context; pass raw:true for full text]\n{}",
+        target.path, diff
+    );
+    if wrapped.len() < new_output.len().saturating_mul(45) / 100
+        && new_output.len().saturating_sub(wrapped.len()) >= 512
+    {
+        Some(wrapped)
+    } else {
+        None
+    }
+}
+
+fn compute_compact_diff(old: &str, new: &str) -> Option<String> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let min_len = old_lines.len().min(new_lines.len());
+    let mut prefix = 0;
+    while prefix < min_len && old_lines[prefix] == new_lines[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < (min_len - prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let mid_old = &old_lines[prefix..old_lines.len() - suffix];
+    let mid_new = &new_lines[prefix..new_lines.len() - suffix];
+    if mid_old.is_empty() && mid_new.is_empty() {
+        return None;
+    }
+    if mid_old.len().saturating_mul(mid_new.len()) > 250_000 {
+        return None;
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Op<'a> {
+        Same(&'a str),
+        Del(&'a str),
+        Add(&'a str),
+    }
+
+    let n = mid_old.len();
+    let m = mid_new.len();
+    let cols = m + 1;
+    let mut dp = vec![0u32; (n + 1) * cols];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i * cols + j] = if mid_old[i] == mid_new[j] {
+                dp[(i + 1) * cols + (j + 1)] + 1
+            } else {
+                dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+            };
+        }
+    }
+    let mut ops = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if mid_old[i] == mid_new[j] {
+            ops.push(Op::Same(mid_old[i]));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)] {
+            ops.push(Op::Del(mid_old[i]));
+            i += 1;
+        } else {
+            ops.push(Op::Add(mid_new[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(Op::Del(mid_old[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push(Op::Add(mid_new[j]));
+        j += 1;
+    }
+
+    let mut all_ops = Vec::with_capacity(prefix + ops.len() + suffix);
+    all_ops.extend(old_lines[..prefix].iter().map(|l| Op::Same(l)));
+    all_ops.extend(ops);
+    all_ops.extend(
+        old_lines[old_lines.len() - suffix..]
+            .iter()
+            .map(|l| Op::Same(l)),
+    );
+
+    const CTX: usize = 2;
+    let changed_indices: Vec<usize> = all_ops
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, op)| (!matches!(op, Op::Same(_))).then_some(idx))
+        .collect();
+    if changed_indices.is_empty() {
+        return None;
+    }
+
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for idx in changed_indices {
+        let start = idx.saturating_sub(CTX);
+        let end = (idx + CTX + 1).min(all_ops.len());
+        if let Some(last) = groups.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        groups.push((start, end));
+    }
+
+    let mut old_pos = vec![0usize; all_ops.len() + 1];
+    let mut new_pos = vec![0usize; all_ops.len() + 1];
+    for (idx, op) in all_ops.iter().enumerate() {
+        old_pos[idx + 1] = old_pos[idx] + usize::from(!matches!(op, Op::Add(_)));
+        new_pos[idx + 1] = new_pos[idx] + usize::from(!matches!(op, Op::Del(_)));
+    }
+
+    let mut out = String::new();
+    for (g_idx, (start, end)) in groups.into_iter().enumerate() {
+        if g_idx > 0 {
+            out.push('\n');
+        }
+        let o_start = old_pos[start] + 1;
+        let o_count = old_pos[end] - old_pos[start];
+        let n_start = new_pos[start] + 1;
+        let n_count = new_pos[end] - new_pos[start];
+        let _ = writeln!(out, "@@ -{o_start},{o_count} +{n_start},{n_count} @@");
+        for op in &all_ops[start..end] {
+            match op {
+                Op::Same(l) => {
+                    out.push(' ');
+                    out.push_str(l);
+                }
+                Op::Del(l) => {
+                    out.push('-');
+                    out.push_str(l);
+                }
+                Op::Add(l) => {
+                    out.push('+');
+                    out.push_str(l);
+                }
+            }
+            out.push('\n');
+        }
+    }
+    Some(out.trim_end_matches('\n').to_owned())
 }
 
 /// How much of its need each result of one batch may present so that the batch
@@ -429,4 +765,151 @@ pub(super) fn largest_fitting_scale<T>(build: impl Fn(usize) -> T, fits: impl Fn
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differential_read_emits_compact_diff_on_small_edit_and_respects_raw_flag() {
+        let mut lines: Vec<String> = (1..=80).map(|i| format!("line number {i:03} with stable content")).collect();
+        let old_text = lines.join("\n");
+        lines[40] = "line number 041 with UPDATED content".to_owned();
+        let new_text = lines.join("\n");
+        assert!(new_text.len() >= 1024);
+
+        let assistant = ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            }],
+        );
+        let tool = ProviderMessage::tool("read", "c1", old_text);
+        let base = vec![ProviderMessage::user("check"), assistant, tool];
+
+        let runtime = Runtime::new();
+        let calls = vec![ProviderToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"./src/lib.rs","offset":1}"#.into(),
+        }];
+        let results = vec![ToolResult::ok("read", new_text.clone())];
+        let batch = PresentationBatch {
+            id: "b1",
+            calls: &calls,
+            results: &results,
+        };
+        let config = AgentLoopConfig::default();
+        let plan = runtime.presentation_plan(&batch, &base, &config, Path::new("."));
+        let presented = runtime.present_batch(&plan, 1000);
+        assert_eq!(presented.len(), 1);
+        assert!(presented[0].text.starts_with("[diff vs earlier read of src/lib.rs"));
+        assert!(presented[0].text.contains("-line number 041 with stable content"));
+        assert!(presented[0].text.contains("+line number 041 with UPDATED content"));
+        assert!(presented[0].text.len() < new_text.len() / 2);
+
+        // `raw: true` forces full text.
+        let raw_calls = vec![ProviderToolCall {
+            id: "c3".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"src/lib.rs","raw":true}"#.into(),
+        }];
+        let raw_batch = PresentationBatch {
+            id: "b2",
+            calls: &raw_calls,
+            results: &results,
+        };
+        let raw_plan = runtime.presentation_plan(&raw_batch, &base, &config, Path::new("."));
+        let raw_presented = runtime.present_batch(&raw_plan, 1000);
+        assert_eq!(raw_presented[0].text, new_text);
+    }
+
+    #[test]
+    fn shell_fold_compresses_verbose_cargo_output_in_presentation() {
+        let mut raw = String::from("exit_code=0\nstdout:\n");
+        for i in 0..40 {
+            raw.push_str(&format!("   Compiling dep-{i} v0.1.0\n"));
+        }
+        for i in 0..30 {
+            raw.push_str(&format!("test t_{i} ... ok\n"));
+        }
+        raw.push_str("test result: ok. 30 passed; 0 failed\n");
+
+        let runtime = Runtime::new();
+        let calls = vec![ProviderToolCall {
+            id: "s1".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":"cargo test -p slim-core"}"#.into(),
+        }];
+        let results = vec![ToolResult::ok("shell", raw.clone())];
+        let batch = PresentationBatch {
+            id: "b1",
+            calls: &calls,
+            results: &results,
+        };
+        let config = AgentLoopConfig::default();
+        let plan = runtime.presentation_plan(&batch, &[], &config, Path::new("."));
+        let presented = runtime.present_batch(&plan, 1000);
+        assert!(presented[0].text.starts_with("exit_code=0\n[cargo summary:"));
+        assert!(presented[0].text.len() < raw.len() / 2);
+    }
+
+    #[test]
+    fn effective_presentation_caps_adapts_to_small_tight_and_large_windows() {
+        let mut cfg = AgentLoopConfig {
+            context_window_tokens: 16_000,
+            max_result_bytes: 16 * 1024,
+            ..AgentLoopConfig::default()
+        };
+        let (read_small, res_small, batch_small) =
+            effective_presentation_caps(&cfg, 64 * 1024, &[]);
+        assert!(read_small < 64 * 1024);
+        assert!(batch_small <= 16_000);
+        assert!(res_small >= 4 * 1024);
+
+        cfg.context_window_tokens = 200_000;
+        let (read_large, _, batch_large) = effective_presentation_caps(&cfg, 64 * 1024, &[]);
+        assert!(read_large >= 96 * 1024);
+        assert!(batch_large >= 128 * 1024);
+    }
+
+    #[test]
+    fn codemode_output_is_distilled_and_oversized_preserves_console_tail() {
+        let rows: Vec<Value> = (0..30)
+            .map(|i| serde_json::json!({ "id": i, "path": format!("src/file_{i}.rs"), "line": i + 1 }))
+            .collect();
+        let json_out = format!("{}\nconsole:\nkept tail line", Value::Array(rows));
+        let runtime = Runtime::new();
+        let calls = vec![ProviderToolCall {
+            id: "cm1".into(),
+            name: "codemode".into(),
+            arguments: r#"{"code":"return [];"}"#.into(),
+        }];
+        let results = vec![ToolResult::ok("codemode", json_out.clone())];
+        let batch = PresentationBatch {
+            id: "b1",
+            calls: &calls,
+            results: &results,
+        };
+        let config = AgentLoopConfig::default();
+        let plan = runtime.presentation_plan(&batch, &[], &config, Path::new("."));
+        let presented = runtime.present_batch(&plan, 1000);
+        assert!(presented[0].text.len() < json_out.len());
+        assert!(presented[0].text.contains("console:\nkept tail line"));
+
+        let oversized = format!(
+            "{}\nconsole:\nIMPORTANT_CONSOLE_MARKER",
+            "x".repeat(20_000)
+        );
+        let cut = crate::tools::present_unstructured(
+            "codemode",
+            &oversized,
+            PresentationBudget { max_bytes: 1024 },
+        );
+        assert!(!cut.complete);
+        assert!(cut.text.contains("IMPORTANT_CONSOLE_MARKER"));
+    }
 }

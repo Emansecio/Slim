@@ -139,45 +139,62 @@ pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) ->
 
 /// [`elide_superseded_tool_outputs`] for a history the provider already caches.
 /// Rewriting a message changes the request from there on, so the rewrite is
-/// made only when the bytes it saves are at least those of the messages after
-/// the first one it rewrites (what the cache would have to take in again).
-/// Otherwise nothing changes now: a later pass that pays, or the compaction
-/// that rewrites the history anyway, elides it.
+/// made only when the bytes it saves outweigh the invalidated tail multiplied
+/// by `write_penalty` (1 for uncached adapters; higher when cache writes cost
+/// multiples of cache reads).
+#[cfg(test)]
 pub(super) fn elide_superseded_tool_outputs_if_it_pays(
     messages: &mut [ProviderMessage],
 ) -> ElisionStats {
+    elide_superseded_tool_outputs_with_penalty(messages, 1)
+}
+
+pub(super) fn elide_superseded_tool_outputs_with_penalty(
+    messages: &mut [ProviderMessage],
+    write_penalty: usize,
+) -> ElisionStats {
     let plan = plan_elisions(messages);
-    let Some(first) = plan.first().map(|planned| planned.index) else {
+    if plan.is_empty() {
         return ElisionStats::default();
-    };
-    let saved: usize = plan
+    }
+    debug_assert!(plan.windows(2).all(|w| w[0].index < w[1].index));
+    // Precompute wire bytes from the tail so every suffix `plan[k..]` can be
+    // evaluated in O(1), eliding the largest profitable suffix without
+    // invalidating a huge cached tail because of one older entry.
+    let mut suffix_wire_bytes = vec![0_usize; messages.len() + 1];
+    for index in (0..messages.len()).rev() {
+        let message = &messages[index];
+        let msg_bytes = message.content.len()
+            + message
+                .content_blocks
+                .iter()
+                .map(content_block_bytes)
+                .sum::<usize>()
+            + message
+                .tool_calls
+                .iter()
+                .map(|call| super::mode::wire_argument_bytes(messages, index, call))
+                .sum::<usize>();
+        suffix_wire_bytes[index] = suffix_wire_bytes[index + 1].saturating_add(msg_bytes);
+    }
+    let mut remaining_saved: usize = plan
         .iter()
         .map(|planned| messages[planned.index].content.len() - planned.pointer.len())
         .sum();
-    // What is sent after that message, as the provider view sends it: a
-    // completed large `write` goes out as a short receipt, not its content.
-    let invalidated: usize = messages
-        .iter()
-        .enumerate()
-        .skip(first + 1)
-        .map(|(index, message)| {
-            message.content.len()
-                + message
-                    .content_blocks
-                    .iter()
-                    .map(content_block_bytes)
-                    .sum::<usize>()
-                + message
-                    .tool_calls
-                    .iter()
-                    .map(|call| super::mode::wire_argument_bytes(messages, index, call))
-                    .sum::<usize>()
-        })
-        .sum();
-    if saved < invalidated {
+    let penalty = write_penalty.max(1);
+    let chosen_start = plan.iter().enumerate().find_map(|(k, planned)| {
+        let invalidated = suffix_wire_bytes[planned.index + 1];
+        if remaining_saved >= invalidated.saturating_mul(penalty) {
+            Some(k)
+        } else {
+            remaining_saved -= messages[planned.index].content.len() - planned.pointer.len();
+            None
+        }
+    });
+    let Some(start) = chosen_start else {
         return ElisionStats::default();
-    }
-    apply_elisions(messages, plan)
+    };
+    apply_elisions(messages, plan.into_iter().skip(start).collect())
 }
 
 fn content_block_bytes(block: &crate::provider::ProviderContentBlock) -> usize {
@@ -197,16 +214,43 @@ struct PlannedElision {
     pointer: String,
 }
 
+/// Whether an output looks like a failure/recovery notice rather than fresh
+/// superseding evidence.
+fn is_error_like_tool_output(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    let Some(first_line) = trimmed.lines().next() else {
+        return true;
+    };
+    let lower = first_line.to_ascii_lowercase();
+    lower.starts_with("error:")
+        || lower.starts_with("failed")
+        || lower.starts_with("invalid ")
+        || lower.starts_with("[no output]")
+        || lower.contains("does not exist")
+        || lower.contains("is a directory")
+        || lower.contains("not allowed")
+        || lower.contains("timed out")
+        || lower.contains("cancelled")
+        || lower.contains("not available")
+        || lower.contains("permission denied")
+}
+
+fn is_exact_superseding_tool(name: &str) -> bool {
+    matches!(name, "read" | "list" | "search" | "code_intel")
+}
+
 /// The rewrites [`elide_superseded_tool_outputs`] makes, in history order.
 fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
     // Call ids are only unique within one assistant turn (providers recycle
     // short ids), so a tool message resolves against the assistant before it.
     let mut call_paths = vec![None::<(String, String)>; messages.len()];
+    let mut exact_calls = vec![None::<(&str, &str)>; messages.len()];
     // Per id, the calls of the turn in order: a provider that repeats an id
     // inside one turn answers them in the same order.
+    type TurnCallEntry<'a> = (Option<(String, String)>, Option<(&'a str, &'a str)>);
     let mut turn_calls = std::collections::HashMap::<
         &str,
-        std::collections::VecDeque<Option<(String, String)>>,
+        std::collections::VecDeque<TurnCallEntry<'_>>,
     >::new();
     for (index, message) in messages.iter().enumerate() {
         match message.role.as_str() {
@@ -220,24 +264,30 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
                     } else {
                         tool_call_path(&call.arguments)
                     };
+                    let exact = is_exact_superseding_tool(&call.name)
+                        .then_some((call.name.as_str(), call.arguments.as_str()));
                     turn_calls
                         .entry(call.id.as_str())
                         .or_default()
-                        .push_back(key);
+                        .push_back((key, exact));
                 }
             }
             "tool" => {
-                call_paths[index] = message
+                if let Some((path_key, exact_key)) = message
                     .tool_call_id
                     .as_deref()
                     .and_then(|call_id| turn_calls.get_mut(call_id))
                     .and_then(|calls| {
                         if calls.len() > 1 {
-                            calls.pop_front().flatten()
+                            calls.pop_front()
                         } else {
-                            calls.front().cloned().flatten()
+                            calls.front().cloned()
                         }
-                    });
+                    })
+                {
+                    call_paths[index] = path_key;
+                    exact_calls[index] = exact_key;
+                }
             }
             _ => {}
         }
@@ -247,9 +297,27 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
     let mut latest_shell = std::collections::HashMap::<String, usize>::new();
     // The latest result of a command that is a pointer to an earlier run.
     let mut shell_pointer = std::collections::HashMap::<String, usize>::new();
+    let mut latest_list = std::collections::HashMap::<String, usize>::new();
+    let mut list_pointer = std::collections::HashMap::<String, usize>::new();
+    let mut latest_exact = std::collections::HashMap::<(&str, &str), usize>::new();
+    let mut exact_pointer = std::collections::HashMap::<(&str, &str), usize>::new();
     for (index, message) in messages.iter().enumerate() {
         if message.role != "tool" || !message.content_blocks.is_empty() {
             continue;
+        }
+        if let Some((name, args)) = exact_calls[index] {
+            if message.name.as_deref() == Some(name) {
+                if message.content.starts_with(DUPLICATE_POINTER_PREFIX) {
+                    exact_pointer.insert((name, args), index);
+                } else if !message.content.is_empty()
+                    && !message.content.starts_with(SUPERSEDED_OUTPUT_PREFIX)
+                    && !message.content.starts_with(PRUNED_OLD_OUTPUT_PREFIX)
+                    && !write_output_is_recovery(&message.content)
+                    && !is_error_like_tool_output(&message.content)
+                {
+                    latest_exact.insert((name, args), index);
+                }
+            }
         }
         let Some((key, _)) = &call_paths[index] else {
             continue;
@@ -262,6 +330,17 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
             Some("patch") if message.content.starts_with("patched ") => {
                 latest_mutation.insert(key.clone(), index);
             }
+            Some("list") => {
+                if message.content.starts_with(DUPLICATE_POINTER_PREFIX) {
+                    list_pointer.insert(key.clone(), index);
+                } else if !message.content.is_empty()
+                    && !message.content.starts_with(SUPERSEDED_OUTPUT_PREFIX)
+                    && !message.content.starts_with(PRUNED_OLD_OUTPUT_PREFIX)
+                    && !is_error_like_tool_output(&message.content)
+                {
+                    latest_list.insert(key.clone(), index);
+                }
+            }
             // A duplicate pointer stands for one of the earlier runs: they stay.
             Some("shell") if message.content.starts_with(DUPLICATE_POINTER_PREFIX) => {
                 shell_pointer.insert(key.clone(), index);
@@ -273,24 +352,45 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
             _ => {}
         }
     }
-    if latest_write.is_empty() && latest_mutation.is_empty() && latest_shell.is_empty() {
+    if latest_write.is_empty()
+        && latest_mutation.is_empty()
+        && latest_shell.is_empty()
+        && latest_list.is_empty()
+        && latest_exact.is_empty()
+    {
         return Vec::new();
     }
     let mut plan = Vec::new();
     for (index, message) in messages.iter().enumerate() {
-        if message.role != "tool" || !message.content_blocks.is_empty() {
+        if message.role != "tool"
+            || !message.content_blocks.is_empty()
+            || message.content.starts_with(DUPLICATE_POINTER_PREFIX)
+            || message.content.starts_with(SUPERSEDED_OUTPUT_PREFIX)
+            || message.content.starts_with(PRUNED_OLD_OUTPUT_PREFIX)
+        {
             continue;
         }
-        let Some((key, raw)) = &call_paths[index] else {
-            continue;
-        };
         let name = message.name.as_deref().unwrap_or("");
-        let pointer = match name {
-            "read" if latest_write.get(key).is_some_and(|&later| later > index) => format!(
-                "[superseded read output elided; {raw} was overwritten by a later write]",
-                raw = raw.as_str()
-            ),
-            "write" | "patch"
+        let pointer = match (name, &call_paths[index]) {
+            ("read", Some((key, raw)))
+                if latest_write.get(key).is_some_and(|&later| later > index) =>
+            {
+                format!(
+                    "[superseded read output elided; {raw} was overwritten by a later write]",
+                    raw = raw.as_str()
+                )
+            }
+            ("patch", Some((key, raw)))
+                if message.content.starts_with("patched ")
+                    && message.content.len() > 256
+                    && latest_write.get(key).is_some_and(|&later| later > index) =>
+            {
+                format!(
+                    "[superseded patch output elided; {raw} was overwritten by a later write]",
+                    raw = raw.as_str()
+                )
+            }
+            ("write" | "patch", Some((key, raw)))
                 if write_output_is_recovery(&message.content)
                     && latest_mutation.get(key).is_some_and(|&later| later > index) =>
             {
@@ -299,10 +399,19 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
                     raw = raw.as_str()
                 )
             }
+            ("list", Some((key, raw)))
+                if latest_list.get(key).is_some_and(|&later| later > index)
+                    && !list_pointer.get(key).is_some_and(|&later| later > index) =>
+            {
+                format!(
+                    "[superseded list output elided; {raw} was listed again later]",
+                    raw = raw.as_str()
+                )
+            }
             // The same command ran again later: only the latest run describes
             // the workspace. The status stays in the pointer as a record of the
             // attempt, behind the prefix every consumer of pointers knows.
-            "shell"
+            ("shell", Some((key, _)))
                 if latest_shell.get(key).is_some_and(|&later| later > index)
                     && !shell_pointer.get(key).is_some_and(|&later| later > index) =>
             {
@@ -313,7 +422,20 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
                     None => continue,
                 }
             }
-            _ => continue,
+            _ => match exact_calls[index] {
+                Some((exact_name, exact_args))
+                    if exact_name == name
+                        && latest_exact
+                            .get(&(exact_name, exact_args))
+                            .is_some_and(|&later| later > index)
+                        && !exact_pointer
+                            .get(&(exact_name, exact_args))
+                            .is_some_and(|&later| later > index) =>
+                {
+                    format!("[superseded {name} output elided; the same call ran again later]")
+                }
+                _ => continue,
+            },
         };
         if pointer.len() < message.content.len() {
             plan.push(PlannedElision { index, pointer });
@@ -404,7 +526,7 @@ pub(super) fn shrink_history_to_fit(
     None
 }
 
-fn drop_earlier_reasoning(messages: &mut [ProviderMessage]) -> ElisionStats {
+pub(super) fn drop_earlier_reasoning(messages: &mut [ProviderMessage]) -> ElisionStats {
     let last_assistant = messages
         .iter()
         .rposition(|message| message.role == "assistant");
@@ -443,7 +565,26 @@ fn cap_tool_results(messages: &mut [ProviderMessage], max_bytes: usize) -> Elisi
         .iter_mut()
         .filter(|message| message.role == "tool" && message.content.len() > max_bytes)
     {
-        let cut = truncate_result(&message.content, max_bytes);
+        // Preserve the receipt line of a successful `write` (`written ...;
+        // bytes=...; sha256=...; exists=true;`) so `mode::project_call` never
+        // re-expands a >4 KiB `write` argument on the wire during overflow.
+        let cut = if message.name.as_deref() == Some("write")
+            && message.content.starts_with("written ")
+        {
+            let first_line = message.content.lines().next().unwrap_or("");
+            if first_line.contains("; sha256=") && first_line.contains("; exists=true;") {
+                let kept_line = first_line.to_owned();
+                if kept_line.len() < message.content.len() {
+                    kept_line
+                } else {
+                    continue;
+                }
+            } else {
+                truncate_result(&message.content, max_bytes)
+            }
+        } else {
+            truncate_result(&message.content, max_bytes)
+        };
         stats.elided += 1;
         stats.original_bytes += message.content.len() as u64;
         stats.emitted_bytes += cut.len() as u64;
@@ -462,6 +603,135 @@ pub(super) fn write_output_is_recovery(output: &str) -> bool {
         || output.contains("Closest text is at line")
         || output.contains("Nearest text is around line")
         || output.contains("Example context only for the first match at line ")
+}
+
+const MICRO_PRUNE_MIN_BYTES: usize = 4_096;
+const MICRO_PRUNE_COMPACT_MIN_BYTES: usize = 2_048;
+const PRUNED_OLD_OUTPUT_PREFIX: &str = "[pruned old ";
+const SUPERSEDED_OUTPUT_PREFIX: &str = "[superseded ";
+
+fn is_micro_prunable_read_tool(message: &ProviderMessage) -> bool {
+    if message.role != "tool"
+        || message.content.starts_with(DUPLICATE_POINTER_PREFIX)
+        || message.content.starts_with(SUPERSEDED_OUTPUT_PREFIX)
+        || message.content.starts_with(PRUNED_OLD_OUTPUT_PREFIX)
+    {
+        return false;
+    }
+    let name = message.name.as_deref();
+    if matches!(name, Some("search" | "list" | "ls" | "subagent")) {
+        return message.content.len() > MICRO_PRUNE_COMPACT_MIN_BYTES;
+    }
+    message.content.len() > MICRO_PRUNE_MIN_BYTES
+        && (matches!(
+            name,
+            Some("read" | "grep" | "glob" | "find" | "code_intel" | "artifact_read" | "codemode" | "batch_code")
+        ) || (name == Some("shell") && shell_completed_status(&message.content).is_some()))
+}
+
+fn pruned_old_output_note(tool_name: &str, content: &str) -> String {
+    let original_bytes = content.len();
+    if tool_name == "shell" {
+        if let Some(status) = shell_completed_status(content) {
+            return format!(
+                "{PRUNED_OLD_OUTPUT_PREFIX}shell output ({original_bytes} bytes; {status}); call history_recall if needed]"
+            );
+        }
+    }
+    if tool_name == "subagent" {
+        return format!(
+            "{PRUNED_OLD_OUTPUT_PREFIX}subagent output ({original_bytes} bytes; synthesized in assistant response); call history_recall if needed]"
+        );
+    }
+    format!(
+        "{PRUNED_OLD_OUTPUT_PREFIX}{tool_name} output ({original_bytes} bytes); call history_recall or re-read if needed]"
+    )
+}
+
+fn message_reasoning_bytes(message: &ProviderMessage) -> usize {
+    message
+        .responses_reasoning
+        .iter()
+        .map(|reasoning| reasoning.item.to_string().len())
+        .sum::<usize>()
+        + message.chat_reasoning.as_ref().map_or(0, |reasoning| {
+            reasoning.content.len()
+                + reasoning
+                    .details
+                    .iter()
+                    .map(|detail| detail.to_string().len())
+                    .sum::<usize>()
+        })
+}
+
+/// Estimates how many characters of old read/search/shell tool results and
+/// earlier assistant reasoning strictly before `cut_index` can be deterministically
+/// collapsed before running an LLM compaction.
+pub(super) fn estimate_micro_prune_savings_chars(
+    messages: &[ProviderMessage],
+    cut_index: usize,
+) -> u64 {
+    let limit = cut_index.min(messages.len());
+    let last_assistant = messages.iter().rposition(|message| message.role == "assistant");
+    let tool_savings: u64 = messages
+        .iter()
+        .take(limit)
+        .filter(|message| is_micro_prunable_read_tool(message))
+        .map(|message| {
+            let name = message.name.as_deref().unwrap_or("tool");
+            let note_len = pruned_old_output_note(name, &message.content).len();
+            message.content.len().saturating_sub(note_len) as u64
+        })
+        .sum();
+    let reasoning_savings: u64 = messages
+        .iter()
+        .enumerate()
+        .take(limit)
+        .filter(|(idx, msg)| msg.role == "assistant" && Some(*idx) != last_assistant)
+        .map(|(_, msg)| message_reasoning_bytes(msg) as u64)
+        .sum();
+    tool_savings.saturating_add(reasoning_savings)
+}
+
+/// Deterministically collapses large (>4 KiB) read/search/completed-shell tool
+/// outputs and stale earlier assistant reasoning strictly before `cut_index`
+/// while preserving `recorded_content` so the durable journal fingerprint stays valid.
+pub(super) fn micro_prune_before_cut(
+    messages: &mut [ProviderMessage],
+    cut_index: usize,
+) -> ElisionStats {
+    let mut stats = ElisionStats::default();
+    let limit = cut_index.min(messages.len());
+    let last_assistant = messages.iter().rposition(|message| message.role == "assistant");
+    for (idx, message) in messages.iter_mut().take(limit).enumerate() {
+        if message.role == "assistant" && Some(idx) != last_assistant {
+            let bytes = message_reasoning_bytes(message);
+            if bytes > 0 {
+                message.responses_reasoning.clear();
+                message.chat_reasoning = None;
+                stats.elided += 1;
+                stats.original_bytes += bytes as u64;
+            }
+            continue;
+        }
+        if !is_micro_prunable_read_tool(message) {
+            continue;
+        }
+        let name = message.name.as_deref().unwrap_or("tool").to_owned();
+        let original_len = message.content.len();
+        let note = pruned_old_output_note(&name, &message.content);
+        if note.len() >= original_len {
+            continue;
+        }
+        stats.elided += 1;
+        stats.original_bytes += original_len as u64;
+        stats.emitted_bytes += note.len() as u64;
+        message
+            .recorded_content
+            .get_or_insert_with(|| std::sync::Arc::from(message.content.as_str()));
+        message.content = note;
+    }
+    stats
 }
 
 #[cfg(test)]
@@ -574,6 +844,7 @@ mod tests {
             Some(crate::provider::ChatReasoning {
                 scope_id: 1,
                 model: "m".into(),
+                provenance: 0,
                 content: "thinking".into(),
                 details: Vec::new(),
             })
@@ -606,5 +877,198 @@ mod tests {
         assert_eq!(messages[2].content.len(), 256);
         assert_eq!(messages[2].recorded_content.as_deref(), Some(big.as_str()));
         assert!(shrink_history_to_fit(&mut messages, &mut step).is_none());
+    }
+
+    #[test]
+    fn micro_prune_before_cut_collapses_old_large_reads_and_keeps_recorded_content() {
+        let large_read = "R".repeat(16 * 1024);
+        let large_bash = "B".repeat(16 * 1024);
+        let mut messages = vec![
+            ProviderMessage::user("start"),
+            ProviderMessage::tool("read", "t1", large_read.clone()),
+            ProviderMessage::tool("shell", "t2", large_bash.clone()),
+            ProviderMessage::user("kept turn"),
+            ProviderMessage::tool("read", "t3", large_read.clone()),
+        ];
+
+        let estimated = estimate_micro_prune_savings_chars(&messages, 3);
+        assert!(estimated > 15_000, "old large read must register substantial savings: {estimated}");
+
+        let stats = micro_prune_before_cut(&mut messages, 3);
+        assert_eq!(stats.elided, 1);
+        assert!(messages[1].content.starts_with(PRUNED_OLD_OUTPUT_PREFIX));
+        assert_eq!(messages[1].recorded_content.as_deref(), Some(large_read.as_str()));
+        // Non-read tool before cut and read tool at/after cut are untouched.
+        assert_eq!(messages[2].content, large_bash);
+        assert_eq!(messages[4].content, large_read);
+        // Second call is idempotent on already-pruned entries.
+        assert_eq!(micro_prune_before_cut(&mut messages, 3).elided, 0);
+    }
+
+    #[test]
+    fn suffix_optimal_elision_keeps_later_savings_when_early_tail_is_too_large() {
+        let mut messages = vec![ProviderMessage::user("fix both")];
+        // Early small superseded read followed by a huge live tail.
+        messages.extend(exchange("r1", "read", "a.txt", "a".repeat(2_000)));
+        messages.extend(exchange(
+            "w1",
+            "write",
+            "a.txt",
+            "written a.txt; bytes=1; sha256=abc; exists=true;".into(),
+        ));
+        messages.extend(exchange("r2", "read", "huge.txt", "h".repeat(30_000)));
+        // Later large superseded read near the end (tiny tail after it).
+        messages.extend(exchange("r3", "read", "b.txt", "b".repeat(12_000)));
+        messages.extend(exchange(
+            "w2",
+            "write",
+            "b.txt",
+            "written b.txt; bytes=1; sha256=def; exists=true;".into(),
+        ));
+
+        let stats = elide_superseded_tool_outputs_with_penalty(&mut messages, 4);
+        assert_eq!(stats.elided, 1);
+        assert!(messages[2].content.starts_with("aaaa"));
+        assert!(messages[8].content.starts_with("[superseded read output"));
+    }
+
+    #[test]
+    fn repeated_exact_read_and_completed_shell_micro_prune_behave_cleanly() {
+        let mut messages = vec![
+            ProviderMessage::user("check"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "s1".into(),
+                    name: "search".into(),
+                    arguments: r#"{"query":"needle"}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("search", "s1", "old match\n".repeat(40)),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "s2".into(),
+                    name: "search".into(),
+                    arguments: r#"{"query":"needle"}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("search", "s2", "new match\n".repeat(40)),
+        ];
+        let stats = elide_superseded_tool_outputs(&mut messages);
+        assert_eq!(stats.elided, 1);
+        assert!(messages[2]
+            .content
+            .starts_with("[superseded search output elided;"));
+
+        let large_shell = format!("exit 0\n{}", "ok\n".repeat(3_000));
+        let mut prune_msgs = vec![
+            ProviderMessage::user("run"),
+            ProviderMessage::tool("shell", "sh1", large_shell.clone()),
+            ProviderMessage::user("recent"),
+        ];
+        let pruned = micro_prune_before_cut(&mut prune_msgs, 2);
+        assert_eq!(pruned.elided, 1);
+        assert!(prune_msgs[1].content.contains("exit 0"));
+        assert_eq!(
+            prune_msgs[1].recorded_content.as_deref(),
+            Some(large_shell.as_str())
+        );
+
+        let mut reasoning_msgs = vec![
+            ProviderMessage::user("first"),
+            {
+                let mut m = ProviderMessage::assistant("step 1", Vec::new());
+                m.chat_reasoning = Some(crate::provider::ChatReasoning {
+                    scope_id: 1,
+                    model: "m".into(),
+                    provenance: 0,
+                    content: "old chain of thought".repeat(100),
+                    details: Vec::new(),
+                });
+                m
+            },
+            ProviderMessage::user("second"),
+            {
+                let mut m = ProviderMessage::assistant("step 2", Vec::new());
+                m.chat_reasoning = Some(crate::provider::ChatReasoning {
+                    scope_id: 1,
+                    model: "m".into(),
+                    provenance: 0,
+                    content: "latest reasoning".into(),
+                    details: Vec::new(),
+                });
+                m
+            },
+        ];
+        assert!(estimate_micro_prune_savings_chars(&reasoning_msgs, 4) > 0);
+        let r_stats = micro_prune_before_cut(&mut reasoning_msgs, 4);
+        assert_eq!(r_stats.elided, 1);
+        assert!(reasoning_msgs[1].chat_reasoning.is_none());
+        assert!(reasoning_msgs[3].chat_reasoning.is_some());
+    }
+
+    #[test]
+    fn expanded_micro_prune_handles_patch_before_write_list_and_subagent() {
+        let mut msgs = vec![
+            ProviderMessage::user("start"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "p1".into(),
+                    name: "patch".into(),
+                    arguments: r#"{"path":"a.rs","edits":[]}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool(
+                "patch",
+                "p1",
+                format!("patched a.rs:1; {}", "detail ".repeat(60)),
+            ),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "l1".into(),
+                    name: "list".into(),
+                    arguments: r#"{"path":"src","max_entries":50}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("list", "l1", "old.rs\n".repeat(40)),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "w1".into(),
+                    name: "write".into(),
+                    arguments: r#"{"path":"a.rs","content":"new"}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("write", "w1", "written a.rs; bytes=3; sha256=abc; exists=true;"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "l2".into(),
+                    name: "list".into(),
+                    arguments: r#"{"path":"src","max_entries":100}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("list", "l2", "new.rs\n".repeat(20)),
+        ];
+        let stats = elide_superseded_tool_outputs(&mut msgs);
+        assert_eq!(stats.elided, 2);
+        assert!(msgs[2].content.starts_with("[superseded patch output elided;"));
+        assert!(msgs[4].content.starts_with("[superseded list output elided;"));
+
+        let mut prune = vec![
+            ProviderMessage::user("ask"),
+            ProviderMessage::tool("search", "s1", "hit\n".repeat(700)),
+            ProviderMessage::tool("subagent", "sa1", "report ".repeat(400)),
+            ProviderMessage::assistant("synthesized summary", Vec::new()),
+        ];
+        let pruned = micro_prune_before_cut(&mut prune, 3);
+        assert_eq!(pruned.elided, 2);
+        assert!(prune[1].content.starts_with("[pruned old search output"));
+        assert!(prune[2]
+            .content
+            .contains("synthesized in assistant response"));
     }
 }

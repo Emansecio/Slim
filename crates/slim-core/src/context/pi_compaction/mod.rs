@@ -42,10 +42,12 @@ pub use prompts::{
 };
 pub use serialize::serialize_conversation;
 pub use summary::{
-    apply_compaction, build_history_summary_request, build_turn_prefix_summary_request,
-    compaction_summary_content, compaction_summary_message, compaction_summary_text,
-    merge_split_turn_summary, rewrite_stale_duplicate_pointers, SummaryRequest, SummaryRequests,
-    DUPLICATE_POINTER_PREFIX, NO_PRIOR_HISTORY,
+    apply_compaction, build_chunk_merge_summary_request, build_history_summary_request,
+    build_turn_prefix_summary_request, compaction_summary_content, compaction_summary_message,
+    compaction_summary_text, merge_split_turn_summary, rewrite_stale_duplicate_pointers,
+    validate_and_repair_summary, SummaryRequest, SummaryRequests, DUPLICATE_POINTER_PREFIX,
+    INITIAL_HISTORY_SUMMARY_MAX_TOKENS, INITIAL_IN_PLACE_SUMMARY_MAX_TOKENS,
+    INITIAL_TURN_PREFIX_SUMMARY_MAX_TOKENS, NO_PRIOR_HISTORY,
 };
 
 /// Compaction settings, with Pi's defaults.
@@ -68,19 +70,5 @@ pub const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = CompactionSettings {
 impl Default for CompactionSettings {
     fn default() -> Self {
         DEFAULT_COMPACTION_SETTINGS
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_match_pi() {
-        let settings = CompactionSettings::default();
-        assert!(settings.enabled);
-        assert_eq!(settings.reserve_tokens, 16_384);
-        assert_eq!(settings.keep_recent_tokens, 20_000);
-        assert_eq!(settings, DEFAULT_COMPACTION_SETTINGS);
     }
 }

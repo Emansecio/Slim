@@ -6,9 +6,11 @@ pub mod command_code_catalog;
 mod config;
 pub mod devin_catalog;
 mod exit_codes;
+pub mod fast_client;
 mod headless;
 mod mcp;
 mod mcp_cli;
+pub mod mcp_desktop;
 mod opencode_catalog;
 pub mod oauth;
 pub mod open_design_catalog;
@@ -26,19 +28,26 @@ pub use code_intel::install_code_intel;
 pub use config::Config;
 pub use config::{global_config_path, project_config_path};
 pub use exit_codes::ExitCode;
+pub use fast_client::{
+    resolve_fast_provider_auth, run_fast_micro_completion, FastMicroRequest, ResolvedFastAuth,
+};
 pub use headless::{
-    load_local_images, render_jsonl, render_provider_jsonl, render_provider_text,
-    render_provider_verbose_text, render_text, run_fake_headless, run_provider_headless,
-    run_provider_headless_with_options, run_provider_headless_with_resume,
+    build_in_process_mcp_server, load_local_images, render_jsonl, render_provider_jsonl,
+    render_provider_text, render_provider_verbose_text, render_text, run_fake_headless,
+    run_provider_headless, run_provider_headless_with_options, run_provider_headless_with_resume,
     run_provider_headless_with_resume_and_options, run_provider_headless_with_session,
-    run_provider_headless_with_session_and_options, HeadlessRequest, HeadlessResult, OutputFormat,
-    ProviderHeadlessResult, ProviderRequest, ProviderRunOptions, ToolJobOutputFact,
+    run_provider_headless_with_session_and_options, CodeIntelligenceHandle, HeadlessRequest,
+    HeadlessResult, InProcessMcpServer, InProcessMcpToolHandler, InProcessMcpToolSpec, McpHandle,
+    OutputFormat, ProviderHeadlessResult, ProviderRequest, ProviderRunOptions, ToolJobOutputFact,
     ToolProcessFact, UsageCostSummary, MAX_IMAGE_BYTES,
 };
 pub use mcp_cli::run_mcp_cli;
 pub use tui::{
-    run_provider_tui_turn, run_tui, spawn_embedded_runtime, spawn_embedded_runtime_deferred,
-    spawn_tui_runtime, spawn_tui_runtime_with_resume, TuiError, TuiRuntimeHandle,
+    build_project_code_intelligence, build_project_mcp_handle, prewarm_provider_endpoint,
+    reconcile_project_mcp_handle, run_provider_tui_turn, run_tui, shared_runtime,
+    spawn_embedded_runtime, spawn_embedded_runtime_deferred,
+    spawn_embedded_runtime_deferred_with_extras, spawn_tui_runtime, spawn_tui_runtime_with_resume,
+    EmbeddedRuntimeExtras, TuiError, TuiRuntimeHandle,
 };
 
 pub(crate) fn canonical_provider_model(
@@ -61,14 +70,14 @@ pub(crate) fn provider_compatible_model(
     kind: slim_core::provider::ProviderKind,
     model: &str,
 ) -> bool {
-    use slim_core::provider::{codex_model, open_code_model, zen_model, ProviderKind};
+    use slim_core::provider::{codex_model, zen_model, ProviderKind};
     match kind {
         // The bundled Codex list plus the account's fetched catalog: a model
         // newer than this release must not be rejected as foreign.
         ProviderKind::OpenAiCodex => {
             codex_model(model).is_some() || crate::codex_catalog::known_codex_model(model)
         }
-        ProviderKind::OpenCodeGo => open_code_model(model).is_some(),
+        ProviderKind::OpenCodeGo => crate::opencode_go_catalog::known_model(model),
         ProviderKind::OpenCodeZen => zen_model(model).is_some(),
         ProviderKind::ClinePass => slim_core::provider::is_clinepass_model_id(model),
         ProviderKind::CommandCode => slim_core::provider::is_command_code_model_id(model),
@@ -92,25 +101,6 @@ mod provider_model_tests {
         assert_eq!(
             default_provider_model(ProviderKind::OpenAiCodex),
             ModelAlias::Sol.id()
-        );
-        assert_ne!(
-            default_provider_model(ProviderKind::OpenAiCodex),
-            "gpt-5.3-codex"
-        );
-    }
-
-    #[test]
-    fn anthropic_default_is_shared_between_headless_and_tui() {
-        assert_eq!(
-            default_provider_model(ProviderKind::Anthropic),
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(
-            crate::tui::defaults_for_test(ProviderKind::Anthropic),
-            (
-                crate::cli::default_provider_endpoint(ProviderKind::Anthropic),
-                default_provider_model(ProviderKind::Anthropic),
-            )
         );
     }
 

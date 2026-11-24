@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 
@@ -280,6 +281,7 @@ struct SearchSnapshotCache {
 #[derive(Clone, Debug)]
 struct SearchSnapshot {
     context_lines: usize,
+    glob: Option<String>,
     root: PathBuf,
     patterns: Arc<Vec<String>>,
     hits: Arc<Vec<MatchedSearchHit>>,
@@ -322,6 +324,16 @@ impl SearchEvidence {
         self.record_field(path.to_string_lossy().as_bytes());
         let stamp = FastStamp::from_file(DependencyKind::File, file, metadata, None);
         self.record_field(stamp.digest().as_bytes());
+    }
+
+    pub(crate) fn record_file_metadata(&mut self, path: &Path, metadata: &Metadata) -> bool {
+        let Some(stamp) = FastStamp::from_metadata(DependencyKind::File, metadata, None) else {
+            return false;
+        };
+        self.observed_files = self.observed_files.saturating_add(1);
+        self.record_field(path.to_string_lossy().as_bytes());
+        self.record_field(stamp.digest().as_bytes());
+        true
     }
 
     pub(crate) fn record_bytes(&mut self, bytes: &[u8]) {
@@ -372,6 +384,19 @@ impl SearchService {
         cursor: Option<&str>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<SearchBatchPage, ToolExecutionError> {
+        self.page_in(root, patterns, options, cursor, cancellation, None)
+    }
+
+    /// [`Self::page`] over the files `glob` keeps.
+    pub(crate) fn page_in(
+        &self,
+        root: &Path,
+        patterns: Vec<String>,
+        options: SearchPageOptions,
+        cursor: Option<&str>,
+        cancellation: Option<&CancellationToken>,
+        glob: Option<&str>,
+    ) -> Result<SearchBatchPage, ToolExecutionError> {
         let SearchPageOptions {
             offset,
             max_hits,
@@ -404,6 +429,7 @@ impl SearchService {
                 context_lines,
                 cursor,
                 cancellation,
+                glob,
             );
         }
         check_cancellation(cancellation)?;
@@ -413,21 +439,40 @@ impl SearchService {
         // external workspace changes between turns; a revision-only guard
         // would miss edits made outside Slim.
         if offset > 1 {
-            if let Some((id, snapshot)) = self.reuse_snapshot(root, &patterns, context_lines) {
+            if let Some((id, snapshot)) = self.reuse_snapshot(root, &patterns, context_lines, glob)
+            {
                 return Ok(snapshot.page(&id, offset, max_hits, 0));
             }
         }
 
         let canonical = root.to_path_buf();
-        let mut scan = search_with_walker(
+        let filter = glob.map(|glob| compile_glob(&canonical, glob)).transpose()?;
+        let mut scan = search_with_index_or_walker(
             &canonical,
             &patterns,
             MAX_SEARCH_SNAPSHOT_HITS,
             context_lines,
             cancellation,
+            filter.as_ref(),
         )?;
         note_case_variants(&canonical, &patterns, &mut scan, cancellation)?;
-        Ok(self.cache_scan(canonical, patterns, options, scan))
+        // A single pattern missed only by letter case: answer with the hits of
+        // the spelling that occurs instead of asking for a second call. The
+        // snapshot stays under the pattern asked for, so its cursor still works.
+        if patterns.len() == 1 && scan.hits.is_empty() {
+            if let Some(variant) = scan.coverage[0].case_variant.clone() {
+                scan = search_with_index_or_walker(
+                    &canonical,
+                    std::slice::from_ref(&variant.spelling),
+                    MAX_SEARCH_SNAPSHOT_HITS,
+                    context_lines,
+                    cancellation,
+                    filter.as_ref(),
+                )?;
+                scan.coverage[0].case_variant = Some(variant);
+            }
+        }
+        Ok(self.cache_scan(canonical, patterns, options, scan, glob.map(str::to_owned)))
     }
 
     fn cache_scan(
@@ -436,6 +481,7 @@ impl SearchService {
         patterns: Vec<String>,
         options: SearchPageOptions,
         scan: SearchScan,
+        glob: Option<String>,
     ) -> SearchBatchPage {
         let SearchPageOptions {
             offset,
@@ -450,6 +496,7 @@ impl SearchService {
         let now = Instant::now();
         let snapshot = SearchSnapshot {
             context_lines,
+            glob,
             root,
             patterns: Arc::clone(&patterns),
             hits: Arc::clone(&hits),
@@ -480,6 +527,7 @@ impl SearchService {
         context_lines: usize,
         cursor: &str,
         cancellation: Option<&CancellationToken>,
+        glob: Option<&str>,
     ) -> Result<SearchBatchPage, ToolExecutionError> {
         check_cancellation(cancellation)?;
         let (id, offset) = parse_cursor(cursor).ok_or_else(expired_cursor_error)?;
@@ -497,9 +545,10 @@ impl SearchService {
             if snapshot.root != canonical
                 || snapshot.patterns.as_ref() != patterns
                 || snapshot.context_lines != context_lines
+                || snapshot.glob.as_deref() != glob
             {
                 return Err(ToolError::InvalidInput {
-                    message: "search cursor does not match this path/query/context_lines".into(),
+                    message: "search cursor does not match this path/query/context_lines/glob".into(),
                 }
                 .into());
             }
@@ -516,6 +565,7 @@ impl SearchService {
         root: &Path,
         patterns: &[String],
         context_lines: usize,
+        glob: Option<&str>,
     ) -> Option<(String, SearchSnapshot)> {
         let canonical = root.to_path_buf();
         let now = Instant::now();
@@ -528,6 +578,7 @@ impl SearchService {
                 snapshot.root == canonical
                     && snapshot.patterns.as_ref() == patterns
                     && snapshot.context_lines == context_lines
+                    && snapshot.glob.as_deref() == glob
             })
             .max_by_key(|(_, snapshot)| snapshot.last_used)
             .map(|(id, _)| id.clone())?;
@@ -731,6 +782,20 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
     if !legend.is_empty() {
         legend.push_str(&output);
         output = legend;
+    }
+    if let Some(variant) = page
+        .coverage
+        .first()
+        .and_then(|coverage| coverage.case_variant.as_ref())
+        .filter(|_| page.total > 0 && !multiple)
+    {
+        output.insert_str(
+            0,
+            &format!(
+                "[`{}` not found; showing `{}`, which differs only in letter case]\n",
+                page.patterns[0], variant.spelling
+            ),
+        );
     }
     // Multi-pattern absence is reported per pattern by the coverage notice;
     // incomplete scans carry their own notices below.
@@ -1106,7 +1171,22 @@ fn search_walk_error_path(error: &ignore::Error) -> Option<&Path> {
     }
 }
 
-fn walk_search_entries(root: &Path) -> impl Iterator<Item = Result<SearchWalkEntry, PathBuf>> + '_ {
+/// The `glob` of one search, relative to its root. It only narrows the walk:
+/// ignore rules and skipped directories still apply.
+pub(super) fn compile_glob(root: &Path, glob: &str) -> Result<Override, ToolError> {
+    let mut builder = OverrideBuilder::new(root);
+    builder
+        .add(glob)
+        .and_then(|builder| builder.build())
+        .map_err(|error| ToolError::InvalidInput {
+            message: format!("search glob `{glob}` is invalid: {error}"),
+        })
+}
+
+fn walk_search_entries<'a>(
+    root: &'a Path,
+    glob: Option<&'a Override>,
+) -> impl Iterator<Item = Result<SearchWalkEntry, PathBuf>> + 'a {
     let mut walker = WalkBuilder::new(root);
     walker
         .git_ignore(true)
@@ -1127,7 +1207,147 @@ fn walk_search_entries(root: &Path) -> impl Iterator<Item = Result<SearchWalkEnt
     });
     walker
         .build()
-        .map(|entry| map_search_walk_entry(entry, root))
+        .map(move |entry| map_search_walk_entry(entry, root))
+        .filter(move |entry| match (glob, entry) {
+            (Some(glob), Ok(entry)) if !entry.is_dir => {
+                !glob.matched(&entry.path, false).is_ignore()
+            }
+            _ => true,
+        })
+}
+
+/// In-memory `BufRead` over an `Arc<str>` from [`crate::project_index::ProjectIndexDaemon`]'s slab.
+struct SlabBytesReader {
+    text: Arc<str>,
+    pos: usize,
+}
+
+impl std::io::Read for SlabBytesReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rem = &self.text.as_bytes()[self.pos..];
+        let n = rem.len().min(buf.len());
+        buf[..n].copy_from_slice(&rem[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl BufRead for SlabBytesReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Ok(&self.text.as_bytes()[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.text.len());
+    }
+}
+
+enum IndexedOrFileReader {
+    Slab(SlabBytesReader),
+    File(BufReader<File>),
+}
+
+impl std::io::Read for IndexedOrFileReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Slab(r) => r.read(buf),
+            Self::File(r) => r.read(buf),
+        }
+    }
+}
+
+impl BufRead for IndexedOrFileReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        match self {
+            Self::Slab(r) => r.fill_buf(),
+            Self::File(r) => r.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self {
+            Self::Slab(r) => r.consume(amt),
+            Self::File(r) => r.consume(amt),
+        }
+    }
+}
+
+fn search_with_index_or_walker(
+    root: &Path,
+    patterns: &[String],
+    hit_limit: usize,
+    context_lines: usize,
+    cancellation: Option<&CancellationToken>,
+    glob: Option<&Override>,
+) -> Result<SearchScan, ToolExecutionError> {
+    let daemon = if root.is_dir() && !patterns.is_empty() && patterns.iter().all(|p| p.len() >= 3)
+    {
+        std::fs::canonicalize(root).ok().and_then(|canonical_root| {
+            crate::project_index::existing_for_workspace(&canonical_root)
+                .or_else(|| crate::project_index::for_workspace(&canonical_root).ok())
+        })
+    } else {
+        None
+    };
+    if let Some(daemon) = daemon {
+        let mut union_candidates: Option<std::collections::HashSet<PathBuf>> =
+            Some(std::collections::HashSet::new());
+        for pattern in patterns {
+            match daemon.search_candidates(pattern) {
+                Some(paths) => {
+                    if let Some(set) = union_candidates.as_mut() {
+                        set.extend(paths);
+                    }
+                }
+                None => {
+                    union_candidates = None;
+                    break;
+                }
+            }
+        }
+        if let Some(candidates) = union_candidates {
+            let daemon_prune = Arc::clone(&daemon);
+            let entries = walk_search_entries(root, glob).filter(move |entry| match entry {
+                Ok(entry) if !entry.is_dir => {
+                    candidates.contains(&entry.path)
+                        || !daemon_prune.trigram_tracks_clean_file(&entry.path)
+                }
+                _ => true,
+            });
+            let daemon_read = &daemon;
+            return search_with_entries(
+                root,
+                patterns,
+                hit_limit,
+                context_lines,
+                cancellation,
+                entries,
+                move |path, evidence| {
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        if let Ok(Some(cached)) = daemon_read.read_file_cached_with_meta(path, &meta)
+                        {
+                            if evidence.record_file_metadata(path, &meta) {
+                                let len = cached.text.len() as u64;
+                                return Ok(SearchOpenedFile {
+                                    reader: IndexedOrFileReader::Slab(SlabBytesReader {
+                                        text: Arc::clone(&cached.text),
+                                        pos: 0,
+                                    }),
+                                    len,
+                                });
+                            }
+                        }
+                    }
+                    let opened = open_search_file(path, evidence)?;
+                    Ok(SearchOpenedFile {
+                        reader: IndexedOrFileReader::File(opened.reader),
+                        len: opened.len,
+                    })
+                },
+            );
+        }
+    }
+    search_with_walker(root, patterns, hit_limit, context_lines, cancellation, glob)
 }
 
 fn search_with_walker(
@@ -1136,6 +1356,7 @@ fn search_with_walker(
     hit_limit: usize,
     context_lines: usize,
     cancellation: Option<&CancellationToken>,
+    glob: Option<&Override>,
 ) -> Result<SearchScan, ToolExecutionError> {
     search_with_entries(
         root,
@@ -1143,7 +1364,7 @@ fn search_with_walker(
         hit_limit,
         context_lines,
         cancellation,
-        walk_search_entries(root),
+        walk_search_entries(root, glob),
         open_search_file,
     )
 }
@@ -1525,7 +1746,7 @@ fn find_case_variants(
     let mut scanned_bytes = 0u64;
     let mut lines_until_check = 0usize;
     let mut line_bytes = Vec::new();
-    for entry in walk_search_entries(root) {
+    for entry in walk_search_entries(root, None) {
         check_cancellation(cancellation)?;
         let Ok(entry) = entry else {
             return Ok(Vec::new());
@@ -2115,10 +2336,10 @@ mod tests {
         );
         fs::write(root.join("data.txt"), &text).unwrap();
         let plain =
-            search_with_walker(&root, &["needle".into()], MAX_SEARCH_SNAPSHOT_HITS, 0, None)
+            search_with_walker(&root, &["needle".into()], MAX_SEARCH_SNAPSHOT_HITS, 0, None, None)
                 .unwrap();
         let context =
-            search_with_walker(&root, &["needle".into()], MAX_SEARCH_SNAPSHOT_HITS, 3, None)
+            search_with_walker(&root, &["needle".into()], MAX_SEARCH_SNAPSHOT_HITS, 3, None, None)
                 .unwrap();
         assert!(plain.capped && context.capped);
         assert_eq!(
@@ -2138,7 +2359,7 @@ mod tests {
             .any(|line| line.1.contains("truncated")));
         assert!(context.bytes_read >= plain.bytes_read);
         fs::write(root.join("data.txt"), b"before\xff\nneedle\nafter\n").unwrap();
-        let context = search_with_walker(&root, &["needle".into()], 500, 1, None).unwrap();
+        let context = search_with_walker(&root, &["needle".into()], 500, 1, None, None).unwrap();
         assert_eq!(context.hits.len(), 1);
         assert!(context.hits[0].context[0].1.contains("unavailable"));
         fs::remove_dir_all(root).unwrap();
@@ -2244,7 +2465,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("data.txt"), "needle\r").unwrap();
         for context in [0, 3] {
-            let scan = search_with_walker(&root, &["needle\r".into()], 500, context, None).unwrap();
+            let scan = search_with_walker(&root, &["needle\r".into()], 500, context, None, None).unwrap();
             assert_eq!(scan.hits.len(), 1);
             assert_eq!(scan.hits[0].hit.text, "needle\r");
         }
@@ -2738,6 +2959,44 @@ mod tests {
     }
 
     #[test]
+    fn glob_filters_files_without_overriding_gitignore() {
+        let root = temp_root("glob");
+        fs::create_dir_all(root.join("src/deep")).expect("src");
+        fs::write(root.join(".gitignore"), "ignored.rs\n").expect("gitignore");
+        fs::write(root.join("src/deep/a.rs"), "needle rust").expect("a");
+        fs::write(root.join("src/b.ts"), "needle ts").expect("b");
+        fs::write(root.join("ignored.rs"), "needle hidden").expect("ignored");
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init");
+        let canonical = root.canonicalize().expect("canonical");
+        let paths = |glob: &str| {
+            let options = SearchPageOptions {
+                offset: 1,
+                max_hits: DEFAULT_MAX_HITS,
+                context_lines: 0,
+            };
+            let mut paths = SearchService::default()
+                .page_in(&canonical, vec!["needle".into()], options, None, None, Some(glob))
+                .expect("search")
+                .hits
+                .iter()
+                .map(|hit| display_path(&canonical, &hit.hit.path).display().to_string())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        // The glob narrows the walk; the ignored file stays out even when it matches.
+        assert_eq!(paths("*.rs"), ["src/deep/a.rs"]);
+        assert_eq!(paths("!*.rs"), ["src/b.ts"]);
+        assert_eq!(paths("src/*.ts"), ["src/b.ts"]);
+        assert!(compile_glob(&canonical, "src/{a").is_err());
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
     fn search_respects_gitignore_and_skip_dirs() {
         let root = temp_root("ignore");
         fs::create_dir_all(root.join("src")).expect("src");
@@ -2926,6 +3185,7 @@ mod tests {
                 context_lines: 0,
             },
             scan,
+            None,
         );
         let output = format_search_batch_page(&page, &root);
         assert!(output.contains("search incomplete"), "{output}");
@@ -2963,6 +3223,7 @@ mod tests {
                 context_lines: 0,
             },
             scan,
+            None,
         );
         let output = format_search_batch_page(&page, &root);
         assert!(output.contains("search incomplete"), "{output}");
@@ -3114,7 +3375,7 @@ mod tests {
             max_hits: 1,
             context_lines: 0,
         };
-        let first = service.cache_scan(root.clone(), patterns.clone(), options, scan);
+        let first = service.cache_scan(root.clone(), patterns.clone(), options, scan, None);
         assert_eq!(first.total, 2);
         assert!(first.next_cursor.is_some());
         assert!(!first.scan_complete);
@@ -3196,6 +3457,7 @@ mod tests {
                 context_lines: 0,
             },
             scan,
+            None,
         );
         assert_eq!(page.total, 0);
         let presented = page.present(1, &root);
@@ -3260,6 +3522,7 @@ mod tests {
                     context_lines: 0,
                 },
                 scan,
+                None,
             );
         let cursor = first.next_cursor.expect("first page has continuation");
         let arguments = serde_json::json!({
@@ -3346,6 +3609,7 @@ mod tests {
                 context_lines: 0,
             },
             scan,
+            None,
         );
         let output = format_search_batch_page(&page, &root);
         assert!(output.contains("work budget exhausted"), "{output}");
@@ -3538,17 +3802,16 @@ mod tests {
         let root = temp_root("case-variant");
         fs::create_dir_all(&root).expect("root");
         fs::write(root.join("a.rs"), "// intro\nstruct SearchService;\nação\n").expect("fixture");
+        // A single pattern gets the hits of the spelling that occurs.
         let single = formatted_search(&root, &["searchservice"]);
         assert!(
-            single.starts_with("[no matches after full scan]"),
+            single.starts_with("[`searchservice` not found; showing `SearchService`"),
             "{single}"
         );
-        assert!(
-            single.contains("`SearchService` occurs at a.rs:2"),
-            "{single}"
-        );
+        assert!(single.contains("2: struct SearchService;"), "{single}");
         let unicode = formatted_search(&root, &["AÇÃO"]);
-        assert!(unicode.contains("`ação` occurs at a.rs:3"), "{unicode}");
+        assert!(unicode.contains("showing `ação`"), "{unicode}");
+        assert!(unicode.contains("3: ação"), "{unicode}");
         // Per absent pattern, and nothing for a pattern that is truly absent
         // or that has hits.
         let multiple = formatted_search(&root, &["SEARCHSERVICE", "intro", "nothing"]);
@@ -3568,7 +3831,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         fs::write(root.join("a.txt"), "Needle\n").expect("fixture");
         let patterns = vec!["needle".to_owned()];
-        let mut scan = search_with_walker(&root, &patterns, 10, 0, None).expect("scan");
+        let mut scan = search_with_walker(&root, &patterns, 10, 0, None, None).expect("scan");
         scan.work_limited = true;
         note_case_variants(&root, &patterns, &mut scan, None).expect("recheck");
         assert!(scan.coverage[0].case_variant.is_none());

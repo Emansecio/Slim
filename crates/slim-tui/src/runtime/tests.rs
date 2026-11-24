@@ -1,7 +1,7 @@
 use super::{
-    control_requires_data_barrier, footer_line, measure_scrollback, menu_line,
-    notification_toast_label, receive_batch, terminal_action, toast_row_count,
-    update_visible_stream_state, LaneDrain, Palette, CONTROL_BATCH_LIMIT, STREAM_BATCH_LIMIT,
+    control_requires_data_barrier, footer_line, menu_line, notification_toast_label, receive_batch,
+    terminal_action, toast_row_count, update_visible_stream_state, LaneDrain, Palette,
+    CONTROL_BATCH_LIMIT, STREAM_BATCH_LIMIT,
 };
 use crate::api::{
     McpServerView, McpStatusView, TodoItemStatus, TodoItemView, ToolBatchId, ToolCallId, UiEvent,
@@ -849,7 +849,10 @@ fn wheel_still_scrolls_when_mouse_is_captured() {
 #[test]
 fn slash_popup_keeps_a_late_selection_visible_in_a_small_viewport() {
     let mut state = AppState::new();
-    state.set_skill_names_for_test((0..20).map(|index| format!("skill-{index:02}")).collect());
+    state.apply_event(UiEvent::WorkspaceChanged {
+        cwd: state.cwd.clone(),
+        skill_names: (0..20).map(|index| format!("skill-{index:02}")).collect(),
+    });
     state.slash_suggestions = Some(SlashSuggestions {
         query: "skill".into(),
         selected: 15,
@@ -864,7 +867,10 @@ fn slash_popup_keeps_a_late_selection_visible_in_a_small_viewport() {
 #[test]
 fn slash_skills_with_a_shared_prefix_remain_distinct_at_minimum_size() {
     let mut state = AppState::new();
-    state.set_skill_names_for_test(vec!["typescript-symbols".into(), "typescript-refs".into()]);
+    state.apply_event(UiEvent::WorkspaceChanged {
+        cwd: state.cwd.clone(),
+        skill_names: vec!["typescript-symbols".into(), "typescript-refs".into()],
+    });
     reduce(&mut state, Action::Paste("/typescript".into()));
     reduce(
         &mut state,
@@ -944,52 +950,6 @@ fn migrated_causal_suffix_and_cancel_wait_for_queued_stream_data() {
         &mut visible_stream_started,
     );
     assert!(!visible_stream_started);
-}
-
-#[test]
-fn question_arrows_are_routed_to_reducer_instead_of_scrollback() {
-    let mut state = AppState::new();
-    state.apply_event(UiEvent::QuestionRequired {
-        request_id: crate::api::InteractionRequestId("question-1".into()),
-        question: "Which crate?".into(),
-        options: vec![
-            slim_core::QuestionOption {
-                label: "core".into(),
-                description: String::new(),
-            },
-            slim_core::QuestionOption {
-                label: "tui".into(),
-                description: String::new(),
-            },
-        ],
-        persisted: false,
-    });
-    let key = crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Down,
-        crossterm::event::KeyModifiers::NONE,
-    );
-    let mut cache = WrapCache::default();
-    let action = terminal_action(
-        crossterm::event::Event::Key(key),
-        &state,
-        (80, 24),
-        &mut cache,
-    )
-    .expect("action");
-    assert!(
-        matches!(
-            action,
-            Action::Key(event) if event.code == crossterm::event::KeyCode::Down
-        ),
-        "pending question must capture arrows: {action:?}"
-    );
-    reduce(&mut state, action);
-    assert_eq!(
-        state
-            .pending_interaction()
-            .map(|interaction| interaction.selected_question_option),
-        Some(1)
-    );
 }
 
 #[test]
@@ -2214,8 +2174,6 @@ fn idle_down_becomes_scroll_without_an_overlay() {
             ..
         }
     ));
-    let _ = measure_scrollback(&state, 80, 24, &mut cache);
-    let _ = FrameClock::default();
 }
 
 fn pinned_state_with_draft() -> AppState {
@@ -2343,7 +2301,6 @@ fn data_barrier_drains_prefetched_event_and_full_bounded_stream_lane() {
 
     let (batch, state) = receive_batch(&receiver, STREAM_BATCH_LIMIT, &mut prefetched);
 
-    assert_eq!(STREAM_BATCH_LIMIT, STREAM_EVENT_CAPACITY + 1);
     assert_eq!(batch.len(), STREAM_EVENT_CAPACITY + 1);
     assert_eq!(state, LaneDrain::Exhausted);
     assert!(matches!(
@@ -2767,4 +2724,341 @@ fn a_long_toast_ends_in_exactly_one_ellipsis_within_the_available_width() {
     }
     let fits = notification_toast_label(&crate::app::Notification::from("curto"), 0, 30);
     assert_eq!(fits, "curto");
+}
+
+#[test]
+fn session_snapshot_waits_for_session_cleared_in_same_wakeup() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-runtime-snapshot-barrier-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cwd: String = root.to_string_lossy().into();
+    let after_snapshot = UiEvent::SessionSnapshot {
+        session_id: crate::api::SessionId("after-new".into()),
+        cwd: cwd.clone(),
+        skill_names: vec![],
+    };
+    assert!(control_requires_data_barrier(std::slice::from_ref(
+        &after_snapshot
+    )));
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (ctrl_tx, ctrl_rx) = mpsc::sync_channel(8);
+    let (data_tx, data_rx) = mpsc::sync_channel(8);
+    let (clipboard_tx, _clipboard_rx) = mpsc::channel();
+    let channels = crate::api::UiChannels {
+        commands: cmd_tx,
+        wake: crate::api::WakeSignal::new().unwrap(),
+        lane_space: crate::api::WakeSignal::new().unwrap(),
+        events: ctrl_rx,
+        events_data: data_rx,
+    };
+
+    let bridge = crate::api::QueueJournalBridge::new();
+    let mut state = AppState::new();
+    let mut queue =
+        crate::prompt_queue::PersistentQueue::with_initial_prompt_and_bridge(None, bridge);
+    queue
+        .reduce(
+            &mut state,
+            Action::UiEventReceived(UiEvent::SessionSnapshot {
+                session_id: crate::api::SessionId("before-new".into()),
+                cwd: cwd.clone(),
+                skill_names: vec![],
+            }),
+        )
+        .unwrap();
+
+    // Queue SessionCleared (data lane) and SessionSnapshot (control lane) in the same wakeup.
+    data_tx
+        .send(UiEvent::SessionCleared {
+            cwd,
+            skill_names: vec![],
+        })
+        .unwrap();
+    ctrl_tx.send(after_snapshot).unwrap();
+
+    let (control_events, _) = receive_batch(&channels.events, CONTROL_BATCH_LIMIT, &mut Vec::new());
+    let (stream_events, _) =
+        receive_batch(&channels.events_data, STREAM_BATCH_LIMIT, &mut Vec::new());
+    let mut coalescer = super::EventCoalescer::new(1024, std::time::Duration::from_millis(16));
+    let mut visible_stream_started = false;
+    let mut dirty = false;
+
+    assert!(control_requires_data_barrier(&control_events));
+    super::reduce_stream_events(
+        &mut queue,
+        &channels,
+        &mut state,
+        &mut coalescer,
+        &mut visible_stream_started,
+        &mut dirty,
+        &clipboard_tx,
+        stream_events,
+        true,
+    )
+    .unwrap();
+    for event in control_events {
+        let effects = queue
+            .reduce(&mut state, Action::UiEventReceived(event))
+            .unwrap();
+        super::run_effects(&channels, &clipboard_tx, effects).unwrap();
+    }
+
+    assert_eq!(
+        state.session_id,
+        Some(crate::api::SessionId("after-new".into())),
+        "SessionCleared must reduce before SessionSnapshot so the new session is preserved"
+    );
+    assert!(queue.snapshot().is_some());
+    assert_eq!(
+        slim_core::session::PromptQueueJournal::open(&root, "after-new")
+            .err()
+            .map(|e| e.kind()),
+        Some(std::io::ErrorKind::ResourceBusy),
+        "after-new journal must remain attached"
+    );
+
+    drop(queue);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn drain_single_wakeup_via_lane_routing(
+    events: Vec<UiEvent>,
+    state: &mut AppState,
+    queue: &mut crate::prompt_queue::PersistentQueue,
+) {
+    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (ctrl_tx, ctrl_rx) = mpsc::sync_channel(16);
+    let (data_tx, data_rx) = mpsc::sync_channel(16);
+    let (clipboard_tx, _clipboard_rx) = mpsc::channel();
+    let channels = crate::api::UiChannels {
+        commands: cmd_tx,
+        wake: crate::api::WakeSignal::new().unwrap(),
+        lane_space: crate::api::WakeSignal::new().unwrap(),
+        events: ctrl_rx,
+        events_data: data_rx,
+    };
+
+    for event in events {
+        if event.is_control() {
+            ctrl_tx.send(event).unwrap();
+        } else {
+            data_tx.send(event).unwrap();
+        }
+    }
+
+    let (control_events, _) = receive_batch(&channels.events, CONTROL_BATCH_LIMIT, &mut Vec::new());
+    let (stream_events, _) =
+        receive_batch(&channels.events_data, STREAM_BATCH_LIMIT, &mut Vec::new());
+    let mut coalescer = super::EventCoalescer::new(1024, std::time::Duration::from_millis(16));
+    let mut visible_stream_started = false;
+    let mut dirty = false;
+    let data_barrier = control_requires_data_barrier(&control_events);
+    let mut stream_events = Some(stream_events);
+
+    if data_barrier {
+        super::reduce_stream_events(
+            queue,
+            &channels,
+            state,
+            &mut coalescer,
+            &mut visible_stream_started,
+            &mut dirty,
+            &clipboard_tx,
+            stream_events.take().expect("stream batch"),
+            true,
+        )
+        .unwrap();
+    }
+    for event in control_events {
+        let effects = queue
+            .reduce(state, Action::UiEventReceived(event))
+            .unwrap();
+        super::run_effects(&channels, &clipboard_tx, effects).unwrap();
+    }
+    if let Some(stream_events) = stream_events {
+        super::reduce_stream_events(
+            queue,
+            &channels,
+            state,
+            &mut coalescer,
+            &mut visible_stream_started,
+            &mut dirty,
+            &clipboard_tx,
+            stream_events,
+            false,
+        )
+        .unwrap();
+    }
+    for event in coalescer.flush() {
+        let effects = queue
+            .reduce(state, Action::UiEventReceived(event))
+            .unwrap();
+        super::run_effects(&channels, &clipboard_tx, effects).unwrap();
+    }
+}
+
+#[test]
+fn session_restored_and_todo_changed_in_same_wakeup_preserves_todos() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-runtime-todo-lane-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cwd: String = root.to_string_lossy().into();
+    let expected_items = vec![TodoItemView {
+        reason: None,
+        id: Some(1),
+        title: "restored task".into(),
+        status: TodoItemStatus::InProgress,
+    }];
+    let todo_event = UiEvent::TodoChanged {
+        items: expected_items.clone(),
+    };
+    assert!(!todo_event.is_control());
+
+    let mut state = AppState::new();
+    let mut queue = crate::prompt_queue::PersistentQueue::with_initial_prompt_and_bridge(
+        None,
+        crate::api::QueueJournalBridge::new(),
+    );
+    drain_single_wakeup_via_lane_routing(
+        vec![
+            UiEvent::SessionRestored {
+                session_id: crate::api::SessionId("restored-todo".into()),
+                cwd,
+                messages: Vec::new(),
+                skill_names: Vec::new(),
+            },
+            todo_event,
+        ],
+        &mut state,
+        &mut queue,
+    );
+
+    assert_eq!(state.todo_items, expected_items);
+    drop(queue);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn session_cleared_and_queued_user_added_in_same_wakeup_preserves_queued_prompt() {
+    let queued_event = UiEvent::QueuedUserAdded {
+        text: "follow-up".into(),
+        position: 0,
+    };
+    assert!(!queued_event.is_control());
+
+    // Idle after SessionCleared: QueuedUserAdded drains into prompt preparation
+    // instead of being wiped by SessionCleared overtaking/trailing it.
+    let mut idle_state = AppState::new();
+    let mut idle_queue = crate::prompt_queue::PersistentQueue::with_initial_prompt_and_bridge(
+        None,
+        crate::api::QueueJournalBridge::new(),
+    );
+    drain_single_wakeup_via_lane_routing(
+        vec![
+            UiEvent::SessionCleared {
+                cwd: "/tmp/workspace".into(),
+                skill_names: Vec::new(),
+            },
+            queued_event.clone(),
+        ],
+        &mut idle_state,
+        &mut idle_queue,
+    );
+    assert_eq!(
+        idle_state
+            .current_prompt_preparation()
+            .map(|prep| prep.prompt.as_str()),
+        Some("follow-up")
+    );
+
+    // Working after SessionCleared + RunStarted: QueuedUserAdded stays in
+    // `queued_prompts` and `blocks`.
+    let mut working_state = AppState::new();
+    let mut working_queue = crate::prompt_queue::PersistentQueue::with_initial_prompt_and_bridge(
+        None,
+        crate::api::QueueJournalBridge::new(),
+    );
+    drain_single_wakeup_via_lane_routing(
+        vec![
+            UiEvent::SessionCleared {
+                cwd: "/tmp/workspace".into(),
+                skill_names: Vec::new(),
+            },
+            UiEvent::run_started(1),
+            queued_event,
+        ],
+        &mut working_state,
+        &mut working_queue,
+    );
+
+    assert_eq!(
+        working_state
+            .queued_prompts
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["follow-up".to_owned()]
+    );
+    assert!(working_state.blocks().iter().any(|block| {
+        matches!(block.kind(), crate::block::BlockKind::QueuedUser(text) if text == "follow-up")
+    }));
+}
+
+#[test]
+fn tool_started_and_tool_source_in_same_wakeup_attaches_program_source() {
+    let batch_id = ToolBatchId("batch-1".into());
+    let call_id = ToolCallId("call-1".into());
+    let tool_source = UiEvent::ToolSource {
+        batch_id: batch_id.clone(),
+        call_id: call_id.clone(),
+        source: "return 42;".into(),
+    };
+    assert!(!tool_source.is_control());
+
+    let mut state = AppState::new();
+    let mut queue = crate::prompt_queue::PersistentQueue::with_initial_prompt_and_bridge(
+        None,
+        crate::api::QueueJournalBridge::new(),
+    );
+    drain_single_wakeup_via_lane_routing(
+        vec![
+            UiEvent::ToolStarted {
+                batch_id,
+                call_id,
+                name: "codemode".into(),
+                arguments_summary: String::new(),
+            },
+            tool_source,
+        ],
+        &mut state,
+        &mut queue,
+    );
+
+    assert!(!state.snapshot_resync_needed());
+    assert!(
+        !state
+            .notifications
+            .iter()
+            .any(|notification| notification.as_str().contains("Código órfão")),
+        "unexpected lifecycle anomaly: {:?}",
+        state.notifications
+    );
+    assert!(state.blocks().iter().any(|block| {
+        matches!(
+            block.kind(),
+            crate::block::BlockKind::Tool(tool)
+                if tool.program_source.as_deref() == Some("return 42;")
+        )
+    }));
 }

@@ -30,4 +30,7 @@ pub mod todo;
 pub mod view_model;
 pub mod work;
 
-pub use runtime::{run_app, run_app_with_initial_prompt};
+pub use api::QueueJournalBridge;
+pub use runtime::{
+    run_app, run_app_with_initial_prompt, run_app_with_initial_prompt_and_bridge,
+};

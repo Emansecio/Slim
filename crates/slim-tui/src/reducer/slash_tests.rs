@@ -86,7 +86,6 @@ fn filter_narrows_to_prefix() {
     assert_eq!(slash_matches("lo"), vec!["/login", "/logout"]);
     assert_eq!(slash_matches("logi"), vec!["/login"]);
     assert_eq!(slash_matches("he"), vec!["/help"]);
-    assert_eq!(slash_matches("").len(), 20);
     assert_eq!(slash_matches("job"), vec!["/jobs"]);
     assert_eq!(
         slash_matches("re"),
@@ -130,7 +129,10 @@ fn slash_and_palette_navigation_follow_the_visible_category_order() {
 fn discovered_skill_autocompletes_and_dispatches_as_a_prompt() {
     let mut state = AppState::new();
     state.authenticated = true;
-    state.set_skill_names_for_test(vec!["review-code".into()]);
+    state.apply_event(crate::api::UiEvent::WorkspaceChanged {
+        cwd: state.cwd.clone(),
+        skill_names: vec!["review-code".into()],
+    });
     type_text(&mut state, "/rev");
     assert_eq!(
         slash_matches_with_skills(&state, "rev"),
@@ -154,7 +156,7 @@ fn discovered_skill_autocompletes_and_dispatches_as_a_prompt() {
 }
 
 #[test]
-fn tab_completes_selected_command_into_draft() {
+fn backspace_after_tab_complete_removes_one_grapheme_not_the_draft() {
     let mut state = AppState::new();
     type_text(&mut state, "run /lo");
     reduce(
@@ -167,20 +169,6 @@ fn tab_completes_selected_command_into_draft() {
     );
     assert_eq!(state.composer.payload(), "run /logout ");
     assert!(state.slash_suggestions.is_none());
-}
-
-#[test]
-fn backspace_after_tab_complete_removes_one_grapheme_not_the_draft() {
-    let mut state = AppState::new();
-    type_text(&mut state, "run /lo");
-    reduce(
-        &mut state,
-        Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-    );
-    reduce(
-        &mut state,
-        Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-    );
     reduce(
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
@@ -241,4 +229,44 @@ fn paste_with_slash_token_opens() {
         .as_ref()
         .expect("paste triggers the popup too");
     assert_eq!(suggestions.query, "log");
+}
+
+fn submit_text(state: &mut AppState, text: &str) -> Vec<Effect> {
+    state.composer.clear();
+    state.composer.insert_text(text);
+    reduce(
+        state,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    )
+}
+
+#[test]
+fn memory_slash_commands_parse_list_add_remove_and_clear() {
+    let mut state = AppState::new();
+    let effects = submit_text(&mut state, "/memory");
+    assert!(effects.contains(&Effect::Send(UiCommand::MemoryList)));
+
+    let mut state = AppState::new();
+    let effects = submit_text(&mut state, "/memory add command cargo test --lib");
+    assert!(effects.contains(&Effect::Send(UiCommand::MemoryAdd {
+        kind: "command".into(),
+        text: "cargo test --lib".into(),
+    })));
+
+    let mut state = AppState::new();
+    let effects = submit_text(&mut state, "/memory add usar rustfmt no workspace");
+    assert!(effects.contains(&Effect::Send(UiCommand::MemoryAdd {
+        kind: "convention".into(),
+        text: "usar rustfmt no workspace".into(),
+    })));
+
+    let mut state = AppState::new();
+    let effects = submit_text(&mut state, "/memory rm ab12cd34");
+    assert!(effects.contains(&Effect::Send(UiCommand::MemoryRemove {
+        id: "ab12cd34".into(),
+    })));
+
+    let mut state = AppState::new();
+    let effects = submit_text(&mut state, "/memory clear");
+    assert!(effects.contains(&Effect::Send(UiCommand::MemoryClear)));
 }

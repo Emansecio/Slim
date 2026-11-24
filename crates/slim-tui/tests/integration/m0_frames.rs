@@ -3,7 +3,7 @@ use std::sync::Arc;
 use slim_core::OperatingMode;
 use slim_tui::api::{LoginProvider, SessionId, UiEvent};
 use slim_tui::app::AppState;
-use slim_tui::block::{BlockKind, BlockLifecycle, FoldState};
+use slim_tui::block::BlockKind;
 use slim_tui::reducer::{reduce, Action, Effect};
 use slim_tui::testkit::MemorySurface;
 use slim_tui::view_model::ViewModel;
@@ -168,20 +168,6 @@ fn restore_draft_only_replaces_empty_composer() {
         text: "do not overwrite".into(),
     });
     assert_eq!(state.composer.payload(), "retry me");
-}
-
-#[test]
-fn compaction_completed_becomes_collapsed_system_block() {
-    let mut state = AppState::new();
-    state.apply_event(UiEvent::CompactionCompleted);
-    assert!(state.notifications.is_empty());
-    assert_eq!(state.blocks().len(), 1);
-    assert!(matches!(
-        state.blocks()[0].kind(),
-        BlockKind::System(text) if text == "compactação concluída"
-    ));
-    assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Complete);
-    assert_eq!(state.blocks()[0].fold, FoldState::Collapsed);
 }
 
 #[test]

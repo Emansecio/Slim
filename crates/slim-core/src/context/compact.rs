@@ -72,6 +72,20 @@ impl AdaptiveTokenEstimator {
     }
 }
 
+/// Policy choosing which model summarizes history when cache-preserving in-place
+/// compaction is cold or unavailable.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum SummaryModelPolicy {
+    /// Keep the session model while its prompt cache is warm (`in_place`);
+    /// route cold / serialized / chunked summaries to the provider's fast sibling.
+    #[default]
+    Auto,
+    /// Always use the session's active model for compaction summaries.
+    Same,
+    /// Always use this explicit model id on the same provider.
+    Explicit(String),
+}
+
 /// Compaction configuration. The first three fields are Pi's settings; the
 /// byte limits guard what a durable checkpoint and a manual request may hold.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +100,11 @@ pub struct CompactionPolicy {
     /// session never accepts more than 64 KiB.
     pub summary_max_bytes: usize,
     pub manual_instructions_max_bytes: usize,
+    /// Model policy for cold / fallback compaction summaries.
+    pub summary_model: SummaryModelPolicy,
+    /// Whether idle high-water conversations pre-compute a speculative checkpoint
+    /// in the background so the upcoming threshold / manual `/compact` hits in <5 ms.
+    pub speculative: bool,
 }
 
 impl CompactionPolicy {
@@ -97,6 +116,41 @@ impl CompactionPolicy {
             keep_recent_tokens: self.keep_recent_tokens,
         }
     }
+
+    /// Window-proportional threshold settings used by `should_compact` and
+    /// `prepare_compaction` trigger checks:
+    /// - Scales default settings down proportionally on tiny windows (<= 32k)
+    ///   so `reserve + keep_recent` never exceeds the window.
+    /// - Caps large windows (>= 400k, e.g. 1M) at ~80% fullness so quality
+    ///   does not degrade before compaction triggers.
+    /// - Never overrides non-default user/test reserves on <400k windows, and
+    ///   preserves the configured `reserve_tokens` for summary output sizing.
+    pub fn effective_settings_for_window(&self, context_window_tokens: u64) -> CompactionSettings {
+        let mut settings = self.settings();
+        if context_window_tokens == 0 {
+            return settings;
+        }
+        let is_default_window_budget =
+            settings.reserve_tokens == DEFAULT_COMPACTION_SETTINGS.reserve_tokens
+                && settings.keep_recent_tokens == DEFAULT_COMPACTION_SETTINGS.keep_recent_tokens;
+        if is_default_window_budget
+            && settings
+                .reserve_tokens
+                .saturating_add(settings.keep_recent_tokens)
+                >= context_window_tokens
+        {
+            settings.reserve_tokens = settings
+                .reserve_tokens
+                .min(context_window_tokens / 4)
+                .max(1024.min(context_window_tokens / 2));
+            settings.keep_recent_tokens = settings
+                .keep_recent_tokens
+                .min(context_window_tokens / 3);
+        } else if context_window_tokens >= 400_000 {
+            settings.reserve_tokens = settings.reserve_tokens.max(context_window_tokens / 5);
+        }
+        settings
+    }
 }
 
 impl Default for CompactionPolicy {
@@ -107,6 +161,8 @@ impl Default for CompactionPolicy {
             keep_recent_tokens: DEFAULT_COMPACTION_SETTINGS.keep_recent_tokens,
             summary_max_bytes: 64 * 1024,
             manual_instructions_max_bytes: 4 * 1024,
+            summary_model: SummaryModelPolicy::Auto,
+            speculative: true,
         }
     }
 }
@@ -142,6 +198,58 @@ struct CompactionHandleState {
     usage_anchor: Option<StoredUsageAnchor>,
     compacted: Option<CompactedHistory>,
     channel_anchors: Vec<StoredChannelAnchor>,
+    initial_workspace_snapshot: Option<String>,
+    token_estimator: AdaptiveTokenEstimator,
+    warm_caches: Vec<WarmCacheEntry>,
+    failed_fast_models: std::collections::HashSet<(String, String)>,
+    speculative: Option<SpeculativeCompaction>,
+}
+
+/// Pre-computed speculative compaction stored in memory for a prefix of the
+/// live history. Raw `summary` has NOT yet passed through
+/// `fit_summary_for_persistence`, so applying it reuses the standard finalize pass.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SpeculativeCompaction {
+    pub canonical_prefix_fingerprint: String,
+    pub first_kept_index: usize,
+    pub summary: String,
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+    pub tokens_before: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub created_at_unix_secs: u64,
+}
+
+/// Durable snapshot of a channel anchor so cold resumes within the provider's
+/// cache TTL (e.g., 1h Anthropic / 24h OpenAI) keep byte-identical prefixes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistedChannelAnchor {
+    pub message_index: usize,
+    pub message_fingerprint: String,
+    pub mode: crate::OperatingMode,
+    pub text: String,
+}
+
+/// Durable prefix state (`prefix.anchors.v1`) preserved across process restarts
+/// to keep prompt-cache prefixes intact on cold resume.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistedPrefixAnchors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_anchors: Vec<PersistedChannelAnchor>,
+}
+
+/// Tracks when a `(provider, model)` last held a warm prompt cache in this
+/// session so UI/routing can surface warm-cache affinity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WarmCacheEntry {
+    pub provider: String,
+    pub model: String,
+    pub last_hit_unix_secs: u64,
+    pub ttl_secs: u64,
+    pub cached_tokens: u64,
 }
 
 /// Most run anchors remembered; a history that long has compacted (which
@@ -217,7 +325,303 @@ impl CompactionHandle {
             usage_anchor: None,
             compacted: None,
             channel_anchors: Vec::new(),
+            initial_workspace_snapshot: None,
+            token_estimator: AdaptiveTokenEstimator::default(),
+            warm_caches: Vec::new(),
+            failed_fast_models: std::collections::HashSet::new(),
+            speculative: None,
         })))
+    }
+
+    pub fn set_initial_workspace_snapshot(&self, snapshot: String) {
+        self.with_state_mut(|state| state.initial_workspace_snapshot = Some(snapshot));
+    }
+
+    pub fn initial_workspace_snapshot(&self) -> Option<String> {
+        self.with_state(|state| state.initial_workspace_snapshot.clone())
+    }
+
+    pub fn export_prefix_anchors(&self) -> PersistedPrefixAnchors {
+        self.with_state(|state| PersistedPrefixAnchors {
+            workspace_snapshot: state.initial_workspace_snapshot.clone(),
+            channel_anchors: state
+                .channel_anchors
+                .iter()
+                .map(|anchor| PersistedChannelAnchor {
+                    message_index: anchor.message_index,
+                    message_fingerprint: anchor.message_fingerprint.clone(),
+                    mode: anchor.mode,
+                    text: anchor.text.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn restore_prefix_anchors(&self, persisted: PersistedPrefixAnchors) {
+        self.with_state_mut(|state| {
+            if state.initial_workspace_snapshot.is_none() {
+                state.initial_workspace_snapshot = persisted.workspace_snapshot;
+            }
+            if state.channel_anchors.is_empty() {
+                state.channel_anchors = persisted
+                    .channel_anchors
+                    .into_iter()
+                    .take(MAX_CHANNEL_ANCHORS)
+                    .map(|anchor| StoredChannelAnchor {
+                        message_index: anchor.message_index,
+                        message_fingerprint: anchor.message_fingerprint,
+                        mode: anchor.mode,
+                        text: anchor.text,
+                    })
+                    .collect();
+            }
+        });
+    }
+
+    pub fn token_estimator(&self) -> AdaptiveTokenEstimator {
+        self.with_state(|state| state.token_estimator.clone())
+    }
+
+    pub fn observe_token_calibration(
+        &self,
+        provider: &str,
+        model: &str,
+        serialized_chars: u64,
+        actual_input_tokens: u64,
+    ) {
+        self.with_state_mut(|state| {
+            state
+                .token_estimator
+                .observe(provider, model, serialized_chars, actual_input_tokens);
+        });
+    }
+
+    pub fn record_warm_cache(
+        &self,
+        provider: &str,
+        model: &str,
+        last_hit_unix_secs: u64,
+        ttl_secs: u64,
+        cached_tokens: u64,
+    ) {
+        if ttl_secs == 0 || cached_tokens == 0 {
+            return;
+        }
+        self.with_state_mut(|state| {
+            state
+                .warm_caches
+                .retain(|entry| !(entry.provider == provider && entry.model == model));
+            state.warm_caches.push(WarmCacheEntry {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                last_hit_unix_secs,
+                ttl_secs,
+                cached_tokens,
+            });
+        });
+    }
+
+    /// How long a provider is assumed to keep a cached prefix after its last hit.
+    pub fn warm_cache_ttl_secs(provider: &str) -> u64 {
+        match provider {
+            "anthropic" => 3600,
+            "openai-compatible" | "openai-codex" => 24 * 3600,
+            _ => 300,
+        }
+    }
+
+    /// Cold resume has no cache clock: `last_unix_secs` (the journal's last
+    /// write) stands in for the last hit, recorded only when that window has
+    /// already closed, so nothing ever reads it as a warm cache.
+    pub fn record_cold_cache(&self, provider: &str, model: &str, last_unix_secs: u64, now_unix_secs: u64) {
+        let ttl_secs = Self::warm_cache_ttl_secs(provider);
+        if last_unix_secs.saturating_add(ttl_secs) <= now_unix_secs {
+            self.record_warm_cache(provider, model, last_unix_secs, ttl_secs, 1);
+        }
+    }
+
+    /// True when this provider/model's cached prefix is known to have outlived
+    /// its TTL. Unlike `has_warm_cache`, it keeps the entry.
+    pub fn warm_cache_expired(&self, provider: &str, model: &str, now_unix_secs: u64) -> bool {
+        self.with_state(|state| {
+            state.warm_caches.iter().any(|entry| {
+                entry.provider == provider
+                    && entry.model == model
+                    && entry.last_hit_unix_secs.saturating_add(entry.ttl_secs) <= now_unix_secs
+            })
+        })
+    }
+
+    pub fn warm_caches(&self, now_unix_secs: u64) -> Vec<WarmCacheEntry> {
+        self.with_state_mut(|state| {
+            state
+                .warm_caches
+                .retain(|entry| entry.last_hit_unix_secs.saturating_add(entry.ttl_secs) > now_unix_secs);
+            state.warm_caches.clone()
+        })
+    }
+
+    pub fn has_warm_cache(&self, provider: &str, model: &str, now_unix_secs: u64) -> bool {
+        self.with_state_mut(|state| {
+            state
+                .warm_caches
+                .retain(|entry| entry.last_hit_unix_secs.saturating_add(entry.ttl_secs) > now_unix_secs);
+            state
+                .warm_caches
+                .iter()
+                .any(|entry| entry.provider == provider && entry.model == model)
+        })
+    }
+
+    /// True when the active cached prefix exceeds 50k tokens and the session has
+    /// been idle for at least 3 minutes on this provider/model, making a 1h TTL
+    /// breakpoint worthwhile on the next Anthropic request.
+    pub fn should_promote_1h_ttl(
+        &self,
+        provider: &str,
+        model: &str,
+        estimated_prefix_tokens: u64,
+        now_unix_secs: u64,
+    ) -> bool {
+        if estimated_prefix_tokens < 50_000 {
+            return false;
+        }
+        self.with_state(|state| {
+            state
+                .warm_caches
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.model == model)
+                .any(|entry| {
+                    let idle = now_unix_secs.saturating_sub(entry.last_hit_unix_secs);
+                    idle >= 180
+                })
+        })
+    }
+
+    /// True when opt-in keep-alive is enabled, the session has been idle less
+    /// than `max_idle_secs` (hard-capped at 15 minutes = 900s), and a warm cache
+    /// holding >= 8k tokens is within 1..=45s of TTL expiry.
+    pub fn should_keep_alive_ping(
+        &self,
+        provider: &str,
+        model: &str,
+        now_unix_secs: u64,
+        enabled: bool,
+        session_idle_secs: u64,
+        max_idle_secs: u64,
+    ) -> bool {
+        let cap_secs = max_idle_secs.min(900);
+        if !enabled || cap_secs == 0 || session_idle_secs >= cap_secs {
+            return false;
+        }
+        self.with_state(|state| {
+            state
+                .warm_caches
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.model == model)
+                .any(|entry| {
+                    if entry.cached_tokens < 8_000 || entry.ttl_secs == 0 {
+                        return false;
+                    }
+                    let expires_at = entry.last_hit_unix_secs.saturating_add(entry.ttl_secs);
+                    let remaining = expires_at.saturating_sub(now_unix_secs);
+                    (1..=45).contains(&remaining)
+                })
+        })
+    }
+
+    pub fn mark_fast_model_failed(&self, provider: &str, model: &str) {
+        self.with_state_mut(|state| {
+            state
+                .failed_fast_models
+                .insert((provider.to_owned(), model.to_owned()));
+        });
+    }
+
+    pub fn is_fast_model_failed(&self, provider: &str, model: &str) -> bool {
+        self.with_state(|state| {
+            state
+                .failed_fast_models
+                .contains(&(provider.to_owned(), model.to_owned()))
+        })
+    }
+
+    pub fn store_speculative(&self, entry: SpeculativeCompaction) {
+        self.with_state_mut(|state| {
+            state.speculative = Some(entry);
+        });
+    }
+
+    pub fn has_speculative_for(
+        &self,
+        canonical_prefix_fingerprint: &str,
+        first_kept_index: usize,
+    ) -> bool {
+        self.with_state(|state| {
+            state.speculative.as_ref().is_some_and(|spec| {
+                spec.first_kept_index == first_kept_index
+                    && spec.canonical_prefix_fingerprint == canonical_prefix_fingerprint
+            })
+        })
+    }
+
+    /// Whether the stored checkpoint still summarizes a prefix of `messages`,
+    /// at whatever cut it was made. Consumes nothing.
+    pub fn has_valid_speculative(&self, messages: &[ProviderMessage]) -> bool {
+        self.with_state(|state| {
+            state.speculative.as_ref().is_some_and(|spec| {
+                (1..=messages.len()).contains(&spec.first_kept_index)
+                    && canonical_prefix_fingerprint(&messages[..spec.first_kept_index])
+                        == spec.canonical_prefix_fingerprint
+            })
+        })
+    }
+
+    pub fn take_exact_speculative(
+        &self,
+        canonical_prefix_fingerprint: &str,
+        first_kept_index: usize,
+    ) -> Option<SpeculativeCompaction> {
+        self.with_state_mut(|state| {
+            let matches = state.speculative.as_ref().is_some_and(|spec| {
+                spec.first_kept_index == first_kept_index
+                    && spec.canonical_prefix_fingerprint == canonical_prefix_fingerprint
+            });
+            matches.then(|| state.speculative.take()).flatten()
+        })
+    }
+
+    /// Consumes a speculative compaction covering an earlier prefix of
+    /// `messages` (`0..spec.first_kept_index`, where `spec.first_kept_index < target_first_kept`)
+    /// so compaction only has to summarize the small trailing delta.
+    pub fn take_partial_speculative(
+        &self,
+        messages: &[ProviderMessage],
+        target_first_kept: usize,
+    ) -> Option<SpeculativeCompaction> {
+        let candidate = self.with_state(|state| state.speculative.clone())?;
+        if candidate.first_kept_index == 0
+            || candidate.first_kept_index >= target_first_kept
+            || candidate.first_kept_index > messages.len()
+        {
+            return None;
+        }
+        let prefix_fp =
+            canonical_prefix_fingerprint(&messages[..candidate.first_kept_index]);
+        if prefix_fp != candidate.canonical_prefix_fingerprint {
+            return None;
+        }
+        self.with_state_mut(|state| state.speculative.take())
+    }
+
+    pub fn invalidate_speculative(&self) {
+        self.with_state_mut(|state| {
+            state.speculative = None;
+        });
+    }
+
+    pub fn export_speculative(&self) -> Option<SpeculativeCompaction> {
+        self.with_state(|state| state.speculative.clone())
     }
 
     /// Remembers that a run anchored its channel overlay on
@@ -273,6 +677,80 @@ impl CompactionHandle {
                 .map(|anchor| (anchor.message_index, anchor.text.clone()))
                 .collect()
         })
+    }
+
+    /// Returns remembered anchors regardless of historical mode transitions,
+    /// used when the canonical tool envelope stays frozen across `Plan`/`Auto`.
+    pub fn channel_anchors_preserving_modes(
+        &self,
+        messages: &[ProviderMessage],
+    ) -> Vec<(usize, String)> {
+        self.with_state_mut(|state| {
+            state.channel_anchors.retain(|anchor| {
+                messages.get(anchor.message_index).is_some_and(|message| {
+                    message.role == "user"
+                        && compaction_prefix_fingerprint(std::slice::from_ref(message))
+                            == anchor.message_fingerprint
+                })
+            });
+            state
+                .channel_anchors
+                .iter()
+                .map(|anchor| (anchor.message_index, anchor.text.clone()))
+                .collect()
+        })
+    }
+
+    pub fn export_channel_anchors(
+        &self,
+        messages: &[ProviderMessage],
+    ) -> Vec<(usize, crate::OperatingMode, String)> {
+        self.with_state(|state| {
+            state
+                .channel_anchors
+                .iter()
+                .filter(|anchor| {
+                    messages.get(anchor.message_index).is_some_and(|message| {
+                        message.role == "user"
+                            && compaction_prefix_fingerprint(std::slice::from_ref(message))
+                                == anchor.message_fingerprint
+                    })
+                })
+                .map(|anchor| (anchor.message_index, anchor.mode, anchor.text.clone()))
+                .collect()
+        })
+    }
+
+    pub fn seed_channel_anchors(
+        &self,
+        messages: &[ProviderMessage],
+        anchors: Vec<(usize, crate::OperatingMode, String)>,
+    ) {
+        self.with_state_mut(|state| {
+            for (index, mode, text) in anchors {
+                let Some(message) = messages.get(index) else {
+                    continue;
+                };
+                if message.role != "user" {
+                    continue;
+                }
+                let stored = StoredChannelAnchor {
+                    message_index: index,
+                    message_fingerprint: compaction_prefix_fingerprint(std::slice::from_ref(
+                        message,
+                    )),
+                    mode,
+                    text,
+                };
+                state
+                    .channel_anchors
+                    .retain(|anchor| anchor.message_index != index);
+                if state.channel_anchors.len() >= MAX_CHANNEL_ANCHORS {
+                    state.channel_anchors.remove(0);
+                }
+                state.channel_anchors.push(stored);
+            }
+        });
     }
 
     pub fn clear_channel_anchors(&self) {
@@ -370,7 +848,10 @@ impl CompactionHandle {
             len: messages.len(),
             last_message_fingerprint: compaction_prefix_fingerprint(std::slice::from_ref(last)),
         };
-        self.with_state_mut(|state| state.compacted = Some(marker));
+        self.with_state_mut(|state| {
+            state.compacted = Some(marker);
+            state.speculative = None;
+        });
     }
 
     /// Whether `messages` is exactly what the last compaction left: Pi refuses
@@ -601,6 +1082,7 @@ mod tests {
         ChatReasoning {
             scope_id: 7,
             model: "m".into(),
+            provenance: 0,
             content: text.into(),
             details: Vec::new(),
         }
@@ -787,5 +1269,44 @@ a.rs",
         replaced[1].content = "another".into();
         assert!(!handle.is_already_compacted(&replaced));
         assert!(!handle.is_already_compacted(&[]));
+    }
+
+    #[test]
+    fn ttl_promotion_and_opt_in_keep_alive_respect_thresholds_and_15m_cap() {
+        let handle = CompactionHandle::default();
+        handle.record_warm_cache("anthropic", "claude-opus-4-7", 1_000, 300, 55_000);
+        assert!(!handle.warm_cache_expired("anthropic", "claude-opus-4-7", 1_299));
+        assert!(handle.warm_cache_expired("anthropic", "claude-opus-4-7", 1_300));
+
+        // TTL promotion requires >= 50k prefix AND >= 180s idle.
+        assert!(!handle.should_promote_1h_ttl("anthropic", "claude-opus-4-7", 49_999, 1_200));
+        assert!(!handle.should_promote_1h_ttl("anthropic", "claude-opus-4-7", 55_000, 1_100));
+        assert!(handle.should_promote_1h_ttl("anthropic", "claude-opus-4-7", 55_000, 1_180));
+
+        // Keep-alive is strictly OFF unless opted in.
+        assert!(!handle.should_keep_alive_ping("anthropic", "claude-opus-4-7", 1_270, false, 270, 900));
+        // Enabled and remaining TTL in 1..=45s (1300 - 1270 = 30s) fires when idle < 15m cap.
+        assert!(handle.should_keep_alive_ping("anthropic", "claude-opus-4-7", 1_270, true, 270, 900));
+        // Even if caller passes max_idle_secs > 900, hard cap of 900s (15m) applies.
+        assert!(!handle.should_keep_alive_ping("anthropic", "claude-opus-4-7", 1_270, true, 900, 3600));
+        // Outside expiry window (remaining = 100s) -> false.
+        assert!(!handle.should_keep_alive_ping("anthropic", "claude-opus-4-7", 1_200, true, 200, 900));
+
+        // Speculative export & serde roundtrip.
+        let spec = SpeculativeCompaction {
+            canonical_prefix_fingerprint: "fp-1".into(),
+            first_kept_index: 4,
+            summary: "summary".into(),
+            read_files: vec!["a.rs".into()],
+            modified_files: vec!["b.rs".into()],
+            tokens_before: 12_000,
+            input_tokens: 4_000,
+            output_tokens: 300,
+            created_at_unix_secs: 1_234,
+        };
+        handle.store_speculative(spec.clone());
+        let json = serde_json::to_string(&handle.export_speculative().unwrap()).unwrap();
+        let decoded: SpeculativeCompaction = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, spec);
     }
 }

@@ -102,6 +102,9 @@ fn tool(name: &str, description: &str, schema: Value) -> McpToolSummary {
         description: Some(description.into()),
         schema,
         output_schema: None,
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
     }
 }
 
@@ -787,6 +790,10 @@ fn awareness_block_lists_enabled_non_hidden_servers_with_status_and_summary() {
         lines[0].contains("server-provided and untrusted"),
         "{block}"
     );
+    assert!(lines[0].contains("with the mcp tool"), "{block}");
+    let code_block = manager.awareness_block_for(true).unwrap();
+    assert!(code_block.lines().next().unwrap().contains("tools.call('mcp.server.tool', args)"));
+    assert!(!code_block.lines().next().unwrap().contains("with the mcp tool"));
     assert_eq!(
         lines[1],
         "- docs (ready, 2 tools): Company wiki and runbooks"

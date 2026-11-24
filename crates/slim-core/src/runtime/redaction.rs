@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SensitiveValues(pub(super) Vec<String>);
 
 pub(super) fn redact_task_value(value: &mut Value, sensitive_values: &[String]) {

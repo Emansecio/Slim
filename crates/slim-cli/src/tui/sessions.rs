@@ -300,11 +300,13 @@ pub(super) fn list_finished_turns(path: &Path) -> Result<Vec<TurnListItem>, Stri
                  index,
                  first_seq,
                  prompt,
+                 checkpoint,
                  ..
              }| TurnListItem {
                 index,
                 first_seq,
                 prompt,
+                has_checkpoint: checkpoint.is_some(),
             },
         )
         .collect();
@@ -321,6 +323,8 @@ pub(super) struct RewoundSession {
     pub(super) removed: usize,
     /// Full text of the chosen turn's prompt, to hand back to the composer.
     pub(super) draft: String,
+    /// Disk checkpoint captured right before the chosen turn ran, if any.
+    pub(super) checkpoint: Option<slim_core::checkpoint::TurnCheckpoint>,
 }
 
 /// Forks the session at `current` before the finished turn whose user entry
@@ -356,6 +360,7 @@ pub(super) fn fork_rewind_child(current: &Path, first_seq: u64) -> Result<Rewoun
                     child,
                     removed: turns.len() - turn.index,
                     draft,
+                    checkpoint: turn.checkpoint.clone(),
                 });
             }
             Err(TurnError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -411,6 +416,7 @@ pub(super) fn is_session_command(command: &UiCommand) -> bool {
             | UiCommand::NewSession
             | UiCommand::ListTurns { .. }
             | UiCommand::RewindSession { .. }
+            | UiCommand::UndoLastRewind
     )
 }
 
@@ -443,6 +449,9 @@ pub(super) fn refuse_session_command(sink: &EventSink, command: &UiCommand, wait
         }
         UiCommand::RewindSession { .. } => {
             notify(sink, format!("{wait} antes de voltar a um turno"));
+        }
+        UiCommand::UndoLastRewind => {
+            notify(sink, format!("{wait} antes de desfazer o rewind"));
         }
         UiCommand::NewSession => {
             notify(sink, format!("{wait} antes de iniciar uma nova sessão"));
@@ -546,7 +555,7 @@ pub(super) fn serve_turn_list(startup: &TuiStartup, sink: &EventSink, request_id
 /// checked before it can name a path and must then be one of the scanner's
 /// candidates, so header, stem and workspace checks apply exactly as they do
 /// for automatic resume.
-pub(super) fn resume_session_by_id(
+pub(super) async fn resume_session_by_id(
     startup: &mut TuiStartup,
     sink: &EventSink,
     skill_memo: &mut SkillNameMemo,
@@ -609,18 +618,22 @@ pub(super) fn resume_session_by_id(
         shell_context,
         selected,
         "Sessão retomada. Envie um prompt para continuar.",
-    );
+    )
+    .await;
 }
 
 /// `RewindSession`: forks the current session before the chosen turn, switches
-/// to the fork and hands the turn's prompt back as a draft. The original file
-/// stays as it was; files the removed turns changed are not restored.
-pub(super) fn rewind_current_session(
+/// to the fork and hands the turn's prompt back as a draft. When `restore_files`
+/// is true and the turn has a recorded disk checkpoint, restores workspace files
+/// and keeps an undo checkpoint so `/rewind --undo` can revert the disk step.
+pub(super) async fn rewind_current_session(
     startup: &mut TuiStartup,
     sink: &EventSink,
     skill_memo: &mut SkillNameMemo,
     shell_context: &UserShellContext,
     first_seq: u64,
+    restore_files: bool,
+    last_undo_checkpoint: &mut Option<slim_core::checkpoint::TurnCheckpoint>,
 ) {
     let Some(current) = startup.resume_path.clone() else {
         notify(sink, "Nenhuma conversa salva nesta sessão");
@@ -650,15 +663,95 @@ pub(super) fn rewind_current_session(
             return;
         }
     };
-    let notice = format!(
-        "Voltou {} turno(s). Arquivos alterados não foram restaurados; veja Ctrl+D.",
-        rewound.removed
-    );
+    let undo_summary = if restore_files {
+        if let Some(cp) = rewound.checkpoint.as_ref() {
+            let Some(workspace) = startup.options.workspace_root.as_deref() else {
+                let _ = fs::remove_file(&rewound.child);
+                notify(sink, "Workspace indisponível para restaurar arquivos");
+                return;
+            };
+            let session_id = selected
+                .preflight
+                .session_id
+                .as_deref()
+                .unwrap_or("rewind");
+            match slim_core::checkpoint::restore_turn_checkpoint(workspace, session_id, cp) {
+                Ok(summary) => {
+                    *last_undo_checkpoint = summary.undo_checkpoint.clone();
+                    slim_core::checkpoint::prune_old_checkpoints(workspace, 40, 14);
+                    Some(summary)
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&rewound.child);
+                    notify(sink, format!("Falha ao restaurar arquivos: {error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let notice = if let Some(summary) = undo_summary {
+        format!(
+            "Voltou {} turno(s) e restaurou {} arquivo(s) ({} removido(s)). Use /rewind --undo para desfazer no disco.",
+            rewound.removed,
+            summary.restored_files.len(),
+            summary.removed_files.len()
+        )
+    } else {
+        format!(
+            "Voltou {} turno(s). Arquivos alterados não foram restaurados; veja Ctrl+D.",
+            rewound.removed
+        )
+    };
     // After `SessionRestored`, which resets the composer.
-    if switch_session(startup, sink, skill_memo, shell_context, selected, &notice) {
+    if switch_session(startup, sink, skill_memo, shell_context, selected, &notice).await {
         let _ = sink.send(UiEvent::RestoreDraft {
             text: rewound.draft,
         });
+    }
+}
+
+/// `/rewind --undo`: reverts disk changes from the last disk rewind using its
+/// pre-rewind undo checkpoint.
+pub(super) fn undo_last_rewind(
+    startup: &TuiStartup,
+    sink: &EventSink,
+    last_undo_checkpoint: &mut Option<slim_core::checkpoint::TurnCheckpoint>,
+) {
+    let Some(cp) = last_undo_checkpoint.take() else {
+        notify(sink, "Nenhum rewind em disco recente para desfazer.");
+        return;
+    };
+    let Some(workspace) = startup.options.workspace_root.as_deref() else {
+        *last_undo_checkpoint = Some(cp);
+        notify(sink, "Workspace indisponível para desfazer o rewind.");
+        return;
+    };
+    let session_id = startup
+        .resume_path
+        .as_deref()
+        .and_then(|path| path.file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("undo");
+    match slim_core::checkpoint::restore_turn_checkpoint(workspace, session_id, &cp) {
+        Ok(summary) => {
+            *last_undo_checkpoint = summary.undo_checkpoint;
+            notify(
+                sink,
+                format!(
+                    "Rewind em disco desfeito: {} arquivo(s) restaurado(s) ({} removido(s)).",
+                    summary.restored_files.len(),
+                    summary.removed_files.len()
+                ),
+            );
+        }
+        Err(error) => {
+            *last_undo_checkpoint = Some(cp);
+            notify(sink, format!("Falha ao desfazer rewind: {error}"));
+        }
     }
 }
 

@@ -1,6 +1,19 @@
 use super::ProviderError;
+use std::time::Duration;
 
 pub(super) const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn build_catalog_request(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
+}
 
 /// Downloads a provider model catalog with a hard size bound. `label` names
 /// the provider in error messages; the API key never appears in them.
@@ -11,9 +24,7 @@ pub(super) async fn fetch_bounded_catalog(
     label: &str,
 ) -> Result<Vec<u8>, ProviderError> {
     let redact = |message: String| super::redact_values(&message, &[api_key.to_owned()]);
-    let mut response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {api_key}"))
+    let mut response = build_catalog_request(client, url, api_key)
         .send()
         .await
         .map_err(|error| ProviderError::Transport {
@@ -61,4 +72,18 @@ pub(super) async fn fetch_bounded_catalog(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_request_attaches_bounded_request_timeout() {
+        let client = reqwest::Client::new();
+        let request = build_catalog_request(&client, "https://example.com/models", "test-key")
+            .build()
+            .expect("build catalog request");
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(15)));
+    }
 }

@@ -1,6 +1,6 @@
 use super::{
     opencode::{OpenCodeAdapter, OpenCodeFlavor},
-    opencode_go::{model, OpenCodeApi, OpenCodeModel},
+    opencode_go::{model, OpenCodeApi, OpenCodeModel, OpenCodeModelSpec},
     ProviderKind,
 };
 
@@ -109,11 +109,12 @@ impl OpenCodeFlavor for OpenCodeZen {
     const KIND: ProviderKind = ProviderKind::OpenCodeZen;
     const LABEL: &'static str = "OpenCode Zen";
     const ACCOUNT: &'static str = "opencode-zen";
+    const DEFAULT_BASE_URL: &'static str = OPENCODE_ZEN_BASE_URL;
     const SUPPORTS_MESSAGES_API: bool = false;
     const DROPS_EFFORT_WITHOUT_LEVELS: bool = true;
 
-    fn lookup(model_id: &str) -> Option<&'static OpenCodeModel> {
-        zen_model(model_id)
+    fn lookup(model_id: &str) -> Option<OpenCodeModelSpec> {
+        zen_model(model_id).map(OpenCodeModelSpec::from)
     }
 }
 

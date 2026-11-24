@@ -399,6 +399,7 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
             index,
             first_seq: index as u64 * 12 + 2,
             prompt: (*prompt).into(),
+            has_checkpoint: false,
         })
         .collect(),
         error: None,
